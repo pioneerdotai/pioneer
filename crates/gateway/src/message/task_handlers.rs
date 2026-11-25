@@ -1311,7 +1311,24 @@ impl MessageProcessor {
             )
             .await;
         match self.task_runtime.service().get_task(params).await {
-            Ok(response_payload) => {
+            Ok(mut response_payload) => {
+                if let Err(error) = crate::task_projection::observe_revision_recovery(
+                    self.crud_store.as_ref(),
+                    &mut response_payload,
+                )
+                .await
+                {
+                    self.send_error(
+                        connection_id,
+                        task_public_error(
+                            Some(request_id),
+                            pioneer_protocol::PublicErrorStage::Observation,
+                            format!("failed to observe Task revision recovery: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
                 let mut projected =
                     crate::task_projection::project_task_get(&response_payload, operator_allowed);
                 let review_allowed = self
@@ -2135,6 +2152,60 @@ impl MessageProcessor {
             return;
         }
         let connection_id = request_context.connection_id();
+        if let Some(turn_id) = params.retry_revision_turn_id.as_deref() {
+            match message_future(self.task_agent_executor.retry_blocked_revision(
+                &params.task_id,
+                turn_id,
+                None,
+            ))
+            .await
+            {
+                Ok(response) => {
+                    self.send_task_response(connection_id, request_id, &response)
+                        .await
+                }
+                Err(error) => {
+                    let response = if let Some(blocker) =
+                        error.downcast_ref::<pioneer_protocol::TaskRevisionRetryBlocker>()
+                    {
+                        let mut public = crate::public_error::build_public_error(
+                            pioneer_protocol::PublicErrorCode::Conflict,
+                            pioneer_protocol::PublicErrorStage::Execution,
+                        );
+                        public.message = blocker.message().to_owned();
+                        public.retryable = false;
+                        crate::public_error::rpc_error_from_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            public,
+                        )
+                    } else if error.is::<pioneer_crud::ExecutionAdmissionQuotaExhausted>() {
+                        let mut public = crate::public_error::build_public_error(
+                            pioneer_protocol::PublicErrorCode::ResourceExhausted,
+                            pioneer_protocol::PublicErrorStage::Execution,
+                        );
+                        public.message =
+                            "Task execution quota is full. Retry when capacity is available."
+                                .to_owned();
+                        public.retryable = true;
+                        crate::public_error::rpc_error_from_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            public,
+                        )
+                    } else {
+                        task_public_error(
+                            Some(request_id),
+                            pioneer_protocol::PublicErrorStage::Execution,
+                            format!("failed to restart Task revision: {error:#}"),
+                        )
+                    };
+                    self.send_error(connection_id, response).await;
+                }
+            }
+            return;
+        }
+
         let execution_admission = match self
             .task_execution_readmission_seed(
                 request_context.principal(),

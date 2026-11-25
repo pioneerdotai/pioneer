@@ -3,7 +3,7 @@ name: subagents
 slug: subagents
 owner: pioneer
 description: "Use this skill when Pioneer should delegate current-turn work to attached task-backed subagents, coordinate parallel child agents, wait for child results, review/revise/accept/cancel/detach attached work, or synthesize accepted child results into the parent answer."
-version: "0.2.3"
+version: "0.2.4"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -146,6 +146,8 @@ For an authorized result reader, `reviewRequired.reviewContent` contains the rev
 Always read by `candidateId`, not by `taskId`: a task may have several immutable revision rounds, and the review decision must apply to the exact content that was inspected.
 
 Use `task_revise` when the result is close but incomplete or incorrectly shaped. Give concrete feedback: what is wrong, what to add/remove/correct, and what the revised output must look like.
+
+If the child's MCP session is lost before the revision starts, the feedback already belongs to that round. Read `task_get.revisionExecutions` for its run and round. Wait while `automaticRetryPending` is true. When `requiresIntervention` is true, use `task_resume` with the child's `taskId` and the entry's `turnId` as `retryRevisionTurnId`. Continue waiting for the revised candidate.
 
 Use `task_accept` only after the candidate is good enough to use. Use accepted child results in the parent synthesis.
 

@@ -535,12 +535,21 @@ impl MessageProcessor {
     }
 
     async fn emit_task_event_observed(&self, event: pioneer_crud::AppendedTaskEvent) -> Result<()> {
+        let revision_retry_pending = match &event.payload {
+            TaskEventPayload::RunBlocked { error, .. }
+            | TaskEventPayload::TaskBlocked { error, .. } => error
+                .as_ref()
+                .is_some_and(pioneer_protocol::TaskError::is_revision_retry_pending),
+            _ => false,
+        };
         let closing_fact = match &event.payload {
             TaskEventPayload::RunCompleted { .. } => {
                 Some((Phase::TaskState, Fact::ExecutionSucceeded))
             }
             TaskEventPayload::RunFailed { .. } => Some((Phase::TaskState, Fact::ExecutionFailed)),
-            TaskEventPayload::RunBlocked { .. } => Some((Phase::TaskState, Fact::Blocked)),
+            TaskEventPayload::RunBlocked { .. } if !revision_retry_pending => {
+                Some((Phase::TaskState, Fact::Blocked))
+            }
             TaskEventPayload::RunCancelled { .. } => Some((Phase::TaskState, Fact::Cancelled)),
             TaskEventPayload::TaskRunEnteredReview { .. } => {
                 Some((Phase::TaskState, Fact::PendingReview))
@@ -596,7 +605,7 @@ impl MessageProcessor {
             let outcome = match &event.payload {
                 TaskEventPayload::TaskCancelled { .. } => Some("cancelled"),
                 TaskEventPayload::TaskFailed { .. } => Some("failed"),
-                TaskEventPayload::TaskBlocked { .. } => Some("blocked"),
+                TaskEventPayload::TaskBlocked { .. } if !revision_retry_pending => Some("blocked"),
                 _ => None,
             };
             if let Some(outcome) = outcome {
@@ -657,7 +666,7 @@ impl MessageProcessor {
         let workspace_id = context.workspace_id.clone();
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
-        let is_terminal_event = event.payload.is_terminal();
+        let is_terminal_event = event.payload.is_terminal() && !revision_retry_pending;
         // Saved runs are already committed. Invalidate independently of timeline
         // projection and delivery so offline history and deliveryPolicy=none use
         // the same source. This small hint also avoids coupling inbox refresh to
@@ -813,7 +822,7 @@ impl MessageProcessor {
                     events::TASK_QUEUED,
                     &json!({
                         "context": context,
-                        "run": run.map(crate::task_projection::project_run),
+                        "run": run.map(|run| crate::task_projection::project_run(&task_response.task, run)),
                     }),
                 )
                 .await;
@@ -825,7 +834,7 @@ impl MessageProcessor {
                     events::TASK_RUN_CREATED,
                     &json!({
                         "context": context,
-                        "run": crate::task_projection::project_run(&run),
+                        "run": crate::task_projection::project_run(&task_response.task, &run),
                     }),
                 )
                 .await;
@@ -839,7 +848,7 @@ impl MessageProcessor {
                         events::TASK_RUN_STARTED,
                         &json!({
                             "context": context,
-                            "run": crate::task_projection::project_run(&run),
+                            "run": crate::task_projection::project_run(&task_response.task, run),
                         }),
                     )
                     .await;
@@ -875,7 +884,7 @@ impl MessageProcessor {
                         events::TASK_RUN_COMPLETED,
                         &json!({
                             "context": context,
-                            "run": crate::task_projection::project_run(&run),
+                            "run": crate::task_projection::project_run(&task_response.task, run),
                         }),
                     )
                     .await;
@@ -891,13 +900,16 @@ impl MessageProcessor {
                         events::TASK_RUN_FAILED,
                         &json!({
                             "context": context,
-                            "run": crate::task_projection::project_run(&run),
+                            "run": crate::task_projection::project_run(&task_response.task, run),
                         }),
                     )
                     .await;
                 }
             }
             TaskEventPayload::RunBlocked { run_id, .. } => {
+                if revision_retry_pending {
+                    return Ok(());
+                }
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
@@ -907,7 +919,7 @@ impl MessageProcessor {
                         events::TASK_RUN_BLOCKED,
                         &json!({
                             "context": context,
-                            "run": crate::task_projection::project_run(&run),
+                            "run": crate::task_projection::project_run(&task_response.task, run),
                         }),
                     )
                     .await;
@@ -923,7 +935,7 @@ impl MessageProcessor {
                         events::TASK_RUN_CANCELLED,
                         &json!({
                             "context": context,
-                            "run": crate::task_projection::project_run(&run),
+                            "run": crate::task_projection::project_run(&task_response.task, run),
                         }),
                     )
                     .await;
@@ -954,6 +966,9 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskBlocked { .. } => {
+                if revision_retry_pending {
+                    return Ok(());
+                }
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),

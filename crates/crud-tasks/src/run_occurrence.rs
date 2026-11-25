@@ -242,7 +242,12 @@ impl OccurrenceSourceFacts {
         };
         let run_status = task_run_status_from_db(&prepared_run_model.status)
             .context(TaskRunOccurrenceRepairReason::RunStatus)?;
-        let desired_error = if matches!(
+        if queue::has_pending_revision_retry(&prepared_run_model) {
+            return Ok(OccurrencePreparation::Unchanged(
+                TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent,
+            ));
+        }
+        let terminal_error = if matches!(
             run_status,
             TaskRunStatus::Failed
                 | TaskRunStatus::TimedOut
@@ -253,10 +258,10 @@ impl OccurrenceSourceFacts {
                 prepared_run_model.error_json.clone(),
             )
             .context(TaskRunOccurrenceRepairReason::RunErrorDecode)?
-            .map(|error| error.message)
         } else {
             None
         };
+        let desired_error = terminal_error.map(|error| error.message);
         let Some(desired_status) = queue::terminal_turn_status(run_status) else {
             if background {
                 return Ok(OccurrencePreparation::Unchanged(

@@ -1208,7 +1208,13 @@ fn task_tool_authorization_error() -> ToolError {
     ToolError::Rejected("task_access_denied: unavailable to this execution; this does not confirm absence or cancellation".to_owned())
 }
 
+const TASK_REVISION_QUOTA_FULL: &str =
+    "task_quota_exhausted: Task execution quota is full. Retry when capacity is available.";
+
 fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError {
+    if let Some(blocker) = error.downcast_ref::<pioneer_protocol::TaskRevisionRetryBlocker>() {
+        return ToolError::Rejected(blocker.code().to_owned());
+    }
     match error.downcast_ref::<pioneer_tasks::TaskOperationError>() {
         Some(pioneer_tasks::TaskOperationError::AccessDenied) => task_tool_authorization_error(),
         Some(pioneer_tasks::TaskOperationError::StateConflict) => ToolError::Rejected(
@@ -1220,9 +1226,17 @@ fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError 
 
 pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     match error {
+        ToolError::Rejected(code)
+            if pioneer_protocol::TaskRevisionRetryBlocker::from_code(&code).is_some() =>
+        {
+            let blocker = pioneer_protocol::TaskRevisionRetryBlocker::from_code(&code)
+                .expect("allowlisted blocker");
+            ToolError::Rejected(format!("{}: {}", blocker.code(), blocker.message()))
+        }
         ToolError::Rejected(message)
             if message.starts_with("task_access_denied:")
-                || message == "task_state_conflict: reload the task before changing it" =>
+                || message == "task_state_conflict: reload the task before changing it"
+                || message == TASK_REVISION_QUOTA_FULL =>
         {
             // Only server-authored constants enter these variants.
             if message.starts_with("task_access_denied:") {
@@ -1606,12 +1620,20 @@ impl TaskToolHandler {
         Ok(contents)
     }
 
+    fn uses_durable_mutation_receipt(&self, invocation: &ToolInvocation) -> bool {
+        self.cli_replay
+            || invocation.tool_name == TASK_RUN_NOW_TOOL
+            || (invocation.tool_name == TASK_RESUME_TOOL
+                && matches!(&invocation.payload, ToolPayload::Function { arguments }
+                    if arguments.get("retryRevisionTurnId").is_some_and(JsonValue::is_string)))
+    }
+
     fn bind_cli_mutation_receipt(
         &self,
         invocation: &ToolInvocation,
         plan: &mut crate::authorization::AgentActionCommitPlan,
     ) -> Result<(), ToolError> {
-        if !self.cli_replay && invocation.tool_name != TASK_RUN_NOW_TOOL {
+        if !self.uses_durable_mutation_receipt(invocation) {
             return Ok(());
         }
         let ToolPayload::Function { arguments } = &invocation.payload else {
@@ -1675,7 +1697,7 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
-        if self.cli_replay || invocation.tool_name == TASK_RUN_NOW_TOOL {
+        if self.uses_durable_mutation_receipt(invocation) {
             let ToolPayload::Function { arguments } = &invocation.payload else {
                 return Err(ToolError::invalid_arguments("task_invalid_arguments"));
             };
@@ -2861,13 +2883,19 @@ impl TaskToolHandler {
         let _observation = authorization
             .acquire_observation_page(self.processor.as_ref())
             .await?;
-        let response = self
+        let mut response = self
             .processor
             .task_runtime
             .service()
             .get_task(params)
             .await
             .map_err(task_runtime_tool_error)?;
+        crate::task_projection::observe_revision_recovery(
+            self.processor.crud_store.as_ref(),
+            &mut response,
+        )
+        .await
+        .map_err(task_runtime_tool_error)?;
         let run_ids = response
             .runs
             .iter()
@@ -3204,6 +3232,32 @@ impl TaskToolHandler {
                 AgentToolCapability::TaskControl,
             )
             .await?;
+        if let Some(turn_id) = params.retry_revision_turn_id.as_deref() {
+            let response = self
+                .processor
+                .task_agent_executor
+                .retry_blocked_revision(
+                    &params.task_id,
+                    turn_id,
+                    action_plan.as_ref().map(|plan| &plan.input),
+                )
+                .await
+                .map_err(|error| {
+                    if error.is::<pioneer_crud::ExecutionAdmissionQuotaExhausted>() {
+                        ToolError::Rejected(TASK_REVISION_QUOTA_FULL.to_owned())
+                    } else {
+                        task_runtime_tool_error(error)
+                    }
+                })?;
+            let mut output = json!({
+                "task": task_summary(&response.task),
+                "triggers": task_trigger_details_output(&response.triggers),
+            });
+            Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+            self.cache_mutation_output(cache_key.as_deref(), &output)
+                .await;
+            return Ok(function_output(output));
+        }
         let execution_admission = self
             .processor
             .task_execution_readmission_seed(
@@ -3378,7 +3432,7 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
-        if self.cli_replay || invocation.tool_name == TASK_RUN_NOW_TOOL {
+        if self.uses_durable_mutation_receipt(invocation) {
             let binding = self
                 .processor
                 .agent_action_binding(&self.context.turn_id)
@@ -4447,6 +4501,9 @@ struct TaskResumeToolInput {
     /// Task id to resume. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     task_id: String,
+    /// Exact turnId from task_get revisionExecutions when requiresIntervention is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_revision_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional human-readable resume reason.
     reason: Option<String>,
@@ -4463,6 +4520,11 @@ impl TaskResumeToolInput {
     fn into_params(self) -> Result<TaskResumeParams, ToolError> {
         Ok(TaskResumeParams {
             task_id: validate_entity_id(self.task_id, "taskId")?,
+            retry_revision_turn_id: self
+                .retry_revision_turn_id
+                .as_deref()
+                .map(|turn_id| required_tool_string(Some(turn_id), "retryRevisionTurnId"))
+                .transpose()?,
             reason: clean_optional_string(self.reason),
         })
     }
@@ -4571,7 +4633,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESUME_TOOL,
-            "Resume a paused task through the task service and recompute its next scheduled fire.",
+            "Resume a paused task and recompute its next scheduled fire. To restart a blocked revision in a fresh execution, pass retryRevisionTurnId from task_get revisionExecutions where requiresIntervention is true. This continues the same review round. Repeating the same turn ID cannot start another attempt.",
             task_resume_schema(),
             safe_mutation_recovery(),
         ),
@@ -6083,6 +6145,20 @@ pub(crate) async fn task_turn_item_from_context(
         }
         None => Default::default(),
     };
+    let status = task_anchor_status(task, run);
+    let error = run
+        .and_then(|run| run.error.as_ref())
+        .or(task.error.as_ref());
+    let (progress_preview, error_preview) = if status == TaskStatus::Waiting
+        && error.is_some_and(TaskError::is_revision_retry_pending)
+    {
+        (
+            error.and_then(crate::task_projection::task_failure_detail),
+            None,
+        )
+    } else {
+        (progress_preview, error_preview(error))
+    };
     Ok(TaskTurnItem {
         id: item_id,
         task_id: task.id.clone(),
@@ -6091,7 +6167,7 @@ pub(crate) async fn task_turn_item_from_context(
         parent_task_id: task.parent_task_id.clone(),
         root_task_id: task.root_task_id.clone(),
         title: task.title.clone(),
-        status: task_anchor_status(task.status, run),
+        status,
         attachment: task
             .lifecycle_policy
             .as_ref()
@@ -6118,21 +6194,16 @@ pub(crate) async fn task_turn_item_from_context(
             run.and_then(|run| run.result.as_ref())
                 .or(task.result.as_ref()),
         ),
-        error_preview: error_preview(
-            run.and_then(|run| run.error.as_ref())
-                .or(task.error.as_ref()),
-        ),
+        error_preview,
         started_at: run.and_then(|run| run.started_at),
         created_at: task.created_at,
-        updated_at: task_anchor_updated_at(task.updated_at, run),
+        updated_at: task_anchor_updated_at(task, run),
     })
 }
 
-fn task_anchor_status(task_status: TaskStatus, run: Option<&TaskRun>) -> TaskStatus {
-    let Some(run) = run else {
-        return task_status;
-    };
-    task_run_anchor_status(run.status)
+fn task_anchor_status(task: &Task, run: Option<&TaskRun>) -> TaskStatus {
+    run.map(|run| task_run_anchor_status(run.effective_status(task)))
+        .unwrap_or_else(|| task.effective_status())
 }
 
 fn task_run_anchor_status(status: TaskRunStatus) -> TaskStatus {
@@ -6148,9 +6219,13 @@ fn task_run_anchor_status(status: TaskRunStatus) -> TaskStatus {
     }
 }
 
-fn task_anchor_updated_at(task_updated_at: i64, run: Option<&TaskRun>) -> i64 {
-    run.map(|run| run.completed_at.unwrap_or(run.updated_at))
-        .unwrap_or(task_updated_at)
+fn task_anchor_updated_at(task: &Task, run: Option<&TaskRun>) -> i64 {
+    run.map(|run| {
+        run.completed_at
+            .filter(|_| run.effective_status(task) == run.status)
+            .unwrap_or(run.updated_at)
+    })
+    .unwrap_or(task.updated_at)
 }
 
 fn select_task_anchor_run(response: &TaskGetResponse) -> Option<&TaskRun> {
@@ -6203,7 +6278,7 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
     error.map(|error| {
-        if let Some(message) = error.recovery_public_message() {
+        if let Some(message) = crate::task_projection::task_failure_detail(error) {
             return message;
         }
         match error.class {
@@ -6398,19 +6473,21 @@ mod tests {
 
     #[test]
     fn task_run_anchor_status_is_independent_of_recurring_task_status() {
+        let mut task = sample_task(TaskStatus::Scheduled);
+        task.updated_at = 110;
         let mut succeeded_run = sample_run(TaskRunStatus::Succeeded);
         succeeded_run.completed_at = Some(90);
         succeeded_run.updated_at = 100;
         assert_eq!(
-            task_anchor_status(TaskStatus::Scheduled, Some(&succeeded_run)),
+            task_anchor_status(&task, Some(&succeeded_run)),
             TaskStatus::Completed
         );
         assert_eq!(
-            task_anchor_updated_at(110, Some(&succeeded_run)),
+            task_anchor_updated_at(&task, Some(&succeeded_run)),
             90,
             "a terminal occurrence must retain its actual completion timestamp"
         );
-        assert_eq!(task_anchor_updated_at(110, None), 110);
+        assert_eq!(task_anchor_updated_at(&task, None), 110);
         assert_eq!(
             task_run_anchor_status(TaskRunStatus::TimedOut),
             TaskStatus::Failed
@@ -6419,10 +6496,7 @@ mod tests {
             task_run_anchor_status(TaskRunStatus::WaitingReview),
             TaskStatus::WaitingReview
         );
-        assert_eq!(
-            task_anchor_status(TaskStatus::Scheduled, None),
-            TaskStatus::Scheduled
-        );
+        assert_eq!(task_anchor_status(&task, None), TaskStatus::Scheduled);
     }
 
     #[test]

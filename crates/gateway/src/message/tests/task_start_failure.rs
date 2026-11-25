@@ -4963,3 +4963,755 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
     // no provider output or fabricated task completion is used by the oracle.
     assert_ne!(creator_task.task.id, task_id);
 }
+
+#[test]
+fn revision_retry_reports_permanent_refusals_through_task_rpc_and_retires_pending_work() {
+    use pioneer_protocol::{TaskRevisionRetryBlocker as Blocker, TaskRunStatus};
+    use sea_orm::EntityTrait;
+
+    for (legacy, blocker) in [
+        (true, Blocker::MissingBinding),
+        (true, Blocker::NativeExecutionRecorded),
+        (false, Blocker::MissingBinding),
+        (false, Blocker::NativeExecutionRecorded),
+        (false, Blocker::NewerRun),
+    ] {
+        capture_task_start(async move {
+            let (mut harness, processor) = review_cli_fixture().await;
+            let (task, child) = create_review_cli_child(
+                &harness,
+                &processor,
+                "revision-recovery-refusal",
+                true,
+                false,
+            )
+            .await;
+            let store = harness.crud_store.clone();
+            let (_, mut turn) = store
+                .get_turn(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let previous = store
+                .get_cli_runtime_turn_binding(&child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                processor
+                    .complete_turn(child.child_thread_id, child.child_turn_id, None)
+                    .await
+            );
+            let run = task.run.unwrap();
+            let candidate = store
+                .list_task_result_candidates(&run.id)
+                .await
+                .unwrap()
+                .remove(0);
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Revise safely".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let thread = store
+                .get_thread_model(&revised.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            turn.id = revised.child_turn_id.clone();
+            turn.status = TurnStatus::InProgress;
+            turn.error = None;
+            let actor = turn.author.as_ref().unwrap().actor.clone();
+            store
+                .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[], actor)
+                .await
+                .unwrap();
+            if blocker == Blocker::NativeExecutionRecorded {
+                store
+                    .upsert_cli_runtime_turn_binding(pioneer_crud::NewCliRuntimeTurnBinding {
+                        turn_id: revised.child_turn_id.clone(),
+                        thread_id: revised.child_thread_id.clone(),
+                        continuation_thread_id: revised.child_thread_id.clone(),
+                        workspace_id: harness.workspace_id.clone(),
+                        runtime_id: previous.runtime_id,
+                        runtime_kind: previous.runtime_kind,
+                        native_thread_id: "revision-prior-native-thread".to_owned(),
+                        native_turn_id: Some("revision-prior-native-turn".to_owned()),
+                        request_id: None,
+                        status: "blocked".to_owned(),
+                        model: previous.model,
+                        cwd: previous.cwd,
+                        sandbox_json: previous.sandbox_json,
+                        approval_policy: previous.approval_policy,
+                        input_mapping_json: previous.input_mapping_json,
+                        created_at: previous.created_at,
+                        updated_at: previous.updated_at,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let reason = format!(
+                "CLI runtime recovery is blocked: frozen CLI runtime MCP projection is invalid: {}",
+                pioneer_protocol::CLI_MCP_ACTIVATION_CONTRACT_MISSING,
+            );
+            turn.status = TurnStatus::Blocked;
+            turn.error = Some(reason.clone());
+            store
+                .materialize_turn_blocked(
+                    pioneer_protocol::TurnBlockedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: revised.child_thread_id.clone(),
+                        turn,
+                        resume: None,
+                    },
+                    now_timestamp_secs(),
+                )
+                .await
+                .unwrap();
+            let newer = if blocker == Blocker::NewerRun {
+                let now = now_timestamp_secs();
+                let newer = pioneer_protocol::TaskRun {
+                    id: "revision-retry-newer-run".to_owned(),
+                    run_group_id: "revision-retry-newer-run".to_owned(),
+                    trigger_id: None,
+                    run_number: run.run_number + 1,
+                    status: TaskRunStatus::Succeeded,
+                    completed_at: Some(now),
+                    ..run.clone()
+                };
+                store
+                    .append_task_event(
+                        pioneer_protocol::TaskEventPayload::RunCreated {
+                            run: newer.clone(),
+                            agent_spec: None,
+                        },
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                Some(newer)
+            } else {
+                None
+            };
+            if legacy || blocker == Blocker::NewerRun {
+                // A preserved legacy block or a retry already queued before
+                // the succeeding occurrence became visible to reconciliation.
+                let (code, message) = if legacy {
+                    ("child_turn_blocked", reason.as_str())
+                } else {
+                    (
+                        pioneer_protocol::TASK_REVISION_RETRY_PENDING,
+                        "automatic retry pending",
+                    )
+                };
+                pioneer_tasks::TaskExecutionHandle::new(
+                    store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task.task.id.clone(),
+                    run.id.clone(),
+                )
+                .block_run_with_revision(
+                    revised.task_run_turn.clone(),
+                    pioneer_protocol::TaskError {
+                        recovery_diagnostic: None,
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                        class: TaskErrorClass::Internal,
+                        details: None,
+                        failed_run_id: Some(run.id.clone()),
+                    },
+                    now_timestamp_secs(),
+                )
+                .await
+                .unwrap();
+            } else {
+                processor
+                    .task_agent_executor
+                    .reconcile_child_turn_blocked(
+                        &revised.child_thread_id,
+                        &revised.child_turn_id,
+                        &reason,
+                        super::super::TaskChildReconciliationOrigin::Live,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if let Some(newer) = newer {
+                let before = store.get_task(&task.task.id).await.unwrap().unwrap();
+                for _ in 0..8 {
+                    processor
+                        .reconcile_terminal_task_child_turns(32)
+                        .await
+                        .unwrap();
+                }
+                let saved = store.get_task(&task.task.id).await.unwrap().unwrap();
+                assert_eq!(saved.triggers, before.triggers);
+                assert_eq!(saved.task.status, before.task.status);
+                assert!(
+                    saved
+                        .runs
+                        .iter()
+                        .any(|run| run.id == newer.id && run.status == TaskRunStatus::Succeeded)
+                );
+                let pending = pioneer_entity::task_child_reconcile_pending::Entity::find_by_id(
+                    &revised.child_turn_id,
+                )
+                .one(&store.database_connection())
+                .await
+                .unwrap();
+                assert!(pending.is_none_or(|point| point.next_attempt_at.is_none()));
+                let deliveries = store
+                    .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                        workspace_id: harness.workspace_id.clone(),
+                        task_id: Some(task.task.id.clone()),
+                        run_id: Some(run.id.clone()),
+                        statuses: Vec::new(),
+                        limit: None,
+                    })
+                    .await
+                    .unwrap();
+                let notices = deliveries
+                    .deliveries
+                    .iter()
+                    .filter(|delivery| {
+                        delivery
+                            .error_snapshot
+                            .as_ref()
+                            .is_some_and(|error| error.code == blocker.code())
+                    })
+                    .count();
+                assert_eq!(notices, 1);
+            }
+
+            for (method, params) in [
+                ("task/get", json!({"taskId": task.task.id})),
+                (
+                    "task/resume",
+                    json!({"taskId": task.task.id, "retryRevisionTurnId": revised.child_turn_id}),
+                ),
+            ] {
+                let request_id = generate_test_request_id("revisionretry", method);
+                processor
+                    .process_request_for_connection(
+                        harness.connection_id,
+                        &json!({
+                            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                if method == "task/get" {
+                    let response = recv_response_by_id(&mut harness.rx, &request_id)
+                        .await
+                        .result;
+                    let execution = &response["revisionExecutions"][0];
+                    assert_eq!(execution["requiresIntervention"], false);
+                    assert_eq!(execution["automaticRetryPending"], false);
+                    let blocked = response["runs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["id"] == run.id)
+                        .unwrap();
+                    assert_eq!(blocked["status"], "blocked");
+                    assert_eq!(blocked["error"]["error"]["message"], blocker.message());
+                } else {
+                    let response = recv_error_by_id(&mut harness.rx, &request_id).await;
+                    assert_eq!(response.error.message, blocker.message());
+                }
+            }
+            let current = store
+                .get_latest_task_run_turn(&run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.turn_id, revised.child_turn_id);
+        });
+    }
+}
+
+#[test]
+fn revision_retry_reacquires_task_quota_before_a_fresh_cli_start() {
+    use pioneer_entity::{execution_admission_lease as quota, turn_execution as owner};
+    use pioneer_protocol::{
+        RecoveryAction, RecoveryJobStatus, RecoveryTrigger, TASK_REVISION_RETRY_PENDING,
+    };
+    use sea_orm::{ConnectionTrait, EntityTrait, Set, Statement};
+
+    for automatic in [false, true] {
+        capture_task_start(async move {
+            let (mut harness, processor) = review_cli_fixture().await;
+            let (task, child) =
+                create_review_cli_child(&harness, &processor, "revision-retry-quota", true, false)
+                    .await;
+            let store = harness.crud_store.clone();
+            let (_, mut turn) = store
+                .get_turn(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let first_binding = store
+                .get_cli_runtime_turn_binding(&child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &first_binding.native_thread_id,
+                first_binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#,
+            )
+            .await;
+            let run = task.run.unwrap();
+            let candidate = wait_for_result_candidate_status(
+                store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Keep the review feedback on the same logical revision."
+                            .to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let now = now_timestamp_secs();
+            let at = chrono::DateTime::from_timestamp(now, 0)
+                .unwrap()
+                .fixed_offset();
+            let db = store.database_connection();
+            let lease_id = format!("quota:task:{}", task.task.id);
+            let load_lease = || async {
+                quota::Entity::find_by_id(&lease_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            let original = store
+                .get_task_execution_admission(&task.task.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let context =
+                crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+                    store.as_ref(),
+                    &original,
+                )
+                .await
+                .unwrap();
+            let (quotas, _) = context.admitted_resource_budgets().unwrap();
+            db.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "INSERT INTO execution_admission_lease
+                    (id,subject_kind,subject_id,operation_class,quota_bucket,principal_id,role_key,
+                     workspace_id,policy_fingerprint,status,created_at)
+                 SELECT 'quota-test-' || n,subject_kind,'quota-test-' || n,operation_class,
+                        quota_bucket,principal_id,role_key,workspace_id,policy_fingerprint,'active',now()
+                 FROM execution_admission_lease, generate_series(1,$2::bigint) AS slots(n)
+                 WHERE id = $1",
+                [lease_id.clone().into(), i64::from(quotas.queued.per_principal).into()],
+            )).await.unwrap();
+            let thread = store
+                .get_thread_model(&revised.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            turn.id = revised.child_turn_id.clone();
+            turn.status = TurnStatus::InProgress;
+            turn.error = None;
+            let actor = turn.author.as_ref().unwrap().actor.clone();
+            store
+                .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[], actor)
+                .await
+                .unwrap();
+            owner::Entity::insert(owner::ActiveModel {
+                turn_id: Set(turn.id.clone()),
+                thread_id: Set(thread.id.clone()),
+                workspace_id: Set(harness.workspace_id.clone()),
+                executor_kind: Set("cli_runtime".to_owned()),
+                executor_key: Set(Some(harness.runtime_id.clone())),
+                status: Set("blocked".to_owned()),
+                owner_id: Set("previous-gateway".to_owned()),
+                owner_generation: Set(1),
+                lease_until: Set(at),
+                heartbeat_at: Set(at),
+                completed_at: Set(Some(at)),
+                created_at: Set(at),
+                updated_at: Set(at),
+                ..Default::default()
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+            store
+                .upsert_cli_runtime_turn_binding(pioneer_crud::NewCliRuntimeTurnBinding {
+                    turn_id: turn.id.clone(),
+                    thread_id: thread.id.clone(),
+                    continuation_thread_id: thread.id.clone(),
+                    workspace_id: harness.workspace_id.clone(),
+                    runtime_id: harness.runtime_id.clone(),
+                    runtime_kind: first_binding.runtime_kind,
+                    native_thread_id: "previous-native-thread".to_owned(),
+                    native_turn_id: None,
+                    request_id: None,
+                    status: "blocked".to_owned(),
+                    model: first_binding.model,
+                    cwd: first_binding.cwd,
+                    sandbox_json: first_binding.sandbox_json,
+                    approval_policy: first_binding.approval_policy,
+                    input_mapping_json: first_binding.input_mapping_json,
+                    created_at: at,
+                    updated_at: at,
+                })
+                .await
+                .unwrap();
+            let reason = format!(
+                "CLI runtime recovery is blocked: frozen CLI runtime MCP projection is invalid: {}",
+                pioneer_protocol::CLI_MCP_ACTIVATION_CONTRACT_MISSING,
+            );
+            let job = store
+                .enqueue_recovery_job(
+                    turn.id.clone(),
+                    "revision-mcp-recovery".to_owned(),
+                    TurnItemType::Reasoning,
+                    None,
+                    RecoveryTrigger::Timeout,
+                    RecoveryAction::BlockResumable,
+                    Some(reason.clone()),
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    json!({}),
+                    json!({}),
+                    now,
+                )
+                .await
+                .unwrap();
+            store
+                .mark_recovery_job_terminal(
+                    &job.id,
+                    RecoveryJobStatus::Blocked,
+                    Some(reason.clone()),
+                    now,
+                )
+                .await
+                .unwrap();
+            turn.status = TurnStatus::Blocked;
+            turn.error = Some(reason.clone());
+            store
+                .materialize_turn_blocked(
+                    pioneer_protocol::TurnBlockedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn,
+                        resume: None,
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+            pioneer_tasks::TaskExecutionHandle::new(
+                store.clone(),
+                processor.task_runtime.event_bus(),
+                task.task.id.clone(),
+                run.id.clone(),
+            )
+            .block_run_with_revision(
+                revised.task_run_turn.clone(),
+                pioneer_protocol::TaskError {
+                    recovery_diagnostic: None,
+                    code: if automatic {
+                        TASK_REVISION_RETRY_PENDING
+                    } else {
+                        "child_turn_blocked"
+                    }
+                    .to_owned(),
+                    message: reason.clone(),
+                    class: TaskErrorClass::Internal,
+                    details: None,
+                    failed_run_id: Some(run.id.clone()),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+            let released = load_lease().await;
+            assert_eq!(released.status, "released");
+            assert_eq!(released.quota_bucket, "queued");
+            let starts_before = harness.cli_session.turn_starts.lock().await.len();
+            let send_resume = |id: &str| {
+                let request = json!({
+                    "jsonrpc": "2.0", "id": id, "method": "task/resume",
+                    "params": {"taskId": task.task.id, "retryRevisionTurnId": revised.child_turn_id},
+                }).to_string();
+                let processor = Arc::clone(&processor);
+                let connection_id = harness.connection_id;
+                async move {
+                    processor
+                        .process_request_for_connection(connection_id, &request)
+                        .await
+                }
+            };
+            let reconcile = || {
+                processor.task_agent_executor.reconcile_child_turn_blocked(
+                    &thread.id,
+                    &revised.child_turn_id,
+                    &reason,
+                    super::super::TaskChildReconciliationOrigin::DurableBackground,
+                )
+            };
+            if automatic {
+                assert!(!reconcile().await.unwrap());
+                use crate::task_projection::{
+                    project_task_get, project_task_list, project_task_wait,
+                };
+                use pioneer_protocol::{TaskListParams, TaskRunStatus, TaskStatus, TaskWaitParams};
+
+                let service = processor.task_runtime.service();
+                let saved = store.get_task(&task.task.id).await.unwrap().unwrap();
+                assert_eq!(saved.task.status, TaskStatus::Blocked);
+                let saved_run = saved
+                    .runs
+                    .iter()
+                    .find(|saved_run| saved_run.id == run.id)
+                    .unwrap();
+                assert_eq!(saved_run.status, TaskRunStatus::Blocked);
+                assert!(saved_run.completed_at.is_some());
+
+                let get = project_task_get(&saved, true);
+                assert_eq!(get.task.status, TaskStatus::Waiting);
+                assert_eq!(get.task.completed_at, None);
+                assert_eq!(get.operator.unwrap().task.status, TaskStatus::Blocked);
+                assert!(get.revision_executions.iter().any(|execution| {
+                    execution.run_id == run.id
+                        && execution.status == pioneer_protocol::TaskRunTurnStatus::Blocked
+                        && execution.automatic_retry_pending
+                }));
+                let get_run = get
+                    .runs
+                    .iter()
+                    .find(|get_run| get_run.id == run.id)
+                    .unwrap();
+                assert_eq!(get_run.status, TaskRunStatus::Waiting);
+                assert_eq!(get_run.completed_at, None);
+
+                // The parent task card and separate occurrence card use the
+                // same builder for saved history and live item updates.
+                let mut card_task = saved.task.clone();
+                let mut card_run = saved_run.clone();
+                for (code, expected_status, expected_action) in [
+                    (TASK_REVISION_RETRY_PENDING, TaskStatus::Waiting, false),
+                    (
+                        pioneer_protocol::TASK_REVISION_RETRY_REQUIRED,
+                        TaskStatus::Blocked,
+                        true,
+                    ),
+                    (
+                        pioneer_protocol::TaskRevisionRetryBlocker::MissingBinding.code(),
+                        TaskStatus::Blocked,
+                        false,
+                    ),
+                ] {
+                    let error = card_run.error.as_mut().unwrap();
+                    error.code = code.to_owned();
+                    error.message = "private response /secret".to_owned();
+                    card_task.error = Some(error.clone());
+                    let detail = crate::task_projection::project_error(error).error.message;
+                    assert_eq!(detail.contains("task_resume"), expected_action);
+                    assert!(!detail.contains("/secret"));
+                    for (item_id, occurrence) in [
+                        (crate::task_tools::task_anchor_id(&card_task.id), None),
+                        (
+                            crate::task_tools::task_run_anchor_id(&card_run.id),
+                            Some(&card_run),
+                        ),
+                    ] {
+                        let card = crate::task_tools::task_turn_item_from_context(
+                            &store, &card_task, occurrence, None, None, item_id, None,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(card.status, expected_status);
+                        if expected_status == TaskStatus::Waiting {
+                            assert_eq!(card.error_preview, None);
+                            assert_eq!(card.progress_preview.as_deref(), Some(detail.as_str()));
+                        } else {
+                            assert_eq!(card.error_preview.as_deref(), Some(detail.as_str()));
+                            assert_eq!(card.progress_preview, None);
+                        }
+                    }
+                }
+
+                for status in [TaskStatus::Waiting, TaskStatus::Blocked] {
+                    let list = service
+                        .list_tasks(TaskListParams {
+                            workspace_id: harness.workspace_id.clone(),
+                            status: Some(status),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    let list = project_task_list(&list);
+                    let listed = list.tasks.iter().find(|listed| listed.id == task.task.id);
+                    if status == TaskStatus::Waiting {
+                        let listed = listed.expect("waiting filter includes the pending retry");
+                        assert_eq!(listed.status, get.task.status);
+                        assert_eq!(listed.completed_at, get.task.completed_at);
+                    } else {
+                        assert!(listed.is_none());
+                    }
+                }
+
+                let wait = service
+                    .get_wait_state_snapshot(TaskWaitParams {
+                        run_ids: vec![run.id.clone()],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let wait = project_task_wait(&wait);
+                assert_eq!(wait.terminal_count, 0);
+                assert!(wait.blocked.is_empty());
+                let [pending] = wait.pending.as_slice() else {
+                    panic!("one run should be pending");
+                };
+                assert_eq!(pending.task.status, get.task.status);
+                assert_eq!(pending.task.completed_at, get.task.completed_at);
+                let pending_run = pending.run.as_ref().unwrap();
+                assert_eq!(pending_run.status, get_run.status);
+                assert_eq!(pending_run.completed_at, get_run.completed_at);
+            } else {
+                let id = generate_test_request_id("revisionquota", "full");
+                send_resume(&id).await;
+                let error = recv_error_by_id(&mut harness.rx, &id).await;
+                let public = assert_public_error(
+                    &error,
+                    pioneer_protocol::PublicErrorCode::ResourceExhausted,
+                    pioneer_protocol::PublicErrorStage::Execution,
+                );
+                assert!(public.retryable);
+                assert_eq!(
+                    public.message,
+                    "Task execution quota is full. Retry when capacity is available."
+                );
+            }
+            assert_eq!(load_lease().await, released);
+            assert_eq!(
+                store
+                    .get_latest_task_run_turn(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .turn_id,
+                revised.child_turn_id
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts_before
+            );
+
+            quota::Entity::delete_by_id("quota-test-1")
+                .exec(&db)
+                .await
+                .unwrap();
+            harness
+                .cli_session
+                .set_next_native_turn_id("native-revision-after-quota".to_owned())
+                .await;
+            if automatic {
+                assert!(reconcile().await.unwrap());
+            } else {
+                let id = generate_test_request_id("revisionquota", "available");
+                send_resume(&id).await;
+                recv_response_by_id(&mut harness.rx, &id).await;
+            }
+            let active = load_lease().await;
+            assert_eq!(active.status, "active");
+            assert_eq!(active.released_at, None);
+            let retry = store
+                .get_latest_task_run_turn(&run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.id, revised.task_run_turn.id);
+            assert_eq!(retry.revision_execution_retry(&retry.turn_id), Some(1));
+            assert_eq!(retry.is_manual_revision_retry(), !automatic);
+            // Drive the normal revision dispatch if the scheduler has not
+            // already won the durable owner claim.
+            dispatch_revision_turn_for_test(&processor, revised.clone())
+                .await
+                .unwrap();
+            let starts =
+                wait_for_cli_runtime_turn_starts(&harness.cli_session, starts_before + 1).await;
+            assert_eq!(starts.len(), starts_before + 1);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(binding) = store
+                        .get_cli_runtime_turn_binding(&retry.turn_id)
+                        .await
+                        .unwrap()
+                        && binding.native_turn_id.as_deref() == Some("native-revision-after-quota")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            if !automatic {
+                let id = generate_test_request_id("revisionquota", "replay");
+                send_resume(&id).await;
+                recv_response_by_id(&mut harness.rx, &id).await;
+            }
+            assert_eq!(load_lease().await, active);
+            assert_eq!(
+                store
+                    .get_latest_task_run_turn(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .turn_id,
+                retry.turn_id
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts_before + 1
+            );
+        });
+    }
+}

@@ -5967,6 +5967,7 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
             .resume_task(
                 TaskMutationContext::default(),
                 TaskResumeParams {
+                    retry_revision_turn_id: None,
                     task_id: response.task.id.clone(),
                     reason: Some("continue".to_owned()),
                 },
@@ -6437,6 +6438,7 @@ async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
             .resume_task(
                 TaskMutationContext::default(),
                 TaskResumeParams {
+                    retry_revision_turn_id: None,
                     task_id: response.task.id.clone(),
                     reason: Some("retry without authority".to_owned()),
                 },
@@ -6452,6 +6454,7 @@ async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
             .resume_task(
                 context,
                 TaskResumeParams {
+                    retry_revision_turn_id: None,
                     task_id: response.task.id,
                     reason: Some("permissions confirmed".to_owned()),
                 },
@@ -9868,6 +9871,7 @@ async fn pause_running_recurring_task_preserves_run_and_resume_preserves_repetit
             .resume_task(
                 TaskMutationContext::default(),
                 TaskResumeParams {
+                    retry_revision_turn_id: None,
                     task_id: created.task.id.clone(),
                     reason: None,
                 },

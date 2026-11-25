@@ -2866,6 +2866,31 @@ impl ExecutionAuthorizationContext {
         Ok((execution, tasks))
     }
 
+    /// Derives Task retry quota from the original subject and currently
+    /// registered ceilings. Revision launch still revalidates authority.
+    pub(crate) fn task_revision_admission_seed(
+        admission: &pioneer_crud::TaskExecutionAdmissionRecord,
+    ) -> Result<pioneer_tasks::TaskExecutionAdmissionSeed> {
+        let context = Self::from_persisted_json(&admission.authorization_context_json)?;
+        anyhow::ensure!(
+            context.workspace_id() == admission.workspace_id
+                && context.root_thread_id() == admission.root_thread_id
+                && context.initiating_principal_id().as_str() == admission.initiating_principal_id,
+            "Task execution admission differs from its authority envelope"
+        );
+        let (execution_resources, task_resources) = context.admitted_resource_budgets()?;
+        Ok(pioneer_tasks::TaskExecutionAdmissionSeed {
+            workspace_id: admission.workspace_id.clone(),
+            root_thread_id: admission.root_thread_id.clone(),
+            initiating_principal_id: admission.initiating_principal_id.clone(),
+            authorization_context_json: admission.authorization_context_json.clone(),
+            role_key: context.role_key().to_owned(),
+            policy_fingerprint: context.policy_fingerprint().to_owned(),
+            execution_resources,
+            task_resources,
+        })
+    }
+
     /// Builds a concrete Turn admission from an immutable execution context
     /// after its current collaboration authority has been revalidated. The
     /// context remains frozen at its original admission generation; only this

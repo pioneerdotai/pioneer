@@ -6,9 +6,9 @@ use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
 };
 use crate::policy::{
-    TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext, TaskWaitContext,
-    default_delivery_policy_for_trigger, default_lifecycle_policy,
-    default_lifecycle_policy_for_trigger, default_retry_policy, is_webhook_spec,
+    TaskCreateContext, TaskMutationContext, TaskWaitContext, default_delivery_policy_for_trigger,
+    default_lifecycle_policy, default_lifecycle_policy_for_trigger, default_retry_policy,
+    is_webhook_spec,
 };
 use crate::projector::TaskProjector;
 use crate::reconciliation::TaskStartupReconciler;
@@ -2507,7 +2507,7 @@ impl TaskService {
         let execution_admission = context
             .execution_admission
             .clone()
-            .map(|seed| new_task_execution_admission(&task, std::slice::from_ref(&trigger), seed))
+            .map(|seed| seed.for_task(&task, std::slice::from_ref(&trigger)))
             .transpose()?;
         let actor_contract = build_task_actor_contract(&task, agent_spec.as_ref(), &context, now)?;
         let immediate_occurrence = immediate_run
@@ -3988,6 +3988,9 @@ impl TaskService {
         context: TaskMutationContext,
         params: TaskResumeParams,
     ) -> TaskRuntimeResult<TaskResumeResponse> {
+        if params.retry_revision_turn_id.is_some() {
+            bail!("fresh revision execution must be admitted through Gateway");
+        }
         let agent_action = context.agent_action_commit.clone();
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
@@ -3997,6 +4000,26 @@ impl TaskService {
                 .context("task_finish_requested: final stop cannot be reopened or updated"));
         }
 
+        if response.task.status == TaskStatus::Blocked
+            && response
+                .runs
+                .iter()
+                .max_by_key(|run| run.run_number)
+                .is_some_and(|run| {
+                    run.status == TaskRunStatus::Blocked
+                        && run.error.as_ref().is_some_and(|error| {
+                            matches!(
+                                error.code.as_str(),
+                                pioneer_protocol::TASK_REVISION_RETRY_PENDING
+                                    | pioneer_protocol::TASK_REVISION_RETRY_REQUIRED
+                            ) || pioneer_protocol::TaskRevisionRetryBlocker::from_code(&error.code)
+                                .is_some()
+                        })
+                })
+        {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("observe the existing revision or explicitly restart its execution"));
+        }
         let was_blocked = response.task.status == TaskStatus::Blocked;
         if is_terminal_task(response.task.status) && !was_blocked {
             return Err(
@@ -4011,11 +4034,9 @@ impl TaskService {
             response.task.executor_kind,
             context.execution_admission,
         ) {
-            (true, TaskExecutorKind::Agent, Some(seed)) => Some(new_task_execution_admission(
-                &response.task,
-                &response.triggers,
-                seed,
-            )?),
+            (true, TaskExecutorKind::Agent, Some(seed)) => {
+                Some(seed.for_task(&response.task, &response.triggers)?)
+            }
             (true, TaskExecutorKind::Agent, None) => {
                 bail!("blocked Agent Task requires an execution authorization readmission")
             }
@@ -5317,7 +5338,11 @@ impl TaskService {
         if response.task.status != TaskStatus::Scheduled {
             return Ok(None);
         }
-        if response.runs.iter().any(|run| !run.status.is_terminal()) {
+        if response
+            .runs
+            .iter()
+            .any(|run| !run.effective_status(&response.task).is_terminal())
+        {
             return Ok(None);
         }
         let next_fire_at = response
@@ -6662,45 +6687,6 @@ pub(crate) fn is_terminal_task(status: TaskStatus) -> bool {
     status.is_terminal()
 }
 
-fn new_task_execution_admission(
-    task: &Task,
-    triggers: &[TaskTrigger],
-    seed: TaskExecutionAdmissionSeed,
-) -> TaskRuntimeResult<pioneer_crud::NewTaskExecutionAdmission> {
-    if seed.workspace_id != task.workspace_id {
-        bail!("Task execution admission belongs to another workspace");
-    }
-    let scheduled = triggers.iter().any(|trigger| {
-        matches!(
-            trigger.kind(),
-            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-        ) || is_webhook_spec(&trigger.spec)
-    });
-    Ok(pioneer_crud::NewTaskExecutionAdmission {
-        task_id: task.id.clone(),
-        workspace_id: seed.workspace_id,
-        root_thread_id: seed.root_thread_id,
-        initiating_principal_id: seed.initiating_principal_id.clone(),
-        authorization_context_json: seed.authorization_context_json,
-        created_at: chrono::Utc::now().fixed_offset(),
-        execution_lease: Some(pioneer_crud::NewExecutionAdmissionLease {
-            id: format!("quota:task:{}", task.id),
-            subject_kind: "task".to_owned(),
-            subject_id: task.id.clone(),
-            operation_class: if scheduled {
-                pioneer_crud::ExecutionAdmissionClass::ScheduledTask
-            } else {
-                pioneer_crud::ExecutionAdmissionClass::QueuedTask
-            },
-            principal_id: seed.initiating_principal_id,
-            role_key: seed.role_key,
-            workspace_id: task.workspace_id.clone(),
-            policy_fingerprint: seed.policy_fingerprint,
-            policy: seed.execution_resources,
-        }),
-    })
-}
-
 pub(crate) fn is_terminal_run(status: TaskRunStatus) -> bool {
     status.is_terminal()
 }
@@ -6833,14 +6819,20 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
         match run.status {
             TaskRunStatus::Succeeded => return WaitItemState::Completed,
             TaskRunStatus::Failed | TaskRunStatus::TimedOut => return WaitItemState::Failed,
-            TaskRunStatus::Blocked => return WaitItemState::Blocked,
+            TaskRunStatus::Blocked => {
+                return if run.effective_status(&item.task) == TaskRunStatus::Waiting {
+                    WaitItemState::Pending
+                } else {
+                    WaitItemState::Blocked
+                };
+            }
             TaskRunStatus::Cancelled => return WaitItemState::Cancelled,
             TaskRunStatus::WaitingReview => return WaitItemState::ReviewRequired,
             _ => {}
         }
     }
 
-    match item.task.status {
+    match item.task.effective_status() {
         TaskStatus::Completed => WaitItemState::Completed,
         TaskStatus::Failed => WaitItemState::Failed,
         TaskStatus::Blocked => WaitItemState::Blocked,

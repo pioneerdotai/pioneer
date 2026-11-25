@@ -243,7 +243,14 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 _ => lock_reason,
             };
         }
-        let task = task_from_db_model(state.task.clone())?;
+        let mut task = task_from_db_model(state.task.clone())?;
+        if error.as_ref().is_some_and(|error| {
+            pioneer_protocol::TaskRevisionRetryBlocker::from_code(&error.code).is_some()
+        }) {
+            // A terminal sibling may own the aggregate result. It must
+            // never appear in the obsolete revision's blocked delivery.
+            task.result = None;
+        }
         let run = task_run_from_db_model(state.run.clone())?;
         let response = TaskGetResponse {
             task,
@@ -297,6 +304,9 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 error.clone(),
                 at,
             )?;
+        let revision_retry_pending = error
+            .as_ref()
+            .is_some_and(|error| error.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING);
         let mut delivery = None;
         let implicit_result = result.is_none();
         let implicit_error = error.is_none();
@@ -404,15 +414,17 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 .as_ref()
                 .map(|p| &p.policy)
                 .or(response.task.delivery_policy.as_ref());
-            if let Some(mut queued) = delivery_for_terminal_run(
-                &response,
-                policy,
-                &state.run.id,
-                at,
-                result,
-                error,
-                state.actor.delivery.destination_user_id.as_deref(),
-            ) {
+            if !revision_retry_pending
+                && let Some(mut queued) = delivery_for_terminal_run(
+                    &response,
+                    policy,
+                    &state.run.id,
+                    at,
+                    result,
+                    error,
+                    state.actor.delivery.destination_user_id.as_deref(),
+                )
+            {
                 if state.occurrence.retry_attempt > 0 {
                     queued.delivery_key = format!(
                         "retry:{}:{}",
@@ -460,6 +472,142 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             retry_scheduled,
             terminal_revision: None,
         })
+    }
+
+    /// Resolve the exact pending retry without changing the terminal run's
+    /// identity, retry generation, sibling state or trigger. The prior block
+    /// suppressed delivery, so settlement owns the one final delivery.
+    pub async fn stop_pending_task_revision_retry(
+        &self,
+        revision: &TaskRunTurn,
+        blocker: pioneer_protocol::TaskRevisionRetryBlocker,
+        now: i64,
+    ) -> Result<bool> {
+        use pioneer_entity::{task, task_run as run};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+        let change =
+            crate::work_change::TaskWorkChange::for_source(&self.connection, "r", &revision.run_id);
+        let outcome = self
+            .retry_write_on_conflict(|| async {
+                let Some(old_run) =
+                    task_run::find_run_by_id(&self.connection, &revision.run_id).await?
+                else {
+                    return Ok((true, false));
+                };
+                let model = task_run_from_db_model(old_run.clone())?;
+                let Some(mut error) = model
+                    .error
+                    .filter(|e| e.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING)
+                else {
+                    return Ok((true, false));
+                };
+                blocker.apply(&mut error);
+                let mut prepared = self
+                    .prepare_task_terminal_transition(TaskEventPayload::RunBlocked {
+                        task_id: revision.task_id.clone(),
+                        run_id: revision.run_id.clone(),
+                        error: Some(error),
+                        blocked_at: now,
+                    })
+                    .await?;
+                prepared.events.retain(|event| {
+                    matches!(event.payload(), TaskEventPayload::DeliveryQueued { .. })
+                });
+                prepared.events.extend(
+                    prepare_task_events_for_write(
+                        &self.connection,
+                        vec![TaskEventPayload::TaskRecovered {
+                            task_id: revision.task_id.clone(),
+                            run_id: Some(revision.run_id.clone()),
+                            message: blocker.message().to_owned(),
+                            recovered_at: now,
+                        }],
+                    )
+                    .await?,
+                );
+
+                let tx = self.connection.begin().await?;
+                crate::event_log::lock_task(&tx, &revision.task_id).await?;
+                let current = load_terminal_state(&tx, &revision.task_id, &revision.run_id).await?;
+                let latest = task_run_turn::find_latest_turn_by_run(&tx, &revision.run_id)
+                    .await?
+                    .map(task_run_turn_from_db_model)
+                    .transpose()?;
+                if current.run.status != "blocked" || latest.as_ref() != Some(revision) {
+                    tx.rollback().await?;
+                    return Ok((true, false));
+                }
+                if current.run.error_json != old_run.error_json
+                    || !same_transition_state(&prepared.state, &current)
+                    || (blocker == pioneer_protocol::TaskRevisionRetryBlocker::NewerRun
+                        && current.latest_run_number <= current.run.run_number)
+                {
+                    tx.rollback().await?;
+                    return Ok((false, false));
+                }
+                let expected_error = old_run
+                    .error_json
+                    .as_deref()
+                    .context("pending retry error disappeared")?;
+                let sequence = crate::completion_inbox::next_completion_sequence(&tx).await?;
+                let updated = run::Entity::update_many()
+                    .filter(run::Column::Id.eq(&revision.run_id))
+                    .filter(run::Column::Status.eq("blocked"))
+                    .filter(run::Column::ErrorJson.eq(expected_error))
+                    .col_expr(
+                        run::Column::ErrorJson,
+                        Expr::value(prepared.error_json.clone()),
+                    )
+                    .col_expr(run::Column::UpdatedAt, Expr::value(unix_to_datetime(now)))
+                    // The logical completion occurs at settlement. Inbox
+                    // eligibility and the page cursor both use this timestamp.
+                    .col_expr(run::Column::CompletedAt, Expr::value(unix_to_datetime(now)))
+                    .col_expr(run::Column::InboxSequence, Expr::value(sequence))
+                    .exec(&tx)
+                    .await?;
+                if updated.rows_affected == 0 {
+                    tx.rollback().await?;
+                    return Ok((false, false));
+                }
+                if current.task.status == "blocked" && current.task.error_json == old_run.error_json
+                {
+                    task::Entity::update_many()
+                        .filter(task::Column::Id.eq(&revision.task_id))
+                        .filter(task::Column::Revision.eq(current.task.revision))
+                        .filter(task::Column::Status.eq("blocked"))
+                        .filter(task::Column::ErrorJson.eq(expected_error))
+                        .col_expr(task::Column::ErrorJson, Expr::value(prepared.error_json))
+                        .col_expr(
+                            task::Column::CompletedAt,
+                            Expr::value(unix_to_datetime(now)),
+                        )
+                        .col_expr(task::Column::UpdatedAt, Expr::value(unix_to_datetime(now)))
+                        .exec(&tx)
+                        .await?;
+                }
+                let new_run = task_run::find_run_by_id(&tx, &revision.run_id).await?;
+                crate::task_occurrence_producers::run_change(
+                    &tx,
+                    Some(&current.run),
+                    new_run.as_ref(),
+                )
+                .await?;
+                append_task_events_in_connection_with_delivery_policy(
+                    &tx,
+                    prepared.events,
+                    now,
+                    false,
+                    &self.outputs,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok((true, true))
+            })
+            .await;
+        if let Ok((_, changed)) = &outcome {
+            change.completed(*changed);
+        }
+        outcome.map(|(done, _)| done)
     }
 
     pub async fn commit_task_terminal_transition(

@@ -616,7 +616,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn authorize_member_task_request(
+    async fn authorize_task_request(
         &self,
         context: &crate::request_context::RequestContext,
         request: &JsonRpcRequest,
@@ -1260,12 +1260,19 @@ impl MessageProcessor {
                 }
             };
         }
-        if !action_gate.is_final_allow()
-            && (entry.resolver == ResourceResolverKind::Task
-                || request.method == methods::TASK_CREATE)
+        // These reads charge observation capacity to the task's workspace,
+        // including when the caller already has an absolute grant.
+        let needs_task_workspace = matches!(
+            request.method.as_str(),
+            methods::TASK_GET | methods::TASK_TREE | methods::TASK_EVENTS
+        );
+        if needs_task_workspace
+            || (!action_gate.is_final_allow()
+                && (entry.resolver == ResourceResolverKind::Task
+                    || request.method == methods::TASK_CREATE))
         {
             return self
-                .authorize_member_task_request(context, request, entry, &action_gate, &resolver)
+                .authorize_task_request(context, request, entry, &action_gate, &resolver)
                 .await;
         }
         if matches!(

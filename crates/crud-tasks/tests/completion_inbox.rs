@@ -37,6 +37,200 @@ async fn saved_result_item(db: &impl ConnectionTrait, turn: &str, item: &str) {
 }
 
 #[pioneer_postgres_test::postgres_test]
+async fn inbox_waits_for_a_revision_retry_to_settle_before_showing_or_reading_the_run() {
+    use pioneer_entity::{task as task_row, task_run, task_run_read};
+    use pioneer_protocol::{
+        TASK_REVISION_RETRY_PENDING, TaskCompletionInboxViewedParams, TaskRunStatus,
+    };
+    use sea_orm::{Set, sea_query::Expr};
+
+    let fixture = fixture().await;
+    let db = fixture.connection();
+    let thread_id = "T0000000000000000000P";
+    let task_id = "visible-revision";
+    let run_id = "retry-run";
+    let ordinary_block = "ordinary-block";
+    let recipient = access(A);
+    let read_at = "2026-10-16 12:00:00 +00:00";
+
+    task(
+        db,
+        task_id,
+        Some(thread_id),
+        None,
+        "agent",
+        "thread",
+        "detached",
+    )
+    .await;
+    let error_json = |code| {
+        serde_json::json!({
+            "code": code, "message": "saved\0error", "class": "internal"
+        })
+        .to_string()
+    };
+    let pending_error = error_json(TASK_REVISION_RETRY_PENDING);
+    let ordinary_error = error_json("ordinary_block");
+    task_row::Entity::update_many()
+        .filter(task_row::Column::Id.eq(task_id))
+        .col_expr(task_row::Column::Status, Expr::value("blocked"))
+        .col_expr(
+            task_row::Column::ErrorJson,
+            Expr::value(pending_error.clone()),
+        )
+        .col_expr(
+            task_row::Column::DeliveryPolicyJson,
+            Expr::value(serde_json::json!({
+                "mode": "thread", "threadTarget": "origin_thread", "threadId": thread_id,
+                "includeResult": true, "format": "summary"
+            })),
+        )
+        .exec(db)
+        .await
+        .unwrap();
+    run(db, run_id, task_id, "blocked", 1).await;
+    task_run::Entity::update(task_run::ActiveModel {
+        id: Set(run_id.into()),
+        result_json: Set(None),
+        error_json: Set(Some(pending_error.clone())),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .unwrap();
+
+    task(
+        db,
+        "ordinary-task",
+        Some(thread_id),
+        None,
+        "agent",
+        "thread",
+        "detached",
+    )
+    .await;
+    run(db, ordinary_block, "ordinary-task", "blocked", 1).await;
+    task_row::Entity::update_many()
+        .filter(task_row::Column::Id.eq("ordinary-task"))
+        .col_expr(task_row::Column::Status, Expr::value("blocked"))
+        .col_expr(
+            task_row::Column::ErrorJson,
+            Expr::value(ordinary_error.clone()),
+        )
+        .exec(db)
+        .await
+        .unwrap();
+    task_run::Entity::update(task_run::ActiveModel {
+        id: Set(ordinary_block.into()),
+        error_json: Set(Some(ordinary_error.clone())),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .unwrap();
+
+    for (status, expected_id, expected_error) in [
+        ("waiting", task_id, &pending_error),
+        ("blocked", "ordinary-task", &ordinary_error),
+    ] {
+        let tasks = pioneer_crud_tasks::task::list_tasks_by_workspace_status_scoped(
+            db,
+            recipient.workspace_id,
+            Some(status),
+            Some(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, expected_id);
+        assert_eq!(tasks[0].error_json.as_ref(), Some(expected_error));
+    }
+    let page = list_task_completion_inbox(db, &recipient, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].run_id, ordinary_block);
+    assert_eq!(page[0].status, TaskRunStatus::Blocked);
+    assert_eq!(unread(db, A).await, 1);
+    assert!(
+        find_task_completion_inbox_entry(db, &recipient, run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let patch = find_unread_task_completion_inbox_entries(db, &recipient, &[run_id.into()])
+        .await
+        .unwrap();
+    assert!(patch.is_empty());
+    assert_eq!(unread(db, A).await, 1);
+
+    mark_task_completion_inbox_read(db, &recipient, run_id, read_at)
+        .await
+        .unwrap();
+    let viewed = TaskCompletionInboxViewedParams {
+        workspace_id: recipient.workspace_id.into(),
+        thread_id: thread_id.into(),
+        run_ids: vec![run_id.into()],
+        result_turn_ids: vec![],
+        result_items: vec![],
+    };
+    assert!(
+        mark_viewed_task_completion_inbox_read(db, &recipient, &viewed, read_at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    mark_all_task_completion_inbox_read(db, &recipient, read_at)
+        .await
+        .unwrap();
+    let receipts = task_run_read::Entity::find().all(db).await.unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].run_id, ordinary_block);
+
+    // Recovery clears the intermediate error and publishes the final result
+    // using the same logical Run ID and a fresh completion boundary.
+    let completed_at = "2026-10-16T12:30:00Z"
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .unwrap();
+    task_run::Entity::update(task_run::ActiveModel {
+        id: Set(run_id.into()),
+        status: Set("succeeded".into()),
+        completed_at: Set(Some(completed_at)),
+        result_json: Set(Some(
+            serde_json::json!({"summary": "done", "artifacts": []}).to_string(),
+        )),
+        error_json: Set(None),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .unwrap();
+    let page = list_task_completion_inbox(db, &recipient, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    let completion = &page[0];
+    assert_eq!(completion.run_id, run_id);
+    assert_eq!(completion.status, TaskRunStatus::Succeeded);
+    assert_eq!(completion.summary.as_deref(), Some("done"));
+    assert_eq!(completion.read_at, None);
+    let patch = find_unread_task_completion_inbox_entries(db, &recipient, &[run_id.into()])
+        .await
+        .unwrap();
+    assert_eq!(patch.len(), 1);
+    assert_eq!(patch[0].run_id, run_id);
+    assert_eq!(unread(db, A).await, 1);
+
+    mark_task_completion_inbox_read(db, &recipient, run_id, "2026-10-16 13:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(db, A).await, 0);
+    assert_eq!(unread(db, B).await, 2);
+}
+
+#[pioneer_postgres_test::postgres_test]
 async fn visible_results_resolve_exact_occurrence_and_delivery_with_personal_cross_device_receipts()
 {
     use pioneer_protocol::TaskCompletionInboxViewedParams;
