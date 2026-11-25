@@ -218,7 +218,7 @@ pub use id::{
     AuthDomainIdError, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId, GatewayIdError,
     InvitationId, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId,
     SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
-    TokenFamilyId, WorkspaceId, generate_id,
+    TokenFamilyId, WorkspaceId, generate_id, stable_derived_id,
 };
 pub use identity::{
     AGENT_DISPLAY_NAME_MAX_SCALARS, AGENT_DISPLAY_NAME_MAX_UTF8_BYTES, AGENT_NICKNAME_MAX_LEN,

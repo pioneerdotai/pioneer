@@ -107,11 +107,23 @@ pub struct PreparedExecutionObservation {
     timing: TimingInput,
 }
 impl ExecutionObservationInput {
+    const MAX_ID_BYTES: usize = 256;
+
+    /// Bound generated operation IDs before validation. Persisted keys that
+    /// fit the original byte limit must keep exactly the same identity.
+    pub fn bounded_operation_id(id: String) -> String {
+        if id.len() <= Self::MAX_ID_BYTES {
+            id
+        } else {
+            pioneer_protocol::stable_derived_id("obs1_", &[&id])
+        }
+    }
+
     pub fn prepare(mut self) -> Result<PreparedExecutionObservation> {
         ensure!(self.revision >= 0, "negative observation revision");
         for id in [&self.workspace_id, &self.operation_id, &self.owner_id] {
             ensure!(
-                !id.is_empty() && id.len() <= 256,
+                !id.is_empty() && id.len() <= Self::MAX_ID_BYTES,
                 "invalid observation identity"
             );
         }
@@ -251,13 +263,22 @@ async fn commit_revision_inner<C: ConnectionTrait>(
         );
     }
     if let Some(previous) = &previous {
+        // Older runtime phases could persist a raw parent ID above the limit.
+        // Accept its canonical spelling on replay without rewriting the old fact.
+        let same_parent = previous.parent_operation_id == i.parent_operation_id
+            || (i.kind == "runtime_phase"
+                && previous.parent_operation_id.as_ref().is_some_and(|parent| {
+                    parent.len() > ExecutionObservationInput::MAX_ID_BYTES
+                        && i.parent_operation_id.as_deref()
+                            == Some(bound_causal_parent(parent.clone()).as_str())
+                }));
         ensure!(
             previous.thread_id == i.thread_id
                 && previous.turn_id == i.turn_id
                 && previous.owner_kind == i.owner_kind
                 && previous.owner_id == i.owner_id
                 && previous.kind == i.kind
-                && previous.parent_operation_id == i.parent_operation_id,
+                && same_parent,
             "observation immutable ownership conflict"
         );
         if prepared.expected_previous_sequence.is_none() && previous.source_revision >= revision {
@@ -929,6 +950,15 @@ pub fn prepare_event(payload: &TurnEventPayload) -> Result<Option<PreparedExecut
             facts = details.clone();
             let usage = &details["usage"];
             operation_id = format!("provider:{}:{}", payload.turn_id(), item.item_id());
+            if operation_id.len() > ExecutionObservationInput::MAX_ID_BYTES {
+                facts
+                    .as_object_mut()
+                    .context("provider usage facts must be an object")?
+                    .insert(
+                        "provider_source_item_id".into(),
+                        serde_json::json!(item.item_id()),
+                    );
+            }
             kind = "provider_attempt".into();
             purpose = details["purpose"].as_str().unwrap_or("unknown").into();
             provider = details["provider"].as_str().map(str::to_owned);
@@ -957,18 +987,18 @@ pub fn prepare_event(payload: &TurnEventPayload) -> Result<Option<PreparedExecut
     Ok(Some(
         ExecutionObservationInput {
             workspace_id: payload.workspace_id().into(),
-            operation_id,
+            operation_id: ExecutionObservationInput::bounded_operation_id(operation_id),
             revision: 0,
             thread_id: Some(payload.thread_id().into()),
             turn_id: Some(payload.turn_id().into()),
             owner_kind: "turn".into(),
             owner_id: payload.turn_id().into(),
             parent_operation_id: if matches!(kind.as_str(), "provider_phase" | "runtime_phase") {
-                details_parent(&facts)
+                details_parent(&facts).map(bound_causal_parent)
             } else if kind == "tool_invocation" {
                 facts["observation"]["parentOperationId"]
                     .as_str()
-                    .map(str::to_owned)
+                    .map(|id| bound_causal_parent(id.to_owned()))
                     .or_else(|| Some(format!("turn:{}", payload.turn_id())))
             } else {
                 Some(format!("turn:{}", payload.turn_id()))
@@ -1071,10 +1101,18 @@ fn prepare_lifecycle_event(
         _ => return Ok(None),
     };
     let identity = payload.idempotency_key()?;
+    let operation_id = ExecutionObservationInput::bounded_operation_id(format!(
+        "phase:{}:{identity}",
+        payload.turn_id()
+    ));
+    let parent_operation_id = match parent {
+        Some(id) => bound_causal_parent(format!("item:{}:{id}", payload.turn_id())),
+        None => format!("turn:{}", payload.turn_id()),
+    };
     ExecutionObservationInput {
-        workspace_id:payload.workspace_id().into(),operation_id:format!("phase:{}:{identity}",payload.turn_id()),revision:0,
+        workspace_id:payload.workspace_id().into(),operation_id,revision:0,
         thread_id:Some(payload.thread_id().into()),turn_id:Some(payload.turn_id().into()),owner_kind:"turn".into(),owner_id:payload.turn_id().into(),
-        parent_operation_id:Some(parent.map(|id|format!("item:{}:{id}",payload.turn_id())).unwrap_or_else(||format!("turn:{}",payload.turn_id()))),
+        parent_operation_id:Some(parent_operation_id),
         kind:"runtime_phase".into(),purpose:"runtime".into(),provider:None,model:None,status:"observed".into(),recorded_at_ms:chrono::Utc::now().timestamp_millis(),
         facts:serde_json::json!({"event_type":payload.event_type(),"details":details,"ts_unix_ms":source_time,
             "timing":{"basis":if source_time.is_some(){"source_wall_point"}else{"recorded_event_order_only"},"coverage":"no_inferred_wait_duration"}}),tariff_evidence:None,
@@ -1087,6 +1125,14 @@ pub async fn commit_event<C: ConnectionTrait>(
     sequence: i64,
 ) -> Result<()> {
     commit_revision(db, prepared, sequence).await
+}
+
+fn bound_causal_parent(id: String) -> String {
+    if id.starts_with("turn:") {
+        id
+    } else {
+        ExecutionObservationInput::bounded_operation_id(id)
+    }
 }
 
 fn details_parent(facts: &Value) -> Option<String> {
@@ -1555,9 +1601,14 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
             .one(self.connection)
             .await?
             .context("retained source thread missing")?;
+        let delivery_hash = hex::encode(Sha256::digest(delivery_key.as_bytes()));
+        let operation_id = ExecutionObservationInput::bounded_operation_id(format!(
+            "tool-source:{}:{delivery_hash}",
+            entry.turn_id
+        ));
         ExecutionObservationInput {
             workspace_id:thread.workspace_id,
-            operation_id:format!("tool-source:{}:{}",entry.turn_id,hex::encode(Sha256::digest(delivery_key.as_bytes()))),
+            operation_id,
             revision:0,thread_id:Some(turn.thread_id),turn_id:Some(entry.turn_id.clone()),
             owner_kind:"turn".into(),owner_id:entry.turn_id.clone(),
             parent_operation_id:Some(format!("turn:{}",entry.turn_id)),

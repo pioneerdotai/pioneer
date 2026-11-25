@@ -1677,10 +1677,10 @@ pub(super) async fn run_agent_loop(
                 let mut turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 let recovery = recovery_context(&recovery_request);
                 turn_control.restored_recovery = Some((
-                    format!(
+                    NativeTerminalEffectPreparation::bounded_id(format!(
                         "{}:terminal-effects:{run_id}:{}:recovery:{}",
                         active_request.turn_id, runtime_snapshot.generation, recovery.attempt_id
-                    ),
+                    )),
                     recovery.clone(),
                 ));
 
@@ -2441,7 +2441,9 @@ fn terminal_effect_preparation(
             .clone()
             .expect("task cleanup provider and runtime contract are captured atomically");
         effects.push(NativeTerminalEffectSpec {
-            effect_id: format!("{turn_id}:terminal-effect:attached-task-cleanup"),
+            effect_id: NativeTerminalEffectPreparation::bounded_id(format!(
+                "{turn_id}:terminal-effect:attached-task-cleanup"
+            )),
             effect_kind: NativeTerminalEffectKind::AttachedTaskCleanup,
             gate: NativeTerminalEffectGate::TerminalCommit,
             payload: NativeTerminalEffectPayload::AttachedTaskCleanup {
@@ -2453,10 +2455,10 @@ fn terminal_effect_preparation(
     }
 
     NativeTerminalEffectPreparation {
-        batch_id: format!(
+        batch_id: NativeTerminalEffectPreparation::bounded_id(format!(
             "{turn_id}:terminal-effects:{run_id}:{}",
             runtime_snapshot.generation
-        ),
+        )),
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),

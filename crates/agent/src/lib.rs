@@ -4682,10 +4682,10 @@ impl AgentManager {
         if thread.workspace_id != preparation.workspace_id
             || !control.initial_cancellation_registration
             || preparation.batch_id
-                != format!(
+                != pioneer_protocol::NativeTerminalEffectPreparation::bounded_id(format!(
                     "{}:terminal-effects:{}:{}",
                     preparation.turn_id, control.run_id, preparation.runtime_generation
-                )
+                ))
         {
             return None;
         }
@@ -4711,10 +4711,10 @@ impl AgentManager {
         if !control.initial_cancellation_registration
             || !control.turn_cancellation_token.is_cancelled()
             || preparation.batch_id
-                != format!(
+                != pioneer_protocol::NativeTerminalEffectPreparation::bounded_id(format!(
                     "{}:terminal-effects:{}:{}",
                     preparation.turn_id, control.run_id, preparation.runtime_generation
-                )
+                ))
         {
             return None;
         }

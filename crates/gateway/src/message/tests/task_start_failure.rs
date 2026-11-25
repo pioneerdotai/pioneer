@@ -2955,9 +2955,119 @@ async fn expire_revision_admission_claim(store: &CrudStore, run_id: &str) {
         .unwrap();
 }
 
+// Persist the same event shape as the old admission path. The fixture uses a
+// long child identity to reproduce an admitted revision waiting for dispatch.
+async fn seed_legacy_revision_request(
+    store: &CrudStore,
+    mut candidate: TaskResultCandidate,
+    params: &TaskReviseParams,
+    principal: pioneer_protocol::PrincipalId,
+) -> String {
+    use pioneer_protocol::{TaskResultReviewerRef, TaskRunTurn};
+
+    let now = now_timestamp_secs();
+    let round = candidate.round + 1;
+    let round_suffix = format!("_{round}");
+    let padding = "x".repeat(126 - "revise_".len() - candidate.id.len() - round_suffix.len());
+    let turn_id = format!("revise_{}{padding}{round_suffix}", candidate.id);
+    let id = format!("trt_{turn_id}");
+    let event_id = format!("trre_{}", pioneer_protocol::generate_id(21));
+    let review_event = pioneer_protocol::TaskResultReviewEvent {
+        id: event_id.clone(),
+        candidate_id: candidate.id.clone(),
+        task_id: candidate.task_id.clone(),
+        run_id: candidate.run_id.clone(),
+        task_run_turn_id: candidate.task_run_turn_id.clone(),
+        reviewer_kind: TaskResultReviewerKind::User,
+        reviewer_user_id: Some(principal.to_string()),
+        reviewer: TaskResultReviewerRef::Principal(principal),
+        reviewer_thread_id: None,
+        reviewer_turn_id: None,
+        reviewer_agent_spec_id: None,
+        event_kind: pioneer_protocol::TaskResultReviewEventKind::Decision,
+        decision: TaskResultReviewDecision::RequestChanges,
+        feedback_text: Some(params.feedback.clone()),
+        feedback: None,
+        confidence: None,
+        supersedes_review_event_id: None,
+        next_task_run_turn_id: Some(id.clone()),
+        created_at: now,
+    };
+    candidate.status = TaskResultCandidateStatus::Rejected;
+    candidate.final_review_event_id = Some(event_id.clone());
+    candidate.updated_at = now;
+    candidate.resolved_at = Some(now);
+    let execution = store
+        .load_execution_for_run(&candidate.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let sequence = store
+        .list_task_run_turns(&candidate.run_id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|turn| turn.sequence)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let revision = TaskRunTurn {
+        id: id.clone(),
+        task_id: candidate.task_id.clone(),
+        run_id: candidate.run_id.clone(),
+        execution_id: Some(execution.id),
+        thread_id: candidate.thread_id.clone(),
+        turn_id: turn_id.clone(),
+        kind: TaskRunTurnKind::Revision,
+        round,
+        sequence,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: Some(candidate.id.clone()),
+        requested_by_review_event_id: Some(event_id.clone()),
+        created_at: now,
+        started_at: Some(now),
+        completed_at: None,
+    };
+    store
+        .append_task_events(
+            vec![
+                TaskEventPayload::TaskResultReviewEventRecorded { review_event },
+                TaskEventPayload::TaskResultCandidateRejected {
+                    candidate: candidate.clone(),
+                    review_event_id: event_id.clone(),
+                },
+                TaskEventPayload::TaskRevisionRequested {
+                    task_id: revision.task_id.clone(),
+                    run_id: revision.run_id.clone(),
+                    previous_candidate_id: candidate.id.clone(),
+                    requested_by_review_event_id: event_id.clone(),
+                    task_run_turn_id: id,
+                    thread_id: revision.thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    round,
+                    feedback: params.feedback.clone(),
+                    requested_at: now,
+                },
+                TaskEventPayload::TaskRunTurnStarted {
+                    task_run_turn: revision,
+                },
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+    turn_id
+}
+
 #[test]
 fn revision_admission_and_recovery_share_one_execution_claim() {
-    for case in ["request_first", "recovery_first", "abandoned_claim"] {
+    for case in [
+        "request_first",
+        "recovery_first",
+        "abandoned_claim",
+        "legacy_turn",
+    ] {
         capture_task_start(async move {
             let (harness, processor) = review_cli_fixture().await;
             let (task, child) =
@@ -2989,24 +3099,39 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                 TaskResultCandidateStatus::PendingReview,
             )
             .await;
+            let principal = authenticated_test_superuser().principal_id.clone();
+            let params = TaskReviseParams {
+                task_id: task.task.id.clone(),
+                run_id: run.id.clone(),
+                candidate_id: candidate.id.clone(),
+                feedback: "Return the corrected result in this worker.".to_owned(),
+                additional_instructions: Vec::new(),
+            };
+            let store = &harness.crud_store;
+            let legacy_turn_id = if case == "legacy_turn" {
+                Some(
+                    seed_legacy_revision_request(store, candidate, &params, principal.clone())
+                        .await,
+                )
+            } else {
+                None
+            };
             let revised = processor
                 .task_runtime
                 .service()
                 .revise_task_result_candidate(
-                    pioneer_tasks::TaskMutationContext::user(
-                        authenticated_test_superuser().principal_id.to_string(),
-                    ),
-                    pioneer_protocol::TaskReviseParams {
-                        task_id: task.task.id.clone(),
-                        run_id: run.id.clone(),
-                        candidate_id: candidate.id,
-                        feedback: "Return the corrected result in this worker.".to_owned(),
-                        additional_instructions: Vec::new(),
-                    },
+                    pioneer_tasks::TaskMutationContext::user(principal.to_string()),
+                    params.clone(),
                 )
                 .await
                 .unwrap();
-            let store = &harness.crud_store;
+            if let Some(legacy_turn_id) = &legacy_turn_id {
+                assert!(revised.already_requested);
+                assert_eq!(&revised.child_turn_id, legacy_turn_id);
+            } else {
+                assert!(!revised.already_requested);
+                assert_eq!(revised.child_turn_id.len(), 44);
+            }
             // Stop at the durable request/Turn materialization boundary. No
             // scheduler loop or sleeps choose which contender reaches it first.
             assert!(
@@ -3023,7 +3148,7 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                 .set_next_native_turn_id(revision_native_turn_id)
                 .await;
             let now = now_timestamp_secs();
-            if case == "request_first" {
+            if matches!(case, "request_first" | "legacy_turn") {
                 dispatch_revision_turn_for_test(&processor, revised.clone())
                     .await
                     .unwrap();
@@ -3155,7 +3280,19 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                     .status,
                 TurnStatus::InProgress
             );
-            dispatch_revision_turn_for_test(&processor, revised.clone())
+            let replayed = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(principal.to_string()),
+                    params,
+                )
+                .await
+                .unwrap();
+            assert!(replayed.already_requested);
+            assert_eq!(replayed.child_turn_id, revised.child_turn_id);
+            assert_eq!(replayed.task_run_turn.id, revised.task_run_turn.id);
+            dispatch_revision_turn_for_test(&processor, replayed)
                 .await
                 .unwrap();
             assert_eq!(
@@ -3163,6 +3300,25 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                 activations + 1,
                 "repeated dispatch must not start another native Turn"
             );
+            if let Some(legacy_turn_id) = legacy_turn_id {
+                let raw_id = format!("item:{legacy_turn_id}:user_{legacy_turn_id}");
+                assert_eq!(raw_id.len(), 263);
+                let operation_id =
+                    pioneer_crud::ExecutionObservationInput::bounded_operation_id(raw_id);
+                let observation = store
+                    .execution_observation_latest(
+                        &harness.workspace_id,
+                        &revised.child_thread_id,
+                        &operation_id,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the legacy user item should have a durable observation");
+                assert_eq!(
+                    observation.turn_id.as_deref(),
+                    Some(legacy_turn_id.as_str())
+                );
+            }
             complete_recorded_cli_task_turn(
                 &processor,
                 &harness.cli_session,
