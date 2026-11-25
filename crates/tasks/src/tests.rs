@@ -986,6 +986,7 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
     assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
         native_context: None,
+        codex_model_options: None,
         native_summary: None,
         webhook_secret_ref: None,
         conversation_frozen_hold: None,

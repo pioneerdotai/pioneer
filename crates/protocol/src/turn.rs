@@ -1526,6 +1526,28 @@ pub enum CLIAgentRuntimeKind {
     OpenCode,
 }
 
+/// Model options sent by the Codex adapter in addition to reasoning effort.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexTurnModelOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl CodexTurnModelOptions {
+    pub fn into_cli_runtime_options(self) -> TurnCLIRuntimeOptions {
+        TurnCLIRuntimeOptions {
+            personality: self.personality,
+            summary: self.summary,
+            effort: None,
+            sandbox: None,
+            steer_if_active: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnCLIRuntimeOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]

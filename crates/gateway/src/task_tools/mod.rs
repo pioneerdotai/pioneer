@@ -10,20 +10,20 @@ use pioneer_protocol::PrincipalKind;
 use pioneer_protocol::{
     AgentControlTaskToolInput, AgentModelToolName, AgentReviewDecision, AgentReviewTaskToolInput,
     AgentScheduleTaskToolInput, AgentTaskControl, AgentTaskToolInput, AgentToolCapability,
-    AgentToolIdentityChoice, AgentToolLaunchSelection, AgentToolProfileChoice,
-    ItemCompletedNotification, ItemUpdatedNotification, PublicTaskReviewContent, Task,
-    TaskAcceptParams, TaskAcceptResponse, TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode,
-    TaskCancelParams, TaskCancelScope, TaskCompletionBehavior, TaskCreateParams,
-    TaskCreateResponse, TaskDeliveryMode, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskFinishParams,
-    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor,
-    TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
-    TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams,
-    TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus,
-    TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
-    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
-    TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
+    AgentToolLaunchSelection, AgentToolProfileChoice, ItemCompletedNotification,
+    ItemUpdatedNotification, PublicTaskReviewContent, Task, TaskAcceptParams, TaskAcceptResponse,
+    TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
+    TaskCompletionBehavior, TaskCreateParams, TaskCreateResponse, TaskDeliveryMode,
+    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
+    TaskExternalTriggerFilter, TaskFinishParams, TaskGetParams, TaskGetResponse,
+    TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
+    TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind,
+    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput,
+    TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
+    TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -1204,6 +1204,9 @@ impl TaskToolAuthorizationScope {
     }
 }
 
+pub(crate) const TASK_LAUNCH_SELECTION_ERROR: &str = "agent_execution_selection_not_allowed: check launch identity, model and reasoning with threads_identity_models_list. Use launch.useDefaultReasoning=true for the selected model's default.";
+pub(crate) const TASK_LAUNCH_UNAVAILABLE_ERROR: &str = "agent_execution_profile_unavailable: the selected launch is unavailable. Check launch options before retrying.";
+
 fn task_tool_authorization_error() -> ToolError {
     ToolError::Rejected("task_access_denied: unavailable to this execution; this does not confirm absence or cancellation".to_owned())
 }
@@ -1245,6 +1248,18 @@ pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
                 ToolError::Rejected(message)
             }
         }
+        ToolError::InvalidArguments(message)
+            if message == "agent_execution_selection_not_allowed"
+                || message == TASK_LAUNCH_SELECTION_ERROR =>
+        {
+            ToolError::invalid_arguments(TASK_LAUNCH_SELECTION_ERROR)
+        }
+        ToolError::InvalidArguments(message)
+            if message == "agent_execution_profile_unavailable"
+                || message == TASK_LAUNCH_UNAVAILABLE_ERROR =>
+        {
+            ToolError::invalid_arguments(TASK_LAUNCH_UNAVAILABLE_ERROR)
+        }
         ToolError::InvalidArguments(_) => ToolError::invalid_arguments("task_invalid_arguments"),
         ToolError::NotFound(_) | ToolError::NotVisible(_) | ToolError::Rejected(_) => {
             task_tool_authorization_error()
@@ -1254,6 +1269,12 @@ pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
             if message == "task is unavailable for the current execution" =>
         {
             task_tool_authorization_error()
+        }
+        ToolError::ExecutionFailed(message)
+            if message == "agent_execution_profile_unavailable"
+                || message == TASK_LAUNCH_UNAVAILABLE_ERROR =>
+        {
+            ToolError::execution_failed(TASK_LAUNCH_UNAVAILABLE_ERROR)
         }
         ToolError::ExecutionFailed(message) if message.starts_with("agent_") => {
             match crate::message::agent_action_tools::sanitize_agent_tool_error(
@@ -1628,26 +1649,50 @@ impl TaskToolHandler {
                     if arguments.get("retryRevisionTurnId").is_some_and(JsonValue::is_string)))
     }
 
-    fn bind_cli_mutation_receipt(
+    fn mutation_arguments_fingerprint(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<String, ToolError> {
+        let custom;
+        let arguments = match &invocation.payload {
+            ToolPayload::Function { arguments } => arguments,
+            ToolPayload::Custom { input }
+                if !self.cli_replay && invocation.tool_name == TASK_CREATE_TOOL =>
+            {
+                custom = serde_json::from_str(input)
+                    .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+                &custom
+            }
+            _ => return Err(ToolError::invalid_arguments("task_invalid_arguments")),
+        };
+        crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
+            .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))
+    }
+
+    fn bind_mutation_receipt(
         &self,
         invocation: &ToolInvocation,
         plan: &mut crate::authorization::AgentActionCommitPlan,
+        api_create_receipt: bool,
     ) -> Result<(), ToolError> {
-        if !self.uses_durable_mutation_receipt(invocation) {
+        if !api_create_receipt && !self.uses_durable_mutation_receipt(invocation) {
             return Ok(());
         }
-        let ToolPayload::Function { arguments } = &invocation.payload else {
-            return Err(ToolError::invalid_arguments("task_invalid_arguments"));
-        };
+        let fingerprint = self.mutation_arguments_fingerprint(invocation)?;
         let mut response: JsonValue =
             serde_json::from_str(plan.input.receipt_response_json.as_deref().unwrap_or("{}"))
                 .map_err(|_| ToolError::internal("task action receipt is invalid"))?;
         response["pioneerTaskToolCall"] = json!({
             "tool": invocation.tool_name,
-            "argumentsFingerprint": crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments).map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?,
+            "argumentsFingerprint": fingerprint,
             "mutationKey": invocation.idempotency_key.as_deref().map(str::trim),
-            "taskId": arguments.get("taskId"), "runId": arguments.get("runId"), "candidateId": arguments.get("candidateId"),
         });
+        if let ToolPayload::Function { arguments } = &invocation.payload {
+            let marker = &mut response["pioneerTaskToolCall"];
+            for key in ["taskId", "runId", "candidateId"] {
+                marker[key] = arguments.get(key).cloned().unwrap_or_default();
+            }
+        }
         let response = serde_json::to_string(&response)
             .map_err(|_| ToolError::internal("task action receipt cannot serialize"))?;
         plan.input.action_response_json = Some(response.clone());
@@ -1693,16 +1738,13 @@ impl TaskToolHandler {
         &self,
         invocation: &ToolInvocation,
         cache_key: Option<&str>,
+        api_create_receipt: bool,
     ) -> Result<Option<JsonValue>, ToolError> {
-        let Some(cache_key) = cache_key else {
-            return Ok(None);
-        };
-        if self.uses_durable_mutation_receipt(invocation) {
-            let ToolPayload::Function { arguments } = &invocation.payload else {
-                return Err(ToolError::invalid_arguments("task_invalid_arguments"));
-            };
-            let fingerprint = crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
-                .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+        if let Some(cache_key) = cache_key
+            && (self.uses_durable_mutation_receipt(invocation)
+                || invocation.tool_name == TASK_CREATE_TOOL)
+        {
+            let fingerprint = self.mutation_arguments_fingerprint(invocation)?;
             let mut fingerprints = self.mutation_cache.arguments.lock().await;
             if fingerprints
                 .get(cache_key)
@@ -1714,13 +1756,16 @@ impl TaskToolHandler {
             }
             fingerprints.insert(cache_key.to_owned(), fingerprint);
         }
-        if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
+        if let Some(output) = self.cached_mutation_output(cache_key).await {
             return Ok(Some(output));
         }
-        let Some(output) = self.prior_successful_mutation_output(invocation).await? else {
+        let Some(output) = self
+            .prior_successful_mutation_output(invocation, api_create_receipt)
+            .await?
+        else {
             return Ok(None);
         };
-        self.cache_mutation_output(Some(cache_key), &output).await;
+        self.cache_mutation_output(cache_key, &output).await;
         Ok(Some(output))
     }
 
@@ -1782,7 +1827,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
-        self.bind_cli_mutation_receipt(invocation, &mut plan)?;
+        self.bind_mutation_receipt(invocation, &mut plan, false)?;
         Ok(Some(plan))
     }
 
@@ -1827,18 +1872,12 @@ impl TaskToolHandler {
             .as_ref()
             .map(TaskTriggerToolInput::kind)
             .unwrap_or(TaskTriggerKind::Immediate);
-        let requested_launch = input
-            .launch
-            .clone()
-            .unwrap_or_else(|| AgentToolLaunchSelection {
-                identity: AgentToolIdentityChoice::InheritParent,
-                profile: AgentToolProfileChoice::InheritParent,
-                reasoning: None,
-                use_default_reasoning: false,
-                permission_profile: None,
-                skill_ids: Vec::new(),
-                mcp_server_ids: Vec::new(),
-            });
+        // A cold receipt may skip launch resolution only for ordinary attached
+        // creates. Other creates still go through their own admission checks.
+        let api_create_receipt =
+            !self.cli_replay && input.supports_api_create_receipt(trigger_kind);
+        let inherits_launch = input.launch.is_none();
+        let requested_launch = input.launch.clone().unwrap_or_default();
         let template_fingerprint = {
             let canonical = serde_json::to_vec(&input).map_err(|error| {
                 ToolError::internal(format!("failed to fingerprint task_create: {error}"))
@@ -1848,7 +1887,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(mut output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), api_create_receipt)
             .await?
         {
             // A persisted historical tool response may contain a previous URL.
@@ -2012,16 +2051,36 @@ impl TaskToolHandler {
             spec.model = Some(profile.model_id.clone());
             spec.model_provider = Some(profile.provider_id.clone());
         }
+        if inherits_launch {
+            create_context.codex_model_options =
+                crate::message::agent_action_tools::inherited_codex_model_options(
+                    self.processor.as_ref(),
+                    &pioneer_agent::TurnToolContext {
+                        workspace_id: self.context.workspace_id.clone(),
+                        thread_id: self.context.thread_id.clone(),
+                        turn_id: self.context.turn_id.clone(),
+                    },
+                    &profile,
+                )
+                .await?;
+        }
         create_context.resolved_launch_identity = Some(identity);
         create_context.resolved_launch_profile = Some(profile);
         crate::compaction::native_budget::freeze_task_context(
             self.processor.as_ref(),
             &self.context.workspace_id,
             Some(&self.context.turn_id),
+            inherits_launch,
             &mut create_context,
         )
         .await
-        .map_err(|error| ToolError::execution_failed(format!("Native Task context: {error:#}")))?;
+        .map_err(|error| {
+            if error.is::<crate::compaction::native_budget::InheritedContextAuthorityChanged>() {
+                ToolError::execution_failed("agent_execution_profile_unavailable")
+            } else {
+                ToolError::execution_failed(format!("Native Task context: {error:#}"))
+            }
+        })?;
         let target_option_id = requested_target_option_id
             .clone()
             .unwrap_or_else(|| adapter.current_target_option_id());
@@ -2085,7 +2144,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
-        self.bind_cli_mutation_receipt(&invocation, &mut plan)?;
+        self.bind_mutation_receipt(&invocation, &mut plan, api_create_receipt)?;
         match prepared.normalized.target.as_ref() {
             Some(pioneer_protocol::AgentStartTarget::CurrentThread) | None => {}
             Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { thread_id }) => {
@@ -2403,7 +2462,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -2487,7 +2546,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -2564,7 +2623,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -2616,7 +2675,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(mut output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             // Durable CLI receipts survive handler reconstruction but carry
@@ -2708,7 +2767,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -2758,7 +2817,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -3045,7 +3104,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -3106,7 +3165,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -3159,7 +3218,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -3213,7 +3272,7 @@ impl TaskToolHandler {
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
-            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref(), false)
             .await?
         {
             return Ok(function_output(output));
@@ -3423,16 +3482,13 @@ impl TaskToolHandler {
     async fn prior_successful_mutation_output(
         &self,
         invocation: &ToolInvocation,
+        api_create_receipt: bool,
     ) -> Result<Option<JsonValue>, ToolError> {
-        let Some(current_key) = invocation
-            .idempotency_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-        if self.uses_durable_mutation_receipt(invocation) {
+        let current_key = invocation.idempotency_key.as_deref().map(str::trim);
+        if api_create_receipt
+            || (self.uses_durable_mutation_receipt(invocation)
+                && current_key.is_some_and(|key| !key.is_empty()))
+        {
             let binding = self
                 .processor
                 .agent_action_binding(&self.context.turn_id)
@@ -3456,47 +3512,80 @@ impl TaskToolHandler {
                 let response: JsonValue =
                     serde_json::from_str(receipt.response_json.as_deref().unwrap_or("{}"))
                         .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
-                let ToolPayload::Function { arguments } = &invocation.payload else {
-                    return Err(ToolError::invalid_arguments("task_invalid_arguments"));
-                };
-                let fingerprint =
-                    crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
-                        .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
-                let marker = &response["pioneerTaskToolCall"];
-                if marker["tool"] != invocation.tool_name
-                    || marker["argumentsFingerprint"] != fingerprint
-                    || marker["mutationKey"].as_str() != Some(current_key)
+                // Older API create receipts had no tool marker. Keep their
+                // history and canonical-action replay paths intact.
+                if !(api_create_receipt
+                    && matches!(action.action_kind.as_str(), "create_task" | "schedule_task")
+                    && response.get("pioneerTaskToolCall").is_none())
                 {
-                    return Err(ToolError::invalid_arguments(
-                        "task mutation identity was reused with different input",
-                    ));
-                }
-                if let Some(created) = response.get("taskRunNow") {
+                    let fingerprint = self.mutation_arguments_fingerprint(invocation)?;
+                    let marker = &response["pioneerTaskToolCall"];
+                    if marker["tool"] != invocation.tool_name
+                        || marker["argumentsFingerprint"] != fingerprint
+                        || marker["mutationKey"].as_str() != current_key
+                    {
+                        return Err(ToolError::invalid_arguments(
+                            "task mutation identity was reused with different input",
+                        ));
+                    }
+                    if api_create_receipt {
+                        if action.action_kind != "create_task"
+                            || response.get("taskCreation").is_none()
+                        {
+                            return Err(ToolError::execution_failed("task_operation_failed"));
+                        }
+                        if !binding
+                            .capabilities
+                            .contains(&AgentToolCapability::TaskCreate)
+                        {
+                            return Err(task_tool_authorization_error());
+                        }
+                        use crate::authorization::ResourceAction;
+                        let nested = current_parent_task_id(&self.processor, &self.context)
+                            .await
+                            .map_err(task_runtime_tool_error)?
+                            .is_some();
+                        binding
+                            .adapter
+                            .lock()
+                            .await
+                            .require_source_actions(
+                                [ResourceAction::TaskCreate, ResourceAction::ChildStart]
+                                    .into_iter()
+                                    .chain(nested.then_some(ResourceAction::ChildTaskCreate)),
+                            )
+                            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+                    }
+                    if let Some(created) = response.get("taskRunNow") {
+                        return Ok(Some(
+                            json!({"alreadyCommitted": true, "taskId": created["taskId"], "runId": created["runId"]}),
+                        ));
+                    }
+                    if let Some(created) = response.get("taskCreation") {
+                        let task_id = created["taskId"]
+                            .as_str()
+                            .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
+                        // A creation grant is not a read grant. Replay only the
+                        // references committed with the mutation; current state and
+                        // waitability must be obtained through authorized tools.
+                        return Ok(Some(json!({
+                            "alreadyCommitted": true,
+                            "taskId": task_id,
+                            "triggerId": created["triggerId"],
+                            "runId": created["runId"],
+                            "guidance": "This Task was already created. Do not create it again. Use authorized task_get/task_wait to inspect current state; wait only for active attached work, never merely for a saved runId.",
+                        })));
+                    }
                     return Ok(Some(
-                        json!({"alreadyCommitted": true, "taskId": created["taskId"], "runId": created["runId"]}),
+                        json!({"alreadyCommitted": true, "taskId": marker["taskId"], "runId": marker["runId"], "candidateId": marker["candidateId"],
+                        "guidance": "This mutation already committed. Observe current state with task_get/task_wait; do not repeat it."}),
                     ));
                 }
-                if let Some(created) = response.get("taskCreation") {
-                    let task_id = created["taskId"]
-                        .as_str()
-                        .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
-                    // A creation grant is not a read grant. Replay only the
-                    // references committed with the mutation; current state and
-                    // waitability must be obtained through authorized tools.
-                    return Ok(Some(json!({
-                        "alreadyCommitted": true,
-                        "taskId": task_id,
-                        "triggerId": created["triggerId"],
-                        "runId": created["runId"],
-                        "guidance": "This Task was already created. Do not create it again. Use authorized task_get/task_wait to inspect current state; wait only for active attached work, never merely for a saved runId.",
-                    })));
-                }
-                return Ok(Some(
-                    json!({"alreadyCommitted": true, "taskId": marker["taskId"], "runId": marker["runId"], "candidateId": marker["candidateId"],
-                    "guidance": "This mutation already committed. Observe current state with task_get/task_wait; do not repeat it."}),
-                ));
             }
         }
+        let Some(current_key) = current_key.filter(|key| !key.is_empty()) else {
+            return Ok(None);
+        };
         let parent_items = self
             .processor
             .crud_store
@@ -3789,6 +3878,17 @@ struct TaskCreateToolInput {
     )]
     /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
     idempotency_key: Option<String>,
+}
+
+impl TaskCreateToolInput {
+    fn supports_api_create_receipt(&self, trigger_kind: TaskTriggerKind) -> bool {
+        self.target_option_id.is_none()
+            && self.launch.is_none()
+            && trigger_kind == TaskTriggerKind::Immediate
+            && !self.background
+            && self.lifecycle_policy.is_none()
+            && self.delivery_policy.is_none()
+    }
 }
 
 fn task_create_lifecycle_policy(
@@ -6397,7 +6497,7 @@ mod tests {
             merge_task_capabilities(inherited, vec![skill("B"), skill("C"), server.clone()]);
         assert_eq!(merged.len(), 5);
         let mut launch = AgentToolLaunchSelection {
-            identity: AgentToolIdentityChoice::InheritParent,
+            identity: pioneer_protocol::AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
             use_default_reasoning: false,
@@ -6428,7 +6528,7 @@ mod tests {
         );
 
         let mut tool_only_launch = AgentToolLaunchSelection {
-            identity: AgentToolIdentityChoice::InheritParent,
+            identity: pioneer_protocol::AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
             use_default_reasoning: false,
@@ -6574,6 +6674,18 @@ mod tests {
             assert!(!public.contains("private"));
             assert!(!public.contains("integrity"));
         }
+        let selection = sanitize_task_tool_error(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed",
+        ));
+        assert!(selection.to_string().contains("launch.useDefaultReasoning"));
+        assert_eq!(
+            sanitize_task_tool_error(selection).to_string(),
+            format!("invalid arguments: {TASK_LAUNCH_SELECTION_ERROR}"),
+        );
+        let raw = sanitize_task_tool_error(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed: /host/path secret",
+        ));
+        assert_eq!(raw.to_string(), "invalid arguments: task_invalid_arguments");
         for error in [
             ToolError::execution_failed("private SQL /host/path secret"),
             ToolError::execution_failed("agent_private_secret"),
@@ -8031,6 +8143,62 @@ mod tests {
             output["waitRecommendation"],
             "call_task_wait_for_active_attached_work_before_final_answer"
         );
+    }
+
+    #[test]
+    fn api_create_receipt_is_limited_to_implicit_attached_launches() {
+        let ordinary = json!({"title": "Attached task", "goal": "Check the result"});
+        let input: TaskCreateToolInput = serde_json::from_value(ordinary.clone()).unwrap();
+        assert!(input.supports_api_create_receipt(TaskTriggerKind::Immediate));
+
+        let cases = [
+            ("trigger", json!({"kind": "immediate"}), true),
+            ("requireReview", json!(true), true),
+            ("targetOptionId", json!("explicit-target-option"), false),
+            ("launch", json!({"useDefaultReasoning": true}), false),
+            (
+                "trigger",
+                json!({"kind": "cron", "cronExpr": "0 9 * * *", "timezone": "UTC"}),
+                false,
+            ),
+            ("background", json!(true), false),
+            (
+                "lifecyclePolicy",
+                json!({
+                    "attachment": "detached",
+                    "onParentCancel": "keep_running",
+                    "onParentFailure": "keep_running",
+                    "completion": "complete_on_terminal_run",
+                }),
+                false,
+            ),
+            (
+                "deliveryPolicy",
+                json!({
+                    "mode": "thread",
+                    "threadTarget": "exact_thread",
+                    "threadId": "explicit-thread",
+                    "includeResult": true,
+                    "format": "summary",
+                }),
+                false,
+            ),
+        ];
+        for (field, value, expected) in cases {
+            let mut arguments = ordinary.clone();
+            arguments[field] = value;
+            let input: TaskCreateToolInput = serde_json::from_value(arguments).unwrap();
+            let trigger = input
+                .trigger
+                .as_ref()
+                .map(TaskTriggerToolInput::kind)
+                .unwrap_or(TaskTriggerKind::Immediate);
+            assert_eq!(
+                input.supports_api_create_receipt(trigger),
+                expected,
+                "{field}"
+            );
+        }
     }
 
     #[test]

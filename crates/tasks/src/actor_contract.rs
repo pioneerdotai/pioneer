@@ -129,6 +129,7 @@ pub fn build_task_actor_contract(
                 &pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
                     native_context: context.native_context.clone(),
                     native_summary: context.native_summary.clone(),
+                    codex_model_options: context.codex_model_options.clone(),
                     identity: identity.clone(),
                     profile: profile.clone(),
                     role_key: authorization.role_key.clone(),

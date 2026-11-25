@@ -106,6 +106,12 @@ pub trait Provider: Send + Sync {
             .cloned())
     }
 
+    /// Explicit authority-local service metadata supplied by a recording fixture.
+    #[cfg(feature = "test-support")]
+    fn fixture_service_modes(&self, _model: &str) -> Option<pioneer_protocol::SourceServiceModes> {
+        None
+    }
+
     /// Neutral mapping is authority-owned; arbitrary compatible endpoints omit it.
     fn standard_service_mode(&self, _model: &str) -> pioneer_protocol::ServiceModeParameters {
         pioneer_protocol::ServiceModeParameters::Neutral

@@ -2435,7 +2435,10 @@ impl MessageProcessor {
                         "invalid Composer Task request: {error:#}"
                     ))
                 })?;
-            let native_context = if security_snapshot.backend.execution_backend
+            let inherited_context = agent.and(security_snapshot.native_context.as_ref());
+            let native_context = if let Some(budget) = inherited_context {
+                Some(budget.clone())
+            } else if security_snapshot.backend.execution_backend
                 == pioneer_protocol::TurnSecurityExecutionBackendKind::Native
             {
                 let provider = self
@@ -2463,7 +2466,13 @@ impl MessageProcessor {
             } else {
                 None
             };
-            let native_summary = if let Some(budget) = &native_context {
+            let native_summary = if let Some(summary) = security_snapshot
+                .native_summary
+                .as_ref()
+                .filter(|_| inherited_context.is_some())
+            {
+                Some(summary.clone())
+            } else if let Some(budget) = &native_context {
                 crate::compaction::native_budget::capture_summary(
                     self,
                     &thread.workspace_id,
@@ -8206,6 +8215,13 @@ impl MessageProcessor {
                     ),
                     None => Ok(json),
                 })
+                .and_then(|json| crate::cli_runtime::turn_binding::persist_cli_model_options(
+                    json,
+                    runtime_kind,
+                    effective_cli_runtime_effort.as_deref(),
+                    cli_runtime_personality.as_deref(),
+                    cli_runtime_summary.as_deref(),
+                ))
             {
                 Ok(input_mapping_json) => input_mapping_json,
                 Err(error) => {
@@ -9791,6 +9807,15 @@ impl MessageProcessor {
             std::collections::BTreeSet<pioneer_agent::ObservedTaskOutcome>,
         >,
     ) -> Result<bool, CliRuntimeRecoveryStartFailure> {
+        let model_options =
+            crate::cli_runtime::turn_binding::cli_model_options_from_binding(&restored.binding)
+                .map_err(|error| CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!("Cannot restore CLI model options: {error:#}"),
+                })?;
+        let (personality, summary) = model_options
+            .codex
+            .map(|options| (options.personality, options.summary))
+            .unwrap_or_default();
         let task_continuation = task_continuation_outcomes.is_some();
         // Ordinary recovery holds its caller's plugin admission guards. The
         // attached-task continuation enters here directly and must pin the
@@ -10076,9 +10101,9 @@ impl MessageProcessor {
                     approval_policy: prepared_binding.approval_policy.clone(),
                     sandbox: restored.sandbox.clone(),
                     permissions: restored.permissions.clone(),
-                    effort: None,
-                    personality: None,
-                    summary: None,
+                    effort: model_options.effort,
+                    personality,
+                    summary,
                     elevated_instructions: restored.elevated_instructions.clone(),
                 },
                 std::time::Duration::from_millis(restored.runtime.request_timeout_ms),

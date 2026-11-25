@@ -289,11 +289,40 @@ pub(crate) fn summary_selection(
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct InheritedContextAuthorityChanged;
+
+impl std::fmt::Display for InheritedContextAuthorityChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Inherited context authority changed")
+    }
+}
+
+impl std::error::Error for InheritedContextAuthorityChanged {}
+
+/// A saved picker choice can be reused only within its original authority.
+pub(crate) fn inherited_context<'a>(
+    parent: Option<&'a NativeContextBudget>,
+    current_authority: Option<&str>,
+    instance: &str,
+    model: &str,
+) -> Result<Option<&'a NativeContextBudget>> {
+    let Some(budget) = parent.filter(|budget| budget.instance == instance && budget.model == model)
+    else {
+        return Ok(None);
+    };
+    if budget.authority.as_deref() != current_authority {
+        return Err(InheritedContextAuthorityChanged.into());
+    }
+    Ok(Some(budget))
+}
+
 /// Server-only Task launch freezing, before Task's existing actor-contract commit.
 pub(crate) async fn freeze_task_context(
     processor: &crate::message::MessageProcessor,
     workspace: &str,
     parent_turn: Option<&str>,
+    require_inherited_authority: bool,
     context: &mut pioneer_tasks::TaskCreateContext,
 ) -> Result<()> {
     let Some(profile) = &context.resolved_launch_profile else {
@@ -313,14 +342,20 @@ pub(crate) async fn freeze_task_context(
             .map(|record| record.snapshot),
         None => None,
     };
-    context.native_context = match parent
-        .as_ref()
-        .and_then(|parent| parent.native_context.as_ref())
-        .filter(|budget| {
-            budget.instance == profile.provider_id
-                && budget.model == profile.model_id
-                && budget.authority.as_deref() == provider.authority_fingerprint()
-        }) {
+    let inherited = inherited_context(
+        parent
+            .as_ref()
+            .and_then(|parent| parent.native_context.as_ref()),
+        provider.authority_fingerprint(),
+        &profile.provider_id,
+        &profile.model_id,
+    );
+    let inherited = match inherited {
+        Ok(budget) => budget,
+        Err(error) if require_inherited_authority => return Err(error),
+        Err(_) => None,
+    };
+    context.native_context = match inherited {
         Some(budget) => Some(budget.clone()),
         None => Some(
             capture(
@@ -435,10 +470,10 @@ mod tests {
             id: "pro".into(),
             authority: proof.clone(),
         };
-        let pro = capture_with_mode(&provider, "instance", "model", None, Some(&choice))
+        let pro = capture_with_mode(&provider, "instance", "model", Some(10000), Some(&choice))
             .await
             .unwrap();
-        assert_eq!(pro.context_window, 1000);
+        assert_eq!(pro.context_window, 10000);
         assert_eq!(
             pro.service_mode.as_ref().unwrap().parameters,
             pioneer_protocol::ServiceModeParameters::OpenAiPro
@@ -450,7 +485,43 @@ mod tests {
                 .await
                 .unwrap()
                 .context,
-            1000
+            10000
+        );
+        assert_eq!(
+            inherited_context(
+                Some(&restored),
+                provider.authority_fingerprint(),
+                "instance",
+                "model"
+            )
+            .unwrap(),
+            Some(&restored)
+        );
+        assert!(
+            inherited_context(
+                Some(&restored),
+                provider.authority_fingerprint(),
+                "instance",
+                "other"
+            )
+            .unwrap()
+            .is_none()
+        );
+        let changed_authority = BudgetProvider {
+            authority: "account-b",
+            pro_available: true,
+            windows: provider.windows.clone(),
+            technical_window: provider.technical_window,
+        };
+        assert!(
+            inherited_context(
+                Some(&restored),
+                changed_authority.authority_fingerprint(),
+                "instance",
+                "model"
+            )
+            .unwrap_err()
+            .is::<InheritedContextAuthorityChanged>()
         );
         assert!(
             capture_with_mode(&provider, "instance", "other", None, Some(&choice))
