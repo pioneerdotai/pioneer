@@ -8,8 +8,10 @@ use crate::turn_mcp::projection::{
     McpProjectionLimits, ResolvedMcpTurnTool, canonical_schema_identity, sha256_hex,
 };
 use pioneer_crud::TurnMcpBindingRecord;
+use pioneer_protocol::{AgentModelToolCatalogEntry, AgentModelToolName};
 use pioneer_tools::{
-    ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec, dynamic_unknown_output_policy,
+    ConfiguredToolSpec, ExecutionClass, PayloadKind, TASK_IDENTITY_MODELS_LIST_TOOL,
+    TASK_START_OPTIONS_TOOL, ToolSpec, dynamic_unknown_output_policy, task_launch_catalog_alias,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,40 +81,37 @@ impl NativeToolFamily {
                 .collect();
                 // Share the protocol definitions without embedding execution
                 // facts in the fixed catalog.
-                let entry = pioneer_protocol::agent_identity_models_catalog_entry();
-                let mut entries = vec![entry];
+                let mut entries = vec![
+                    pioneer_protocol::agent_start_options_catalog_entry(),
+                    pioneer_protocol::agent_identity_models_catalog_entry(),
+                ];
                 entries.extend(pioneer_protocol::project_agent_model_tool_catalog(
                     &capabilities,
                     None,
                 ));
                 entries.push(pioneer_protocol::agent_turn_start_catalog_entry());
                 specs.extend(entries.into_iter().map(|entry| {
-                    ConfiguredToolSpec::new(
-                        ToolSpec::new(
-                            entry.name.as_str(),
-                            entry.description,
-                            entry.parameters,
-                            PayloadKind::Function,
-                        ),
-                        ExecutionClass::Shared,
-                        dynamic_unknown_output_policy(),
-                    )
+                    let name = entry.name.as_str();
+                    agent_action_spec(name, entry)
                 }));
                 specs
             }),
             Self::Tasks => TASKS.get_or_init(|| {
                 let mut specs = crate::task_tools::task_tool_specs();
-                let options = pioneer_protocol::agent_start_options_catalog_entry();
-                specs.push(ConfiguredToolSpec::new(
-                    ToolSpec::new(
-                        options.name.as_str(),
-                        options.description,
-                        options.parameters,
-                        PayloadKind::Function,
-                    ),
-                    ExecutionClass::Shared,
-                    dynamic_unknown_output_policy(),
-                ));
+                specs.extend(
+                    [
+                        (
+                            TASK_START_OPTIONS_TOOL,
+                            pioneer_protocol::agent_start_options_catalog_entry(),
+                        ),
+                        (
+                            TASK_IDENTITY_MODELS_LIST_TOOL,
+                            pioneer_protocol::agent_identity_models_catalog_entry(),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(alias, entry)| agent_action_spec(alias, entry)),
+                );
                 specs
             }),
         }
@@ -143,9 +142,9 @@ impl NativeToolFamily {
             Self::ComputerUse => Err(pioneer_tools::ToolError::NotFound(
                 "unknown computer-use operation".into(),
             )),
-            Self::Threads
-                if self.is_thread_reader(name) || name == "threads_identity_models_list" =>
-            {
+            // ChildStart filters the Agent catalog. Reading the catalog uses
+            // the Turn execution's ThreadRead grant.
+            _ if self.is_launch_catalog(name) || self.is_thread_reader(name) => {
                 Ok(ResourceAction::ThreadRead)
             }
             Self::Threads => match name {
@@ -156,10 +155,6 @@ impl NativeToolFamily {
                     "unknown threads tool".to_owned(),
                 )),
             },
-            // Reading the already capability-filtered launch catalog is not a
-            // child-start mutation. ChildStart belongs to the Agent action
-            // envelope, not the Turn execution's resource-action grant.
-            Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ThreadRead),
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
     }
@@ -169,6 +164,43 @@ impl NativeToolFamily {
             && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
                 || name == "threads_tools_result_read"
                 || name == "threads_search")
+    }
+
+    pub(crate) fn is_launch_catalog(self, name: &str) -> bool {
+        match self {
+            Self::Threads => task_launch_catalog_alias(name).is_some(),
+            Self::Tasks => {
+                matches!(
+                    name,
+                    TASK_START_OPTIONS_TOOL | TASK_IDENTITY_MODELS_LIST_TOOL
+                ) || name == AgentModelToolName::AgentStartOptions.as_str()
+            }
+            _ => false,
+        }
+    }
+
+    fn legacy_definition(self, name: &str) -> Option<&'static ToolSpec> {
+        static TASK_OPTIONS: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        static TASK_CREATE: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        match (self, name) {
+            (Self::Html, pioneer_tools::html::HTML_PREVIEW) => Some(legacy_html_preview_spec()),
+            (Self::Tasks, "threads_start_options") => Some(TASK_OPTIONS.get_or_init(|| {
+                let entry = pioneer_protocol::agent_start_options_catalog_entry();
+                agent_action_spec(entry.name.as_str(), entry).spec
+            })),
+            (Self::Tasks, "task_create") => Some(TASK_CREATE.get_or_init(|| {
+                let mut spec = self
+                    .catalog()
+                    .iter()
+                    .find(|spec| spec.spec.name == name)
+                    .expect("native task_create definition")
+                    .spec
+                    .clone();
+                crate::task_tools::restore_legacy_task_create_catalog(&mut spec);
+                spec
+            })),
+            _ => None,
+        }
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -181,6 +213,19 @@ impl NativeToolFamily {
             .unwrap_or(0)
             .saturating_mul(1_000)
     }
+}
+
+fn agent_action_spec(name: &str, entry: AgentModelToolCatalogEntry) -> ConfiguredToolSpec {
+    ConfiguredToolSpec::new(
+        ToolSpec::new(
+            name,
+            entry.description,
+            entry.parameters,
+            PayloadKind::Function,
+        ),
+        ExecutionClass::Shared,
+        dynamic_unknown_output_policy(),
+    )
 }
 
 // A frozen binding identifies the immutable schema, not the latest catalog.
@@ -208,15 +253,16 @@ pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolF
         && tool.runtime_generation == 1
         && tool.timeout_ms == family.timeout_ms(&tool.raw_tool_name)
         && tool.annotations.is_none()
-        && (family.catalog().iter().any(|spec| {
-            spec.spec.name == tool.raw_tool_name
-                && spec.spec.parameters == tool.input_schema
-                && tool.description.as_deref() == Some(spec.spec.description.as_str())
-        }) || (family == NativeToolFamily::Html
-            && tool.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
-            && legacy_html_preview_spec().parameters == tool.input_schema
-            && tool.description.as_deref()
-                == Some(legacy_html_preview_spec().description.as_str()))))
+        && family
+            .catalog()
+            .iter()
+            .map(|spec| &spec.spec)
+            .chain(family.legacy_definition(&tool.raw_tool_name))
+            .any(|spec| {
+                spec.name == tool.raw_tool_name
+                    && spec.parameters == tool.input_schema
+                    && tool.description.as_deref() == Some(spec.description.as_str())
+            }))
     .then_some(family)
 }
 
@@ -226,13 +272,12 @@ pub(crate) fn requires_extended_provider_deadline(tool: &ResolvedMcpTurnTool) ->
 
 pub(crate) fn is_task_operation(tool: &ResolvedMcpTurnTool) -> bool {
     exact_definition(tool) == Some(NativeToolFamily::Tasks)
-        && tool.raw_tool_name != "threads_start_options"
+        && !NativeToolFamily::Tasks.is_launch_catalog(&tool.raw_tool_name)
 }
 
-/// Domain membership is independent of the frozen transport family. The shared
-/// options tool alone is not evidence of available Threads operations.
+/// The options tool alone is not evidence of available Threads operations.
 pub(crate) fn is_threads_operation(tool: &ResolvedMcpTurnTool) -> bool {
-    exact_definition(tool).is_some()
+    exact_definition(tool) == Some(NativeToolFamily::Threads)
         && tool.raw_tool_name != "threads_start_options"
         && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
 }
@@ -262,34 +307,28 @@ pub(crate) fn current_identity(
     };
     let family =
         NativeToolFamily::from_server_id(&binding.server_installation_id).ok_or_else(drift)?;
-    let mut spec = family
+    let original = family
         .catalog()
         .iter()
         .find(|spec| spec.spec.name == binding.raw_tool_name)
-        .ok_or_else(drift)?
-        .spec
-        .clone();
-    let (mut schema, mut fingerprint, _) =
-        canonical_schema_identity(&spec.parameters).map_err(|_| drift())?;
-    if binding.canonical_schema_fingerprint != fingerprint
-        && family == NativeToolFamily::Html
-        && binding.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
-    {
-        let legacy = legacy_html_preview_spec();
-        let (legacy_schema, legacy_fingerprint, _) =
-            canonical_schema_identity(&legacy.parameters).map_err(|_| drift())?;
-        if binding.canonical_schema_fingerprint == legacy_fingerprint {
-            spec = legacy.clone();
-            schema = legacy_schema;
-            fingerprint = legacy_fingerprint;
-        }
-    }
+        .map(|spec| &spec.spec);
+    let (spec, schema, fingerprint) = original
+        .into_iter()
+        .chain(family.legacy_definition(&binding.raw_tool_name))
+        .find_map(|spec| {
+            let (schema, fingerprint, _) = canonical_schema_identity(&spec.parameters).ok()?;
+            (binding.canonical_schema_fingerprint == fingerprint).then_some((
+                spec,
+                schema,
+                fingerprint,
+            ))
+        })
+        .ok_or_else(drift)?;
     if workspace_id.is_empty()
         || binding.server_name != family.server_name()
         || binding.catalog_version != family.server_id()
         || binding.fingerprint != family.server_id()
         || binding.canonical_callable_name != binding.raw_tool_name
-        || binding.canonical_schema_fingerprint != fingerprint
         || binding.annotations_json != "{}"
         || binding.annotations_digest != sha256_hex(b"{}")
         || binding.runtime_generation != 1
@@ -300,8 +339,8 @@ pub(crate) fn current_identity(
     Ok(CurrentMcpToolIdentity {
         server_installation_id: family.server_id().into(),
         server_name: family.server_name().into(),
-        raw_tool_name: spec.name,
-        description: Some(spec.description),
+        raw_tool_name: spec.name.clone(),
+        description: Some(spec.description.clone()),
         catalog_version: family.server_id().into(),
         installation_fingerprint: family.server_id().into(),
         canonical_schema_fingerprint: fingerprint,
@@ -373,10 +412,14 @@ async fn materialize_task_tools_internal(
     for bundle in &mut actions.bundles {
         bundle.specs.retain(|spec| {
             pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+                || matches!(
+                    spec.spec.name.as_str(),
+                    TASK_START_OPTIONS_TOOL | TASK_IDENTITY_MODELS_LIST_TOOL
+                )
         });
         bundle
             .handlers
-            .retain(|(name, _)| pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&name.as_str()));
+            .retain(|(name, _)| bundle.specs.iter().any(|spec| spec.spec.name == *name));
     }
     let provider =
         crate::task_tools::GatewayTaskToolProvider::for_cli(std::sync::Arc::downgrade(&processor));
@@ -413,6 +456,50 @@ mod tests {
     use super::*;
     use crate::turn_mcp::{McpSelectionReason, ResolvedMcpTurnProjection};
     use serde_json::json;
+
+    #[test]
+    fn frozen_task_catalog_and_create_bindings_keep_their_original_identities() {
+        let family = NativeToolFamily::Tasks;
+        for name in ["threads_start_options", "task_create"] {
+            let legacy = family.legacy_definition(name).unwrap();
+            let (_, fingerprint, _) = canonical_schema_identity(&legacy.parameters).unwrap();
+            let binding = TurnMcpBindingRecord {
+                server_installation_id: family.server_id().into(),
+                server_name: family.server_name().into(),
+                raw_tool_name: name.into(),
+                callable_name: name.into(),
+                canonical_callable_name: name.into(),
+                provider_callable_name: format!("mcp__pioneer__{name}"),
+                catalog_version: family.server_id().into(),
+                fingerprint: family.server_id().into(),
+                canonical_schema_fingerprint: fingerprint,
+                provider_schema_fingerprint: String::new(),
+                annotations_json: "{}".into(),
+                annotations_digest: sha256_hex(b"{}"),
+                effective_timeout_ms: family.timeout_ms(name) as i64,
+                runtime_generation: 1,
+                projection_activation_generation: 1,
+                selection_reason: "implicit_policy".into(),
+                capability_id: None,
+            };
+            let restored = current_identity("workspace", &binding).unwrap();
+            assert_eq!(restored.canonical_schema, legacy.parameters);
+            assert_eq!(
+                restored.description.as_deref(),
+                Some(legacy.description.as_str())
+            );
+        }
+        assert_eq!(
+            family.action("threads_start_options").unwrap(),
+            ResourceAction::ThreadRead
+        );
+        assert!(
+            !family
+                .definitions()
+                .iter()
+                .any(|spec| spec.spec.name == "threads_start_options")
+        );
+    }
 
     #[test]
     fn search_is_a_thread_reader_with_a_bounded_page_and_unbounded_query_schema() {

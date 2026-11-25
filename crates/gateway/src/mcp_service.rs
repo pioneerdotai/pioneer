@@ -3587,6 +3587,9 @@ impl TurnMcpValidatedExecution for McpService {
                 &validated.binding.server_installation_id,
             );
             let native_tasks = native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
+            let native_task_operation = native_tasks
+                && !crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                    .is_launch_catalog(&validated.binding.raw_tool_name);
             let native_shared = native_tasks || native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads);
             let native_stable_call = native_shared
                 && native_family.is_some_and(|family| !family.is_thread_reader(&validated.binding.raw_tool_name));
@@ -3718,7 +3721,7 @@ impl TurnMcpValidatedExecution for McpService {
                         meta: Some(json!({"pioneer":{"reasonCode":reason}})),
                     });
                 }
-                Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
+                Err(error) if native_task_operation
                     && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
                     return Ok(canonical_task_error_result(error, started.elapsed()));
                 }
