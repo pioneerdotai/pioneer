@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "ahash"
-version = "0.8.13"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fca89247609239eeb6915e6991111866b92d7b31025e69302bbf430cc4d2c38"
+checksum = "54dae3d1d7b8956f3506c4e999a74e77f932a59153ccf38ab8cf96db74bb9dc0"
 dependencies = [
  "cfg-if",
  "const-random",
@@ -841,9 +841,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.53"
+version = "0.4.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bde8322bfc31ade96978b8d3c06be0fd60401192e7ddb9a0b2de5e215d22e61"
+checksum = "0c31224bd2c09447484a1143f2fc1d871eb405789859c8e5470a3e7f95f40a18"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -1324,9 +1324,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.22.0"
+version = "1.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0b79dbb5331ccd297686df811d50ab3f39db171f5c765372a69272a0990b014"
+checksum = "20b0ce5fd8f8ec576f6737cf9a3a02172fddad2b90b8874577a4647fab11425c"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -2295,9 +2295,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.9"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "844c5c0b65be192cb68d570cca1b21a6444431d24e39c084dc0336177015337c"
+checksum = "50066ca966813ca8957ee15361752f19424a8ff620dbe9c8993d9f99d99b04b3"
 dependencies = [
  "clap_builder",
  "clap_derive 4.6.9",
@@ -2305,9 +2305,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.7"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+checksum = "a0ed97c96ef4efb3cc84e09fa388df4463e7cc3224ec38d7b1d9e45749333590"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2510,15 +2510,15 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.48"
+version = "0.4.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e41632c2efd201c62f1432f7cbee121b97878eab579da9d85676573d1fd33b9"
+checksum = "f938fc0d88fbe2c8d6f0e1ba96ba1165d89ff698e98468cd019d92cff2ecd367"
 dependencies = [
  "compression-core",
  "flate2",
  "memchr",
- "zstd 0.14.4",
- "zstd-safe 8.3.0",
+ "zstd 0.14.5",
+ "zstd-safe 8.4.0",
 ]
 
 [[package]]
@@ -2551,7 +2551,7 @@ dependencies = [
  "serde-untagged",
  "serde_core",
  "serde_json",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "winnow 1.0.5",
  "yaml-rust2 0.11.1",
 ]
@@ -2637,9 +2637,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "constant_time_eq"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+checksum = "144e7f1de087984240b7816d47f698b414979faa6f40839c5b86d6bd47db57b7"
 dependencies = [
  "rustversion",
 ]
@@ -2940,7 +2940,7 @@ dependencies = [
  "anes",
  "cast",
  "ciborium",
- "clap 4.6.9",
+ "clap 4.6.10",
  "criterion-plot",
  "itertools 0.13.0",
  "num-traits",
@@ -3223,7 +3223,7 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "zeroize",
- "zune-core 0.5.1",
+ "zune-core",
 ]
 
 [[package]]
@@ -3273,7 +3273,7 @@ dependencies = [
  "sha2 0.10.9",
  "tiny-skia",
  "tracing",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -3671,9 +3671,9 @@ dependencies = [
 
 [[package]]
 name = "dom_query"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498c698ac51127148a3984450e51fca7f01805a91d7a1f7a24af0a5f761e3385"
+checksum = "b35b4f772a1a8b88e5545a67c2d3a62a93d4edccc5a68f2145fe52e39c96d275"
 dependencies = [
  "bit-set 0.11.1",
  "cssparser 0.38.0",
@@ -3867,7 +3867,7 @@ dependencies = [
  "cc",
  "memchr",
  "rustc_version",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "vswhom",
  "winreg 0.56.0",
 ]
@@ -5015,16 +5015,6 @@ dependencies = [
 
 [[package]]
 name = "gif"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
-dependencies = [
- "color_quant",
- "weezl 0.1.12",
-]
-
-[[package]]
-name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
@@ -5237,7 +5227,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5281,7 +5271,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "anyhow",
  "core-text",
@@ -5308,7 +5298,7 @@ dependencies = [
  "paste",
  "raw-window-handle",
  "regex",
- "resvg 0.45.1",
+ "resvg",
  "ropey 2.0.0-beta.1",
  "rust-i18n",
  "schemars 1.2.3",
@@ -5328,7 +5318,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5385,7 +5375,7 @@ dependencies = [
  "rand 0.9.5",
  "raw-window-handle",
  "regex",
- "resvg 0.46.0",
+ "resvg",
  "schemars 1.2.3",
  "seahash",
  "serde",
@@ -5400,7 +5390,7 @@ dependencies = [
  "ttf-parser",
  "unicode-segmentation",
  "url",
- "usvg 0.46.0",
+ "usvg",
  "uuid",
  "waker-fn",
  "web-time",
@@ -5672,7 +5662,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -5689,7 +5679,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -5750,7 +5740,7 @@ dependencies = [
  "rand 0.9.5",
  "raw-window-handle",
  "regex",
- "resvg 0.46.0",
+ "resvg",
  "schemars 1.2.3",
  "seahash",
  "serde",
@@ -5765,7 +5755,7 @@ dependencies = [
  "ttf-parser",
  "unicode-segmentation",
  "url",
- "usvg 0.46.0",
+ "usvg",
  "uuid",
  "waker-fn",
  "web-time",
@@ -6223,7 +6213,7 @@ checksum = "f0de0aaa67d6974e0983f6d4ded918b73547db6cb82b61ac2de88576a45b0e81"
 [[package]]
 name = "gpui-webview"
 version = "0.11.0"
-source = "git+https://github.com/superoskin/gpui-kit?rev=2d77d70dcef4fa67758811e7db5929c728d5dbf8#2d77d70dcef4fa67758811e7db5929c728d5dbf8"
+source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
 dependencies = [
  "anyhow",
  "gdkx11",
@@ -6313,9 +6303,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.20"
+version = "0.4.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+checksum = "b634322c4924093fe6a6e05ecbe5717cd3c6014934455f4ae8e5cf14ba3264a8"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -6540,9 +6530,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.3"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
+checksum = "927c672dc4fd1e4b7cfcb7b751fe1d5766638080b8d243b78165ef660c2061e7"
 dependencies = [
  "data-encoding",
  "idna",
@@ -7066,7 +7056,7 @@ dependencies = [
  "byteorder-lite",
  "color_quant",
  "exr",
- "gif 0.14.2",
+ "gif",
  "image-webp",
  "moxcms",
  "num-traits",
@@ -7076,8 +7066,8 @@ dependencies = [
  "rayon",
  "rgb",
  "tiff",
- "zune-core 0.5.1",
- "zune-jpeg 0.5.15",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -7089,12 +7079,6 @@ dependencies = [
  "byteorder-lite",
  "quick-error 2.0.1",
 ]
-
-[[package]]
-name = "imagesize"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edcd27d72f2f071c64249075f42e205ff93c9a4c5f6c6da53e79ed9f9832c285"
 
 [[package]]
 name = "imagesize"
@@ -7805,17 +7789,6 @@ dependencies = [
 
 [[package]]
 name = "kurbo"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62026ae44756f8a599ba21140f350303d4f08dcdcc71b5ad9c9bb8128c13c62"
-dependencies = [
- "arrayvec",
- "euclid",
- "smallvec",
-]
-
-[[package]]
-name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b60dfc32f652b926df6192e55525b16d186c69d47876c3ead4da5cc9f8450e2"
@@ -8072,9 +8045,9 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "litrs"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
+checksum = "02b614978e47ce529faee66579f2b2fe19c94aa96d910a6a9a8043b2b02d8175"
 
 [[package]]
 name = "lmdb-master-sys"
@@ -9114,7 +9087,7 @@ dependencies = [
  "nix 0.30.1",
  "serde",
  "windows-sys 0.61.2",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -11072,7 +11045,7 @@ checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "pioneer-agent"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11104,7 +11077,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -11119,7 +11092,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-apps"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "image",
@@ -11134,7 +11107,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11161,7 +11134,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -11179,7 +11152,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "zip",
@@ -11187,7 +11160,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11202,14 +11175,14 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "uuid",
  "zeroize",
 ]
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -11223,7 +11196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11258,7 +11231,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11277,7 +11250,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11290,7 +11263,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "config",
@@ -11298,12 +11271,12 @@ dependencies = [
  "dotenvy",
  "serde",
  "tempfile",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
 ]
 
 [[package]]
 name = "pioneer-crud"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11339,12 +11312,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
- "zstd 0.14.4",
+ "zstd 0.14.5",
 ]
 
 [[package]]
 name = "pioneer-crud-access"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11360,7 +11333,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-artifacts"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11387,7 +11360,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-compaction"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11416,7 +11389,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-conversations"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11437,7 +11410,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-execution"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11464,7 +11437,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-memory"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11484,7 +11457,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-packages"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11506,7 +11479,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-payloads"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -11517,12 +11490,12 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "uuid",
- "zstd 0.14.4",
+ "zstd 0.14.5",
 ]
 
 [[package]]
 name = "pioneer-crud-self-improvement"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11543,7 +11516,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-signals"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "pioneer-entity",
  "pioneer-postgres-pools",
@@ -11553,7 +11526,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-tasks"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11578,7 +11551,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-timeline"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11598,7 +11571,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -11639,7 +11612,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "tracing",
  "url",
  "webbrowser",
@@ -11651,7 +11624,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11665,7 +11638,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11676,7 +11649,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-apps"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -11693,7 +11666,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11703,7 +11676,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -11715,7 +11688,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11728,7 +11701,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-packages"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11739,7 +11712,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11751,7 +11724,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11768,7 +11741,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -11780,7 +11753,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11792,7 +11765,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11818,7 +11791,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -11836,7 +11809,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11849,7 +11822,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -11857,7 +11830,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -11933,7 +11906,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -11942,12 +11915,12 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeroize",
- "zstd 0.14.4",
+ "zstd 0.14.5",
 ]
 
 [[package]]
 name = "pioneer-hooks"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -11964,7 +11937,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -11977,7 +11950,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12003,7 +11976,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp-oauth"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -12027,7 +12000,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12052,7 +12025,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "sea-orm-migration",
  "tokio",
@@ -12060,7 +12033,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12091,7 +12064,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-packages"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12108,7 +12081,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-plugins"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12125,7 +12098,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "fs4",
@@ -12145,7 +12118,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-pools"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12161,7 +12134,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-test"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -12177,7 +12150,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-test-macros"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12186,7 +12159,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12205,7 +12178,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -12221,7 +12194,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12257,7 +12230,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "pioneer-observability",
  "pioneer-protocol",
@@ -12268,7 +12241,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12280,14 +12253,14 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.1",
  "tempfile",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "pioneer-tasks"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12312,7 +12285,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12351,12 +12324,12 @@ dependencies = [
  "url",
  "webclaw-core",
  "windows-sys 0.61.2",
- "zstd 0.14.4",
+ "zstd 0.14.5",
 ]
 
 [[package]]
 name = "pioneer-tunnel"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12369,7 +12342,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -12824,7 +12797,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.20+spec-1.1.0",
+ "toml_edit 0.25.21+spec-1.1.0",
 ]
 
 [[package]]
@@ -13647,36 +13620,19 @@ dependencies = [
 
 [[package]]
 name = "resvg"
-version = "0.45.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8928798c0a55e03c9ca6c4c6846f76377427d2c1e1f7e6de3c06ae57942df43"
-dependencies = [
- "gif 0.13.3",
- "image-webp",
- "log",
- "pico-args",
- "rgb",
- "svgtypes 0.15.3",
- "tiny-skia",
- "usvg 0.45.1",
- "zune-jpeg 0.4.21",
-]
-
-[[package]]
-name = "resvg"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b563218631706d614e23059436526d005b50ab5f2d506b55a17eb65c5eb83419"
 dependencies = [
- "gif 0.14.2",
+ "gif",
  "image-webp",
  "log",
  "pico-args",
  "rgb",
- "svgtypes 0.16.2",
+ "svgtypes",
  "tiny-skia",
- "usvg 0.46.0",
- "zune-jpeg 0.5.15",
+ "usvg",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -14445,7 +14401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04469c4a54e7271fe3fe2b8140102a2cd2eb7e48129a3afcd013b9909ddebc3c"
 dependencies = [
  "chrono",
- "clap 4.6.9",
+ "clap 4.6.10",
  "dotenvy",
  "glob",
  "indoc",
@@ -14481,7 +14437,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07970137dbbed6daf56a2429db349abfb68ed1c79206957c30d4a0e9ea808c08"
 dependencies = [
  "async-trait",
- "clap 4.6.9",
+ "clap 4.6.10",
  "dotenvy",
  "sea-orm",
  "sea-orm-cli",
@@ -16052,21 +16008,11 @@ checksum = "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb"
 
 [[package]]
 name = "svgtypes"
-version = "0.15.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c7541fff44b35860c1a7a47a7cadf3e4a304c457b58f9870d9706ece028afc"
-dependencies = [
- "kurbo 0.11.3",
- "siphasher",
-]
-
-[[package]]
-name = "svgtypes"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f12b12995e3638c70618c1facb1ce65302f6a6f706b675f07c58a5d7391120e"
 dependencies = [
- "kurbo 0.13.1",
+ "kurbo",
  "siphasher",
 ]
 
@@ -16653,7 +16599,7 @@ dependencies = [
  "half",
  "quick-error 2.0.1",
  "weezl 0.1.12",
- "zune-jpeg 0.5.15",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -16972,9 +16918,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.2+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+checksum = "26b1f26e9485c1fa43ee89fe76e9f3fb9e2e52bb227f8594b4d687496b83d073"
 dependencies = [
  "indexmap 2.14.2",
  "serde_core",
@@ -17050,9 +16996,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.20+spec-1.1.0"
+version = "0.25.21+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e76360e201d6dbd6583e17795ba71a88f47365a9139c8450a7979c32303b8e73"
+checksum = "88497dab46de5bf343ec66b05c251e48c6213f3e9170c70a70a823f7abe886a4"
 dependencies = [
  "indexmap 2.14.2",
  "toml_datetime 1.1.3+spec-1.1.0",
@@ -17062,9 +17008,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.6+spec-1.1.0"
+version = "1.1.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
+checksum = "0bb28d6e049a9766c3bd91a8326e6179f5b132dec87906bb97018ef7a2f3431a"
 dependencies = [
  "winnow 1.0.5",
 ]
@@ -17977,33 +17923,6 @@ dependencies = [
 
 [[package]]
 name = "usvg"
-version = "0.45.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80be9b06fbae3b8b303400ab20778c80bbaf338f563afe567cf3c9eea17b47ef"
-dependencies = [
- "base64 0.22.1",
- "data-url",
- "flate2",
- "fontdb",
- "imagesize 0.13.0",
- "kurbo 0.11.3",
- "log",
- "pico-args",
- "roxmltree 0.20.0",
- "rustybuzz",
- "simplecss",
- "siphasher",
- "strict-num",
- "svgtypes 0.15.3",
- "tiny-skia-path",
- "unicode-bidi",
- "unicode-script",
- "unicode-vo",
- "xmlwriter",
-]
-
-[[package]]
-name = "usvg"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e419dff010bb12512b0ae9e3d2f318dfbdf0167fde7eb05465134d4e8756076f"
@@ -18012,8 +17931,8 @@ dependencies = [
  "data-url",
  "flate2",
  "fontdb",
- "imagesize 0.14.0",
- "kurbo 0.13.1",
+ "imagesize",
+ "kurbo",
  "log",
  "pico-args",
  "roxmltree 0.21.2",
@@ -18021,7 +17940,7 @@ dependencies = [
  "simplecss",
  "siphasher",
  "strict-num",
- "svgtypes 0.16.2",
+ "svgtypes",
  "tiny-skia-path",
  "unicode-bidi",
  "unicode-script",
@@ -18506,7 +18425,7 @@ dependencies = [
 [[package]]
 name = "webclaw-core"
 version = "0.7.5"
-source = "git+https://github.com/0xMassi/webclaw#5520df6adc2361d68a4f2c06096b6faab80d50a0"
+source = "git+https://github.com/0xMassi/webclaw#cfb2f7ea6aff08ae81d7500da13e597b3e96d214"
 dependencies = [
  "ego-tree 0.10.0",
  "regex",
@@ -19749,7 +19668,7 @@ version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
 dependencies = [
- "toml 1.2.2+spec-1.1.0",
+ "toml 1.2.3+spec-1.1.0",
  "version_check",
 ]
 
@@ -19810,9 +19729,9 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wry"
-version = "0.57.3"
+version = "0.57.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceb43f824178e8110e3181bfd478359c43b041452a9560d321bd8d121e468f86"
+checksum = "2c7bdc0b007462dd8a6cdb598e131e6899efa7eec16afdab4ee94b33f344c705"
 dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
@@ -20331,18 +20250,18 @@ checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.64"
+version = "0.8.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed43f3060383c64b000f3c630550aebdfa9d3b76d48de32390483dd2cc7e0865"
+checksum = "32bc8a75f879cd6fe53a6bedf3c28f0e1b914c77424fc2be9e2ec85d7d25aff5"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.64"
+version = "0.8.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"
+checksum = "b8bfd2644ea1681f60cf95029ff18aa8ad1cc3f7b8fe37286f8e473bb29f816b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20432,7 +20351,7 @@ version = "9.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d8dbe089cf6b0448b78f5fc50139ab5aaa40d08ac07cdc1baf2c13add35fcce"
 dependencies = [
- "constant_time_eq 0.6.1",
+ "constant_time_eq 0.6.2",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
@@ -20485,55 +20404,49 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+checksum = "b04655dc7bf4abd8ebe23dac6bef20fceea52a29ad19e37a4101b3951d7e8b45"
 dependencies = [
- "zstd-safe 7.4.1",
+ "zstd-safe 7.4.2",
 ]
 
 [[package]]
 name = "zstd"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
+checksum = "465cb081cac3a28a84ef547702dba1fe0f4a9f22e4e57a0b675ceee028c2af80"
 dependencies = [
- "zstd-safe 8.3.0",
+ "zstd-safe 8.4.0",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.4.1"
+version = "7.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+checksum = "df2575690b2a3eccad509fe7898cdde32a5afca06a06449ff4dcfb318c7b7281"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.3.0"
+version = "8.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
+checksum = "9b09bddd92c53b91833f4df03e0ea07e02d8367cfcd15a3b9acda94fc273f793"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.3+zstd.1.5.7"
+version = "2.2.0+zstd.1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
 dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[package]]
-name = "zune-core"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
 
 [[package]]
 name = "zune-core"
@@ -20552,20 +20465,11 @@ dependencies = [
 
 [[package]]
 name = "zune-jpeg"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
-dependencies = [
- "zune-core 0.4.12",
-]
-
-[[package]]
-name = "zune-jpeg"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core",
 ]
 
 [[package]]
