@@ -673,6 +673,7 @@ async fn a_settled_legacy_revision_gets_one_fresh_execution_under_concurrent_ret
         runtime_id: Set("codex".into()),
         runtime_kind: Set("codex".into()),
         native_thread_id: Set("previous-native-thread".into()),
+        frozen_manifest_id: Set(None),
         status: Set("blocked".into()),
         created_at: Set(at),
         updated_at: Set(at),
