@@ -800,6 +800,10 @@ impl Provider for AuthorityBoundProvider {
         model: &str,
     ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
         self.ensure_not_revoked()?;
+        #[cfg(feature = "test-support")]
+        if let Some(modes) = self.inner.fixture_service_modes(model) {
+            return Ok(Some(modes));
+        }
         if !self.use_public_catalog || self.inner.name() == "azure-openai" {
             return Ok(None);
         }

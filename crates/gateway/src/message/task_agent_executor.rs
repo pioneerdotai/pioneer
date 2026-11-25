@@ -193,6 +193,24 @@ async fn revision_turn_author(
     }
 }
 
+fn task_codex_model_options(
+    actor_contract: &pioneer_protocol::TaskActorContract,
+    runtime_kind: Option<CLIAgentRuntimeKind>,
+) -> Result<Option<pioneer_protocol::TurnCLIRuntimeOptions>> {
+    let Some(grant_json) = actor_contract.derived_child_launch_grant_json.as_deref() else {
+        return Ok(None);
+    };
+    let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+        codex_model_options,
+        ..
+    } = serde_json::from_str(grant_json).context("Task resolved launch grant is invalid")?;
+    anyhow::ensure!(
+        codex_model_options.is_none() || runtime_kind == Some(CLIAgentRuntimeKind::Codex),
+        "Task model options differ from the pinned CLI runtime",
+    );
+    Ok(codex_model_options.map(pioneer_protocol::CodexTurnModelOptions::into_cli_runtime_options))
+}
+
 fn task_saved_child_launch_grant(
     actor_contract: &pioneer_protocol::TaskActorContract,
 ) -> Result<pioneer_protocol::ChildAgentLaunchGrantSet> {
@@ -1894,12 +1912,12 @@ impl TaskAgentExecutor {
             .await
             .context("failed to bind child agent action service")?;
         let action_facts = action_adapter.persistence_facts();
-        let launch_selection = processor
+        let actor_contract = processor
             .crud_store
             .get_task_actor_contract(task.id.as_str())
             .await?
-            .context("agent Task is missing its durable actor contract")?
-            .launch;
+            .context("agent Task is missing its durable actor contract")?;
+        let launch_selection = actor_contract.launch.as_ref();
         let effective_model = EffectiveAgentModel {
             model: action_facts.profile.model_id.clone(),
             model_provider: action_facts.profile.provider_id.clone(),
@@ -1994,7 +2012,7 @@ impl TaskAgentExecutor {
         } else {
             None
         };
-        let normalized_selected_capabilities = if let Some(selection) = launch_selection.as_ref() {
+        let normalized_selected_capabilities = if let Some(selection) = launch_selection {
             Some(
                 processor
                     .normalize_task_launch_capabilities(
@@ -2008,7 +2026,7 @@ impl TaskAgentExecutor {
         };
         if let (Some(composer), Some(selection), Some(launch)) = (
             normalized_composer_capabilities.as_ref(),
-            launch_selection.as_ref(),
+            launch_selection,
             composer_launch.as_ref(),
         ) {
             let mut validation_launch = launch.clone();
@@ -2030,7 +2048,6 @@ impl TaskAgentExecutor {
         // actor field into FullAccess, because that would manufacture a false
         // conflict with Supervised or AutoAcceptEdits Composer launches.
         let selected_permission_profile = launch_selection
-            .as_ref()
             .and_then(|selection| selection.execution.permission_profile.as_ref())
             .map(|selection| pioneer_protocol::resolve_turn_permission_profile(Some(selection)));
         let composer_permission_profile =
@@ -2047,9 +2064,8 @@ impl TaskAgentExecutor {
             agent_spec,
             launch_permission_profile.as_ref(),
         )?;
-        let selected_reasoning = launch_selection
-            .as_ref()
-            .and_then(|selection| selection.execution.reasoning.clone());
+        let selected_reasoning =
+            launch_selection.and_then(|selection| selection.execution.reasoning.clone());
         let composer_reasoning_effort = composer_launch_reasoning_effort(composer_launch.as_ref());
         if let (Some(selected), Some(composer)) = (
             selected_reasoning.as_ref(),
@@ -2065,7 +2081,7 @@ impl TaskAgentExecutor {
             .map(str::to_owned)
             .or(composer_reasoning_effort);
         if let Some(launch) = composer_launch.as_mut()
-            && let Some(selection) = launch_selection.as_ref()
+            && let Some(selection) = launch_selection
         {
             if let Some(reasoning) = selection.execution.reasoning.clone() {
                 launch.reasoning = Some(reasoning);
@@ -2167,6 +2183,10 @@ impl TaskAgentExecutor {
             .as_ref()
             .map(|normalized| normalized.execution.clone())
             .unwrap_or_default();
+        let cli_runtime_options = task_codex_model_options(
+            &actor_contract,
+            cli_runtime_backend.as_ref().map(|(_, kind)| *kind),
+        )?;
         let is_composer_service_turn = composer_launch.is_some();
         let turn_params = composer_launch.unwrap_or_else(|| TurnStartParams {
             service_mode: None,
@@ -2187,9 +2207,8 @@ impl TaskAgentExecutor {
             execution_backend: selected_execution_backend,
             reasoning: selected_reasoning,
             permission_profile: launch_selection
-                .as_ref()
                 .and_then(|selection| selection.execution.permission_profile.clone()),
-            cli_runtime_options: None,
+            cli_runtime_options,
         });
         let child_execution_backend = turn_params.execution_backend.clone();
         let child_security_snapshot = match cli_runtime_backend.as_ref() {
@@ -2247,11 +2266,6 @@ impl TaskAgentExecutor {
         let child_authorization_fingerprint = child_authorization_context
             .authorization_fingerprint()
             .context("failed to fingerprint hidden task execution authorization")?;
-        let actor_contract = processor
-            .crud_store
-            .get_task_actor_contract(task.id.as_str())
-            .await?
-            .context("agent Task is missing its durable actor contract")?;
         let input_author = task_actor_turn_author(processor, &actor_contract).await?;
         let non_cli_action_author = input_author.clone();
         let graph = persist_task_agent_execution_graph(
@@ -3561,7 +3575,7 @@ impl TaskAgentExecutor {
                 execution_backend: Some(turn_settings.execution_backend.clone()),
                 reasoning: turn_settings.reasoning.clone(),
                 permission_profile: turn_settings.permission_selection.clone(),
-                cli_runtime_options: None,
+                cli_runtime_options: task_codex_model_options(&actor_contract, Some(runtime_kind))?,
             };
             // As with initial Task startup, CLI preparation and activation need
             // fresh poll stacks below revision dispatch. The existing task

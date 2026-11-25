@@ -25,13 +25,40 @@ async fn start_task_cli_fixture_with_task_config(
     Arc<MessageProcessor>,
     String,
 ) {
-    start_task_cli_fixture_with_models(kind, task_config, &[]).await
+    start_task_cli_fixture_with_models(kind, task_config, &[], None).await
+}
+
+async fn cli_task_request_with_model_options(
+    harness: &CliRuntimeSkillPreflightHarness,
+    request: &str,
+    options: JsonValue,
+) -> String {
+    let mut request: JsonValue = serde_json::from_str(request).unwrap();
+    let thread = harness
+        .crud_store
+        .get_thread_model(request["params"]["thread_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .processor
+        .mark_cli_reasoning_model_ready_for_tests(
+            &harness.workspace_id,
+            &harness.runtime_id,
+            &thread.model,
+        )
+        .await
+        .unwrap();
+    request["params"]["model"] = json!(thread.model);
+    request["params"]["cli_runtime_options"] = options;
+    request.to_string()
 }
 
 fn start_task_cli_fixture_with_models<'a>(
     kind: CLIAgentRuntimeKind,
     task_config: pioneer_tasks::TaskRuntimeConfig,
     models: &'a [&'a str],
+    runtime_options: Option<JsonValue>,
 ) -> BoxFuture<
     'a,
     (
@@ -71,6 +98,11 @@ fn start_task_cli_fixture_with_models<'a>(
             kind,
             Vec::new(),
         );
+        let request = if let Some(options) = runtime_options {
+            cli_task_request_with_model_options(&harness, &request, options).await
+        } else {
+            request
+        };
         processor
             .process_request_for_connection(harness.connection_id, &request)
             .await;
@@ -88,6 +120,7 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
             CLIAgentRuntimeKind::Codex,
             pioneer_tasks::TaskRuntimeConfig::default(),
             &[],
+            None,
         )
         .await;
         // Readiness can expose another allowed model after parent admission.
@@ -2455,10 +2488,16 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 kind,
                 vec![serde_json::to_value(&selected).unwrap()],
             );
+            let request = cli_task_request_with_model_options(
+                &harness,
+                &request,
+                json!({"effort":"high", "personality":"friendly", "summary":"detailed"}),
+            )
+            .await;
             processor
                 .process_request_for_connection(harness.connection_id, &request)
                 .await;
-            wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+            let source = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
             wait_for_task_cli_activation(&processor, &turn_id).await;
             let snapshot = processor
                 .crud_store
@@ -2491,6 +2530,18 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 .await
                 .unwrap()
                 .unwrap();
+            let grant: JsonValue =
+                serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
+                    .unwrap();
+            assert!(grant.get("native_context").is_none());
+            if kind == CLIAgentRuntimeKind::Codex {
+                assert_eq!(
+                    grant["codex_model_options"],
+                    json!({"personality":"friendly", "summary":"detailed"})
+                );
+            } else {
+                assert!(grant.get("codex_model_options").is_none());
+            }
             assert_eq!(
                 actor.launch.unwrap().execution.selected_capabilities,
                 vec![selected],
@@ -2507,6 +2558,18 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
             // Creation only persists the run; await its admitted child before
             // checking the recording session's provider dispatch.
             wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
+            {
+                let starts = harness.cli_session.turn_starts.lock().await;
+                let child = &starts[1];
+                assert_eq!(child.model, source.model);
+                assert_eq!(child.effort, source.effort);
+                if kind == CLIAgentRuntimeKind::Codex {
+                    assert_eq!(child.personality.as_deref(), Some("friendly"));
+                    assert_eq!(child.summary.as_deref(), Some("detailed"));
+                } else {
+                    assert!(child.personality.is_none() && child.summary.is_none());
+                }
+            }
             let child_turn_id = child_binding.turn_id.as_str();
             let child_bindings = processor
                 .crud_store
@@ -3248,7 +3311,13 @@ fn completed_native_attempt_recovery_continues_unfinished_attached_tasks() {
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+            let (harness, processor, turn_id) = start_task_cli_fixture_with_models(
+                kind,
+                pioneer_tasks::TaskRuntimeConfig::default(),
+                &[],
+                Some(json!({"effort":"high", "personality":"friendly", "summary":"detailed"})),
+            )
+            .await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("recovery_child_{kind:?}"));
             let created = invoke_task(&processor, &turn_id, "recovery-create", "task_create", json!({
@@ -3326,18 +3395,18 @@ fn completed_native_attempt_recovery_continues_unfinished_attached_tasks() {
                 .unwrap();
             assert_eq!(next.attempt_index, 2);
             assert_eq!(next.execution_window_index, attempt.execution_window_index);
-            assert!(
-                harness
-                    .cli_session
-                    .turn_starts
-                    .lock()
-                    .await
-                    .last()
-                    .unwrap()
-                    .input
-                    .to_string()
-                    .contains(&task_id)
-            );
+            {
+                let starts = harness.cli_session.turn_starts.lock().await;
+                let recovered = starts.last().unwrap();
+                assert!(recovered.input.to_string().contains(&task_id));
+                assert_eq!(recovered.effort.as_deref(), Some("high"));
+                if kind == CLIAgentRuntimeKind::Codex {
+                    assert_eq!(recovered.personality.as_deref(), Some("friendly"));
+                    assert_eq!(recovered.summary.as_deref(), Some("detailed"));
+                } else {
+                    assert!(recovered.personality.is_none() && recovered.summary.is_none());
+                }
+            }
             assert_eq!(
                 processor
                     .crud_store
@@ -5702,6 +5771,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 kind,
                 pioneer_tasks::TaskRuntimeConfig::default(),
                 &["threads-cli-choice"],
+                None,
             )
             .await;
             let bindings = processor

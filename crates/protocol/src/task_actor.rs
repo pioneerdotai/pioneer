@@ -65,6 +65,8 @@ pub enum TaskDerivedChildLaunchGrant {
         native_context: Option<crate::NativeContextBudget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_summary: Option<crate::NativeSummaryContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_model_options: Option<crate::CodexTurnModelOptions>,
         identity: AgentIdentityProjection,
         profile: AgentExecutionProfileProjection,
         role_key: String,
@@ -129,6 +131,7 @@ impl TaskDerivedChildLaunchGrant {
             agent_authorization_fingerprint,
             child_launch_grant,
             native_context,
+            codex_model_options,
             native_summary: _,
         } = self;
         if role_key.trim().is_empty()
@@ -147,6 +150,14 @@ impl TaskDerivedChildLaunchGrant {
                 || budget.model != profile.model_id
                 || budget.context_window == 0
         }) {
+            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
+        }
+        if codex_model_options.is_some()
+            && !matches!(
+                profile.backend,
+                crate::AgentExecutionProfileBackend::CliRuntime { .. }
+            )
+        {
             return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
         }
         child_launch_grant

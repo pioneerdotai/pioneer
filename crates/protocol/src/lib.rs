@@ -486,7 +486,7 @@ pub use timeline::{
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CUA_TOOL_NAMES,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CUA_TOOL_NAMES, CodexTurnModelOptions,
     ContextCompressedNotification, ContextCompressingNotification, DeltaOutputPolicy,
     DiagnosticExcerptPolicy, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
     EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION, EmptyStrictObligationCollector,

@@ -128,6 +128,59 @@ pub(crate) async fn persist_cli_runtime_turn_binding_before_native_start(
     Ok(binding)
 }
 
+const MODEL_OPTIONS_FIELD: &str = "pioneerCliModelOptions";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SavedCliModelOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<pioneer_protocol::CodexTurnModelOptions>,
+}
+
+pub(crate) fn persist_cli_model_options(
+    input_mapping_json: String,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+    effort: Option<&str>,
+    personality: Option<&str>,
+    summary: Option<&str>,
+) -> Result<String> {
+    let codex = (runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Codex
+        && (personality.is_some() || summary.is_some()))
+    .then(|| pioneer_protocol::CodexTurnModelOptions {
+        personality: personality.map(str::to_owned),
+        summary: summary.map(str::to_owned),
+    });
+    if effort.is_none() && codex.is_none() {
+        return Ok(input_mapping_json);
+    }
+    let mut mapping: serde_json::Value = serde_json::from_str(&input_mapping_json)?;
+    mapping[MODEL_OPTIONS_FIELD] = serde_json::to_value(SavedCliModelOptions {
+        effort: effort.map(str::to_owned),
+        codex,
+    })?;
+    Ok(serde_json::to_string(&mapping)?)
+}
+
+pub(crate) fn cli_model_options_from_binding(
+    binding: &CliRuntimeTurnBindingRecord,
+) -> Result<SavedCliModelOptions> {
+    let mapping: serde_json::Value = serde_json::from_str(&binding.input_mapping_json)?;
+    let saved: SavedCliModelOptions = mapping
+        .get(MODEL_OPTIONS_FIELD)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("saved CLI model options are malformed")?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        saved.codex.is_none() || binding.runtime_kind == "codex",
+        "saved Codex model options differ from the bound runtime kind",
+    );
+    Ok(saved)
+}
+
 pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
     store: &CrudStore,
     native_turn: CLIAgentRuntimeNativeTurnStarted,

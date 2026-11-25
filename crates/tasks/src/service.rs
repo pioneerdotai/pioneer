@@ -2534,8 +2534,8 @@ impl TaskService {
             occurrence.root_resource_scope_id = context.work_graph_root_execution_id.clone();
             occurrence
         });
-        // CLI replay references live in the canonical action receipt and commit
-        // atomically with creation. No CLI response or history ACK is required.
+        // Replay references live in the canonical action receipt and commit
+        // atomically with creation, independently of tool result persistence.
         if let Some(action) = context.agent_action_commit.as_mut() {
             let mut response: serde_json::Value =
                 serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;

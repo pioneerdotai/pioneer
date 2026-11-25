@@ -1161,6 +1161,7 @@ impl MessageProcessor {
             self,
             &params.workspace_id,
             None,
+            false,
             &mut context,
         )
         .await

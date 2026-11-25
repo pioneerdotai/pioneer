@@ -13,12 +13,28 @@ enum ChoiceCatalogResponse {
     Unavailable,
 }
 
+const INHERITED_AUTO_WINDOW: u64 = 1024;
+const INHERITED_MANUAL_WINDOW: u64 = 65_536;
+const INHERITED_MODE: &str = "priority";
+
+fn inherited_service_plan() -> pioneer_protocol::NativeServiceModePlan {
+    pioneer_protocol::NativeServiceModePlan {
+        id: INHERITED_MODE.into(),
+        parameters: pioneer_protocol::ServiceModeParameters::OpenAiTier {
+            tier: pioneer_protocol::OpenAiTier::Priority,
+        },
+    }
+}
+
 #[derive(Default)]
 struct ChoiceRuntimeProbe {
     main_calls: AtomicUsize,
+    main_request: std::sync::Mutex<Option<ChatRequest>>,
     main_started: Notify,
     release_main: Notify,
     hold_main: std::sync::atomic::AtomicBool,
+    stale_reasoning_profile: bool,
+    fixture_model_settings: bool,
 }
 
 struct ChoiceModelsProvider {
@@ -43,6 +59,9 @@ impl Provider for ChoiceModelsProvider {
             Some(PromptParityRequestKind::Main)
         ) {
             self.probe.main_calls.fetch_add(1, Ordering::SeqCst);
+            if self.probe.stale_reasoning_profile {
+                *self.probe.main_request.lock().unwrap() = Some(request.clone());
+            }
             self.probe.main_started.notify_one();
             if self.probe.hold_main.load(Ordering::SeqCst) {
                 self.probe.release_main.notified().await;
@@ -63,6 +82,35 @@ impl Provider for ChoiceModelsProvider {
         ])
         .boxed())
     }
+    fn fixture_service_modes(&self, model: &str) -> Option<pioneer_protocol::SourceServiceModes> {
+        let selected_model = if self.probe.stale_reasoning_profile {
+            "gpt-6.1-terra"
+        } else {
+            "gpt-5.4"
+        };
+        if !self.probe.fixture_model_settings || model != selected_model {
+            return None;
+        }
+        Some(pioneer_protocol::SourceServiceModes::Known(
+            [(
+                INHERITED_MODE.into(),
+                pioneer_protocol::SourceServiceMode::Parsed {
+                    descriptor: pioneer_protocol::ServiceModeDescriptor {
+                        id: INHERITED_MODE.into(),
+                        label: "Priority".into(),
+                        parameters: inherited_service_plan().parameters,
+                        source_provider: "openai".into(),
+                        source_model: model.into(),
+                        source_api: "openai-responses".into(),
+                        source_url: None,
+                        cost: None,
+                    },
+                },
+            )]
+            .into(),
+        ))
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         self.catalog_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -72,6 +120,23 @@ impl Provider for ChoiceModelsProvider {
             ChoiceCatalogResponse::Unavailable => anyhow::bail!("fixture catalog unavailable"),
         }
         let mut models = self.inner.list_models().await?;
+        if self.probe.fixture_model_settings {
+            models[0].limits.context_window = Some(INHERITED_MANUAL_WINDOW);
+            models[0].context_tiers = Some(pioneer_protocol::ProviderContextTiers::Tiered {
+                windows: vec![INHERITED_AUTO_WINDOW, INHERITED_MANUAL_WINDOW],
+                price_order_confirmed: true,
+            });
+        }
+        if self.probe.stale_reasoning_profile {
+            models[0].id = "gpt-6.1-terra".into();
+            models[0]
+                .capabilities
+                .reasoning
+                .as_mut()
+                .unwrap()
+                .effort_options
+                .push("xhigh".into());
+        }
         let mut no_effort = models[0].clone();
         no_effort.id = "catalog-no-effort".into();
         no_effort.name = Some("Model without effort controls".into());
@@ -176,21 +241,35 @@ async fn fixture_with_principal_probe(
     pioneer_agent::TurnToolMaterialization,
 ) {
     let (workspaces, store, workspace) = setup_workspace_manager().await;
-    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "openai",
-        Arc::new(ChoiceModelsProvider {
-            name: "openai",
-            probe,
-            response,
-            inner: PromptParityCaptureProvider::default(),
-            extra_models,
-            catalog_calls,
-        }),
-    ));
+    let stale_reasoning_profile = probe.stale_reasoning_profile;
     let secrets = test_gateway_secrets();
     secrets
         .set_workspace_provider_api_key(&workspace, "openai", "fixture-secret")
         .unwrap();
+    let provider = Arc::new(ChoiceModelsProvider {
+        name: "openai",
+        probe,
+        response,
+        inner: PromptParityCaptureProvider::default(),
+        extra_models,
+        catalog_calls,
+    });
+    let registry = Arc::new(if stale_reasoning_profile {
+        let secrets = secrets.clone();
+        let registry = pioneer_provider::ProviderRegistry::new_scoped(move |workspace, name| {
+            workspace
+                .and_then(|workspace| {
+                    secrets
+                        .get_workspace_provider_api_key(workspace, name)
+                        .unwrap()
+                })
+                .unwrap_or_default()
+        });
+        registry.insert("openai", provider).unwrap();
+        registry
+    } else {
+        pioneer_provider::ProviderRegistry::with_provider("openai", provider)
+    });
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("composer-model", "openai")),
         registry,
@@ -297,7 +376,13 @@ async fn fixture_with_principal_probe(
     } else {
         "openai"
     };
-    let model = if cli_parent { "test-model" } else { "gpt-5.4" };
+    let model = if cli_parent {
+        "test-model"
+    } else if stale_reasoning_profile {
+        "gpt-6.1-terra"
+    } else {
+        "gpt-5.4"
+    };
     let backend = if cli_parent {
         AgentExecutionBackend::CLIAgentRuntime {
             runtime_id: "codex".into(),
@@ -375,14 +460,16 @@ async fn fixture_with_principal_probe(
             thread_id: context.thread_id.clone(),
             workspace_id: workspace,
             mode: pioneer_protocol::ThreadMode::Agent,
-            model: if cli_parent { "test-model" } else { "gpt-5.4" }.into(),
-            provider_name: if cli_parent {
-                "cli_runtime:codex"
-            } else {
-                "openai"
-            }
-            .into(),
-            reasoning_effort: Some("high".into()),
+            model: model.into(),
+            provider_name: provider.into(),
+            reasoning_effort: Some(
+                if stale_reasoning_profile {
+                    "xhigh"
+                } else {
+                    "high"
+                }
+                .into(),
+            ),
             agent_skill_versions_json: None,
             hook_runtime_context_json: serde_json::to_string(
                 &pioneer_agent::AgentTurnHookRuntimeContext::default(),
@@ -399,7 +486,7 @@ async fn fixture_with_principal_probe(
         })
         .await
         .unwrap();
-    if cli_parent {
+    if cli_parent || stale_reasoning_profile {
         let authority = processor
             .load_turn_execution_authorization_context(&context.turn_id)
             .await
@@ -410,12 +497,8 @@ async fn fixture_with_principal_probe(
             .await
             .unwrap()
             .unwrap();
-        thread.model = "test-model".into();
-        thread.model_provider = "cli_runtime:codex".into();
-        let backend = AgentExecutionBackend::CLIAgentRuntime {
-            runtime_id: "codex".into(),
-            runtime_kind: CLIAgentRuntimeKind::Codex,
-        };
+        thread.model = model.into();
+        thread.model_provider = provider.into();
         let prepared = crate::message::agent_action_tools::prepare_root_agent_execution_admission(
             &processor,
             &context,
@@ -425,7 +508,7 @@ async fn fixture_with_principal_probe(
             None,
             Some(&backend),
             None,
-            Some("high"),
+            (!stale_reasoning_profile).then_some("high"),
         )
         .await
         .unwrap();
@@ -595,11 +678,15 @@ async fn delegated_root_route_survives_creator_completion_and_persisted_descenda
 #[pioneer_postgres_test::postgres_test]
 async fn inherited_configuration_survives_visible_thread_creation_message_and_start_replay() {
     let catalog = Arc::new(std::sync::RwLock::new(ChoiceCatalogResponse::Default));
-    let (processor, context, tools) = fixture_with_parent(
+    let (processor, context, tools) = fixture_with_probe(
         Default::default(),
         Default::default(),
         catalog.clone(),
         false,
+        Arc::new(ChoiceRuntimeProbe {
+            fixture_model_settings: true,
+            ..Default::default()
+        }),
     )
     .await;
     let binding = processor
@@ -785,7 +872,9 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         message_thread.turns[0].author.as_ref().unwrap().actor,
         pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
     );
-    let arguments = json!({"targetOptionId": target.id, "input": [{"type":"text","text":"Child task"}], "launch":{"permissionProfile":{"mode":"full_access"}}});
+    let budget = fixture_working_budget(&processor, &context, &facts.profile.model_id).await;
+    let arguments =
+        json!({"targetOptionId": target.id, "input": [{"type":"text","text":"Child task"}]});
     let (first, simultaneous) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(
             call(
@@ -861,6 +950,12 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .await
         .unwrap()
         .unwrap();
+    let saved: pioneer_protocol::TaskDerivedChildLaunchGrant =
+        serde_json::from_str(contract.derived_child_launch_grant_json.as_deref().unwrap()).unwrap();
+    let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+        native_context, ..
+    } = saved;
+    assert_eq!(native_context.as_ref(), Some(&budget));
     assert_eq!(
         contract.creator,
         pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
@@ -926,6 +1021,11 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
             .iter()
             .all(|action| parent_authority.granted_action_names().contains(action))
     );
+    let mut changed = budget;
+    changed.service_mode = None;
+    changed.manual_window = None;
+    changed.context_window = INHERITED_AUTO_WINDOW;
+    seed_working_budget(&processor, &context, changed).await;
     let before = outbox.payload_json.clone();
     *catalog.write().unwrap() = ChoiceCatalogResponse::Unavailable;
     let (replay, concurrent_replay) = tokio::join!(
@@ -941,6 +1041,16 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(replay["threadResult"], first["threadResult"]);
     assert_eq!(concurrent_replay["threadResult"], first["threadResult"]);
     assert_eq!(replay["outcome"], "agent_action_already_committed");
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        contract,
+    );
+
     assert_eq!(
         pioneer_crud::load_agent_action_outbox(&db, &outbox.action_id)
             .await
@@ -2011,6 +2121,349 @@ async fn inherited_other_cli_replay_does_not_reselect_a_model() {
     );
 }
 
+async fn fixture_working_budget(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    model: &str,
+) -> pioneer_protocol::NativeContextBudget {
+    let provider = processor
+        .provider_registry
+        .get_or_create_for_workspace(&context.workspace_id, "openai")
+        .unwrap();
+    provider.list_models().await.unwrap();
+    let authority = pioneer_protocol::native_context_choice_authority(
+        provider.authority_fingerprint().unwrap(),
+        model,
+    );
+    let mode = pioneer_protocol::NativeServiceModeSelection {
+        id: INHERITED_MODE.into(),
+        authority,
+    };
+    let budget = crate::compaction::native_budget::capture_with_mode(
+        provider.as_ref(),
+        "openai",
+        model,
+        Some(INHERITED_MANUAL_WINDOW),
+        Some(&mode),
+    )
+    .await
+    .unwrap();
+    seed_working_budget(processor, context, budget.clone()).await;
+    budget
+}
+
+async fn seed_working_budget(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    budget: pioneer_protocol::NativeContextBudget,
+) {
+    let mut snapshot = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(&context.turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    snapshot.native_context = Some(budget);
+    processor
+        .crud_store
+        .set_turn_execution_security_snapshot(&context.turn_id, &snapshot)
+        .await
+        .unwrap();
+}
+
+async fn api_task_tools(
+    processor: &Arc<MessageProcessor>,
+    context: &TurnToolContext,
+) -> pioneer_agent::TurnToolMaterialization {
+    use pioneer_agent::TaskToolProvider;
+    let tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(processor))
+        .materialize_task_tools(pioneer_agent::TaskTurnContext {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+        })
+        .await
+        .unwrap();
+    pioneer_agent::TurnToolMaterialization {
+        bundles: tools.bundles,
+        ..Default::default()
+    }
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn task_create_inherits_applied_effort_from_an_empty_parent_profile() {
+    let probe = Arc::new(ChoiceRuntimeProbe {
+        stale_reasoning_profile: true,
+        fixture_model_settings: true,
+        ..Default::default()
+    });
+    probe.hold_main.store(true, Ordering::SeqCst);
+    let (processor, context, _) = fixture_with_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        probe.clone(),
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let facts = binding.adapter.lock().await.persistence_facts();
+    assert!(facts.profile.allowed_reasoning.is_empty());
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot(&context.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("xhigh")
+    );
+
+    let model = facts.profile.model_id.as_str();
+    let selected = fixture_working_budget(&processor, &context, model).await;
+    assert_eq!(selected.context_window, INHERITED_MANUAL_WINDOW);
+    let provider = processor
+        .provider_registry
+        .get_or_create_for_workspace(&context.workspace_id, "openai")
+        .unwrap();
+
+    processor.bind_context_compaction().await;
+    processor.bind_task_bridge().await;
+    let tools = api_task_tools(&processor, &context).await;
+    let request = json!({"title":"Inherited task", "goal":"Inspect the selected model settings"});
+    let created = invoke_with_mutation(
+        &tools,
+        "task_create",
+        "stale-profile",
+        request.clone(),
+        Some("inherited-launch"),
+    )
+    .await
+    .unwrap();
+    let task_id = created["taskId"].as_str().unwrap();
+    let actor = processor
+        .crud_store
+        .get_task_actor_contract(task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    actor.validate().unwrap();
+    assert_eq!(
+        actor.resolved_profile_id.as_deref(),
+        Some(facts.profile.id.as_str())
+    );
+    assert_eq!(
+        actor
+            .launch
+            .as_ref()
+            .unwrap()
+            .execution
+            .reasoning
+            .as_ref()
+            .unwrap()
+            .effort,
+        "xhigh"
+    );
+
+    let run_id = created["runId"].as_str().unwrap();
+    let lineage = wait_for_child_lineage_for_run(processor.crud_store.clone(), run_id).await;
+    timeout(Duration::from_secs(10), probe.main_started.notified())
+        .await
+        .unwrap();
+    let child = processor
+        .crud_store
+        .get_turn_runtime_snapshot(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.model, "gpt-6.1-terra");
+    assert_eq!(child.provider_name, "openai");
+    assert_eq!(child.reasoning_effort.as_deref(), Some("xhigh"));
+    let sent = probe.main_request.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        sent.reasoning,
+        Some(pioneer_provider::ReasoningConfig::Effort(
+            pioneer_protocol::ReasoningEffort::XHigh,
+        )),
+    );
+    assert_eq!(sent.service_mode, Some(inherited_service_plan()));
+    let child_security = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    assert_eq!(child_security.native_context.as_ref(), Some(&selected));
+    let applied = crate::compaction::native_budget::effective(
+        provider.as_ref(),
+        "openai",
+        model,
+        child_security.native_context.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
+    let automatic =
+        crate::compaction::native_budget::effective(provider.as_ref(), "openai", model, None, None)
+            .await
+            .unwrap();
+    assert_eq!(applied.context, INHERITED_MANUAL_WINDOW);
+    assert_eq!(automatic.context, INHERITED_AUTO_WINDOW);
+    assert!(u64::from(sent.max_tokens.unwrap()) > automatic.output_reserve(None).unwrap());
+    probe.hold_main.store(false, Ordering::SeqCst);
+    probe.release_main.notify_one();
+
+    let default = call(
+        &tools,
+        "task_create",
+        "native-default",
+        json!({
+            "title":"Native default", "goal":"Use the model default",
+            "launch":{"useDefaultReasoning":true}
+        }),
+    )
+    .await;
+    let default_actor = processor
+        .crud_store
+        .get_task_actor_contract(default["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(default_actor.launch.unwrap().execution.reasoning.is_none());
+
+    let denied = invoke_with_mutation(
+        &tools,
+        "task_create",
+        "bad-reasoning",
+        json!({
+            "title":"Unsupported choice", "goal":"Inspect the selected model settings",
+            "launch":{"profile":{"kind":"model","providerId":"openai","modelId":"catalog-no-effort"},
+                "reasoning":{"effort":"high"}}
+        }),
+        None,
+    ).await.unwrap_err();
+    assert!(
+        denied
+            .to_string()
+            .contains("agent_execution_selection_not_allowed")
+    );
+
+    // The handler committed the Task/action atomically. There is no successful
+    // tool item, and materializing the API tools again creates a cold cache.
+    assert!(
+        processor
+            .crud_store
+            .list_turn_items_by_type(&context.turn_id, "dynamic_tool_call")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    processor
+        .gateway_secrets()
+        .set_workspace_provider_api_key(&context.workspace_id, "openai", "rotated-fixture-secret")
+        .unwrap();
+    // Re-admit the fixture's execution under the live provider authority.
+    // Leave the captured picker budget on the old authority so the normal
+    // tool authorization gate passes and the launch-budget guard is exercised.
+    let saved_authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        saved_authority
+            .verify_current_provider_authority(processor.provider_registry.as_ref())
+            .is_err()
+    );
+    let revalidated = processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &saved_authority,
+            crate::authorization::ResourceAction::TaskCreate,
+            processor.current_authorization_revision().await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let fresh_authority = saved_authority
+        .resolve_new_task_provider_authority(processor.provider_registry.as_ref(), &revalidated)
+        .unwrap();
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(
+                &context.turn_id,
+                &fresh_authority.to_persisted_json().unwrap(),
+            )
+            .await
+            .unwrap()
+    );
+    let cold = api_task_tools(&processor, &context).await;
+    let replay = invoke_with_mutation(
+        &cold,
+        "task_create",
+        "stale-profile",
+        request.clone(),
+        Some("inherited-launch"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["alreadyCommitted"], true);
+    assert_eq!(replay["taskId"], created["taskId"]);
+    assert_eq!(replay["runId"], created["runId"]);
+    let persisted_task = processor
+        .crud_store
+        .get_task(task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted_task.triggers.len(), 1);
+    assert_eq!(
+        replay["triggerId"].as_str(),
+        Some(persisted_task.triggers[0].id.as_str())
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        actor,
+    );
+    let cold = api_task_tools(&processor, &context).await;
+    let different = invoke_with_mutation(
+        &cold,
+        "task_create",
+        "stale-profile",
+        json!({"title":"Different input", "goal":"Inspect the selected model settings"}),
+        Some("inherited-launch"),
+    )
+    .await
+    .unwrap_err();
+    assert!(different.to_string().contains("task_invalid_arguments"));
+    let new_launch = invoke_with_mutation(
+        &cold,
+        "task_create",
+        "new-after-rotation",
+        request,
+        Some("new-after-rotation"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        new_launch
+            .to_string()
+            .contains("agent_execution_profile_unavailable")
+    );
+}
+
 #[pioneer_postgres_test::postgres_test]
 async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay() {
     use pioneer_agent::TaskToolProvider;
@@ -2083,7 +2536,7 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
         instance: "openai".into(),
         authority: provider.authority_fingerprint().map(str::to_owned),
         model: "gpt-5.4".into(),
-        manual_window: None,
+        manual_window: Some(272000),
         context_window: 272000,
         max_input: None,
         max_output: Some(16000),
@@ -2124,7 +2577,11 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
     )
     .unwrap();
     assert_eq!(same_grant["native_context"]["service_mode"]["id"], "pro");
-    assert_eq!(same_grant["native_context"]["context_window"], 272000);
+    assert_eq!(
+        same_grant["native_context"],
+        serde_json::to_value(&admitted).unwrap()
+    );
+    assert!(same_grant.get("codex_model_options").is_none());
     let launch = json!({"profile":{"kind":"model","providerId":"openai","modelId":"gpt-5.4-later-4096"},"useDefaultReasoning":true});
     let task = call(
         &task_tools,
@@ -2822,7 +3279,10 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
 async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner() {
     use sea_orm::{ActiveModelTrait, Set};
     for source_terminal in ["completed", "cancelled"] {
-        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let probe = Arc::new(ChoiceRuntimeProbe {
+            fixture_model_settings: true,
+            ..Default::default()
+        });
         probe.hold_main.store(true, Ordering::SeqCst);
         let (processor, context, tools) = fixture_with_probe(
             Default::default(),
@@ -2838,13 +3298,16 @@ async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner
             .unwrap();
         let source = binding.adapter.lock().await.persistence_facts();
         let target = delegated_launch_target(&processor, &tools, &binding.options).await;
-        call(
+        let mut budget =
+            fixture_working_budget(&processor, &context, &source.profile.model_id).await;
+        let arguments = json!({
+            "targetOptionId":target.id, "input":[{"type":"text","text":"Run independently"}],
+        });
+        let first = call(
             &tools,
             "threads_turn_start",
             "independent-first",
-            json!({
-                "targetOptionId":target.id, "input":[{"type":"text","text":"Run independently"}],
-            }),
+            arguments.clone(),
         )
         .await;
         let db = processor.crud_store.database_connection();
@@ -2856,6 +3319,30 @@ async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner
         let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
         let params: TurnStartParams =
             serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let child_security = processor
+            .crud_store
+            .get_turn_execution_security_snapshot(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(child_security.native_context, Some(budget.clone()));
+        assert_eq!(params.reasoning.as_ref().unwrap().effort, "high");
+        budget.context_window = INHERITED_AUTO_WINDOW;
+        seed_working_budget(&processor, &context, budget).await;
+        let replay = call(&tools, "threads_turn_start", "independent-first", arguments).await;
+        assert_eq!(replay["threadResult"], first["threadResult"]);
+        assert_eq!(replay["outcome"], "agent_action_already_committed");
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_execution_security_snapshot(&params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot,
+            child_security,
+        );
         let mut historical_target: pioneer_entity::thread::ActiveModel =
             pioneer_entity::thread::Entity::find_by_id(
                 payload["dispatch"]["thread_id"].as_str().unwrap(),

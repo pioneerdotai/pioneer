@@ -22,6 +22,16 @@
         "child_launch_grant": {
           "$ref": "#/$defs/ChildAgentLaunchGrantSet"
         },
+        "codex_model_options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodexTurnModelOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "identity": {
           "$ref": "#/$defs/AgentIdentityProjection"
         },
@@ -308,6 +318,25 @@
         "maxPermissionProfile",
         "fingerprint"
       ]
+    },
+    "CodexTurnModelOptions": {
+      "description": "Model options sent by the Codex adapter in addition to reasoning effort.",
+      "type": "object",
+      "properties": {
+        "personality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "NativeContextBudget": {
       "description": "Durable local authorization and budget for one Native/API provider authority/model.\nNever sent to a provider or accepted as a child tool's requested variant.",

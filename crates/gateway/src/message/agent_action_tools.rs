@@ -1921,6 +1921,11 @@ pub(crate) async fn resolve_tool_launch(
                 .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
             let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)
                 .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            if !selection.use_default_reasoning && selection.reasoning.is_none() {
+                selection.reasoning =
+                    serde_json::from_value(payload["dispatch"]["params"]["reasoning"].clone())
+                        .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            }
             Some(
                 serde_json::from_value::<pioneer_protocol::AgentExecutionProfileProjection>(
                     grant["profile"].clone(),
@@ -1961,7 +1966,8 @@ pub(crate) async fn resolve_tool_launch(
             saved_profile = Some(profile);
         }
     }
-    let selected = match saved_profile {
+    let replaying_launch = saved_profile.is_some();
+    let mut selected = match saved_profile {
         Some(profile) => profile,
         None => {
             selected_launch_profile(
@@ -1992,7 +1998,8 @@ pub(crate) async fn resolve_tool_launch(
     processor
         .register_agent_action_binding(context.turn_id.clone(), binding)
         .await;
-    if !selection.use_default_reasoning
+    if !replaying_launch
+        && !selection.use_default_reasoning
         && selection.reasoning.is_none()
         && (identity.id == facts.identity.id || ephemeral)
     {
@@ -2012,11 +2019,21 @@ pub(crate) async fn resolve_tool_launch(
         selection.reasoning = runtime
             .reasoning_effort
             .map(|effort| pioneer_protocol::TurnReasoningSelection { effort });
+        // The profile may have been frozen before the parent picked its effort.
+        // Admit only the applied effort for the very same executor and model.
+        if profile.backend == facts.profile.backend
+            && profile.provider_id == runtime.provider_name
+            && profile.model_id == runtime.model
+            && let Some(reasoning) = selection.reasoning.as_ref()
+            && !selected.allowed_reasoning.contains(reasoning)
+        {
+            selected.allowed_reasoning.push(reasoning.clone());
+        }
     }
     if selection
         .reasoning
         .as_ref()
-        .is_some_and(|reasoning| !profile.allowed_reasoning.contains(reasoning))
+        .is_some_and(|reasoning| !selected.allowed_reasoning.contains(reasoning))
     {
         return Err(ToolError::invalid_arguments(
             "agent_execution_selection_not_allowed",
@@ -2027,6 +2044,39 @@ pub(crate) async fn resolve_tool_launch(
     }
     selection.profile = pioneer_protocol::AgentToolProfileChoice::Exact { id: profile.id };
     Ok((selection, selected))
+}
+
+pub(crate) async fn inherited_codex_model_options(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+) -> Result<Option<pioneer_protocol::CodexTurnModelOptions>, ToolError> {
+    let pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+        runtime_instance_id,
+    } = &profile.backend
+    else {
+        return Ok(None);
+    };
+    let integrity_lost = |_| ToolError::execution_failed("agent_runtime_integrity_lost");
+    let Some(binding) = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(&context.turn_id)
+        .await
+        .map_err(integrity_lost)?
+    else {
+        // Older turns and runtimes without additional model options need no payload.
+        return Ok(None);
+    };
+    if binding.workspace_id != context.workspace_id
+        || binding.thread_id != context.thread_id
+        || &binding.runtime_id != runtime_instance_id
+        || binding.model.as_deref() != Some(profile.model_id.as_str())
+    {
+        return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
+    }
+    crate::cli_runtime::turn_binding::cli_model_options_from_binding(&binding)
+        .map(|options| options.codex)
+        .map_err(integrity_lost)
 }
 
 pub(crate) fn pin_launch_selection_capabilities(
@@ -5349,6 +5399,30 @@ impl AgentActionToolHandler {
         let authority_json = child_authority.to_persisted_json().map_err(|error| {
             ToolError::internal(format!("failed to encode child authority: {error:#}"))
         })?;
+        let cli_runtime_options = if requested_launch == Default::default() {
+            if let Some(authority) = provider_authority.as_ref() {
+                child_security_snapshot.native_context =
+                    crate::compaction::native_budget::inherited_context(
+                        parent_security_snapshot.native_context.as_ref(),
+                        Some(authority.as_str()),
+                        &child.grant.profile.provider_id,
+                        &child.grant.profile.model_id,
+                    )
+                    .map_err(|_| {
+                        ToolError::execution_failed("agent_execution_profile_unavailable")
+                    })?
+                    .cloned();
+                if child_security_snapshot.native_context.is_some() {
+                    child_security_snapshot.native_summary =
+                        parent_security_snapshot.native_summary.clone();
+                }
+            }
+            inherited_codex_model_options(&processor, &self.context, &child.grant.profile)
+                .await?
+                .map(pioneer_protocol::CodexTurnModelOptions::into_cli_runtime_options)
+        } else {
+            None
+        };
         let params = TurnStartParams {
             service_mode: None,
             context_authority: None,
@@ -5368,7 +5442,7 @@ impl AgentActionToolHandler {
             execution_backend: execution_backend.clone(),
             reasoning: start.launch.execution.reasoning.clone(),
             permission_profile: start.launch.execution.permission_profile.clone(),
-            cli_runtime_options: None,
+            cli_runtime_options,
         };
         let audit_event = processor.turn_profile_selected_audit_event_for_turn(
             self.context.workspace_id.as_str(),

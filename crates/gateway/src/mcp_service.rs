@@ -4399,6 +4399,17 @@ fn canonical_task_error_result(
             "permission_denied"
         }
         pioneer_tools::ToolError::Rejected(_) => "task_state_conflict",
+        pioneer_tools::ToolError::InvalidArguments(message)
+            if message == crate::task_tools::TASK_LAUNCH_SELECTION_ERROR =>
+        {
+            "agent_execution_selection_not_allowed"
+        }
+        pioneer_tools::ToolError::InvalidArguments(message)
+        | pioneer_tools::ToolError::ExecutionFailed(message)
+            if message == crate::task_tools::TASK_LAUNCH_UNAVAILABLE_ERROR =>
+        {
+            "agent_execution_profile_unavailable"
+        }
         pioneer_tools::ToolError::InvalidArguments(_) => "task_invalid_arguments",
         _ => "task_operation_failed",
     };
