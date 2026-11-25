@@ -577,6 +577,34 @@ fn revision_execution_budget_is_separate_from_the_review_round() {
         details: None,
         failed_run_id: None,
     });
+    let initial_id = revision.turn_id.clone();
+    assert_eq!(
+        revision.revision_execution_retry(&format!("revision_retry_1_{initial_id}")),
+        Some(1)
+    );
+    let mut legacy_manual = revision.clone();
+    legacy_manual.turn_id = format!("revision_manual_retry_4_{initial_id}");
+    assert!(legacy_manual.is_manual_revision_retry());
+    assert_eq!(
+        legacy_manual.revision_execution_retry(&legacy_manual.turn_id),
+        Some(4)
+    );
+    let largest_automatic = revision.revision_retry_turn_id(u32::MAX, true).unwrap();
+    let largest_manual = revision.revision_retry_turn_id(u32::MAX, false).unwrap();
+    assert_eq!(largest_automatic.len(), 55);
+    assert_eq!(largest_manual.len(), 55);
+    assert_ne!(largest_automatic, largest_manual);
+    assert_eq!(
+        revision.revision_execution_retry(&largest_automatic),
+        Some(u32::MAX)
+    );
+    let mut other_revision = revision.clone();
+    other_revision.id = "trt_revise_other_candidate_8".into();
+    assert_eq!(
+        other_revision.revision_execution_retry(&largest_automatic),
+        None
+    );
+
     assert!(next_revision_execution(&revision, &run, false, 3).is_none());
 
     for retry in 1..=3 {
@@ -591,6 +619,13 @@ fn revision_execution_budget_is_separate_from_the_review_round() {
             revision.requested_by_review_event_id
         );
         assert_ne!(next.turn_id, revision.turn_id);
+        assert_eq!(
+            next_revision_execution(&revision, &run, true, 100)
+                .unwrap()
+                .turn_id,
+            next.turn_id,
+            "the identity must survive a replay at a different timestamp"
+        );
         revision = next;
         revision.status = TaskRunTurnStatus::Blocked;
     }
@@ -616,8 +651,10 @@ async fn a_settled_legacy_revision_gets_one_fresh_execution_under_concurrent_ret
     use pioneer_entity::{task_run_turn as link, turn as child, turn_cli_runtime_binding as cli};
     use sea_orm::{ColumnTrait, QueryFilter, sea_query::Expr};
 
+    let suffix = "legacy_revision".repeat(7) + "12345";
     let (store, task, run, job, thread_id, turn_id) =
-        task_owned_resume_conflict_fixture("ws_task_revision_retry", "revision_retry").await;
+        task_owned_resume_conflict_fixture("ws_task_revision_retry", &suffix).await;
+    assert_eq!(turn_id.len(), 126);
     let now = job.updated_at_unix + 10;
     let at = unix_to_datetime(now);
     let logical_id = format!("trt_{turn_id}");
@@ -798,6 +835,11 @@ async fn a_settled_legacy_revision_gets_one_fresh_execution_under_concurrent_ret
     )
     .unwrap();
     assert_eq!(latest.revision_execution_retry(&latest.turn_id), Some(1));
+    assert_eq!(latest.turn_id.len(), 55);
+    assert_eq!(
+        latest.revision_retry_turn_id(1, false),
+        Some(latest.turn_id.clone())
+    );
     assert!(latest.is_manual_revision_retry());
     assert_eq!(latest.status, TaskRunTurnStatus::InProgress);
     assert_eq!(latest.round, 3);

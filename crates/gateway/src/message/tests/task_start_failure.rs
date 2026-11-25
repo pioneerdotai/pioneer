@@ -5677,7 +5677,7 @@ fn revision_retry_reacquires_task_quota_before_a_fresh_cli_start() {
             let starts =
                 wait_for_cli_runtime_turn_starts(&harness.cli_session, starts_before + 1).await;
             assert_eq!(starts.len(), starts_before + 1);
-            tokio::time::timeout(Duration::from_secs(10), async {
+            let binding = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Some(binding) = store
                         .get_cli_runtime_turn_binding(&retry.turn_id)
@@ -5685,7 +5685,7 @@ fn revision_retry_reacquires_task_quota_before_a_fresh_cli_start() {
                         .unwrap()
                         && binding.native_turn_id.as_deref() == Some("native-revision-after-quota")
                     {
-                        break;
+                        break binding;
                     }
                     tokio::task::yield_now().await;
                 }
@@ -5712,6 +5712,29 @@ fn revision_retry_reacquires_task_quota_before_a_fresh_cli_start() {
                 harness.cli_session.turn_starts.lock().await.len(),
                 starts_before + 1
             );
+
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &binding.native_thread_id,
+                binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"retry completed","data":{"ok":true}}</task_result>"#,
+            )
+            .await;
+            let replacement = wait_for_result_candidate_status(
+                store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            assert_eq!(replacement.task_run_turn_id, retry.id);
+            assert_eq!(replacement.turn_id, retry.turn_id);
+            assert_eq!(replacement.round, revised.round);
+            assert_eq!(replacement.summary.as_deref(), Some("retry completed"));
         });
     }
 }
