@@ -872,6 +872,10 @@ pub struct TaskError {
 }
 
 impl TaskError {
+    pub fn is_revision_retry_pending(&self) -> bool {
+        self.code == TASK_REVISION_RETRY_PENDING
+    }
+
     pub fn recovery_public_message(&self) -> Option<String> {
         self.recovery_diagnostic
             .as_ref()
@@ -925,6 +929,21 @@ pub struct Task {
 }
 
 impl Task {
+    /// Logical task status while a blocked revision waits for another attempt.
+    pub fn effective_status(&self) -> TaskStatus {
+        if self.status == TaskStatus::Blocked
+            && self.finish_request().is_none()
+            && self
+                .error
+                .as_ref()
+                .is_some_and(TaskError::is_revision_retry_pending)
+        {
+            TaskStatus::Waiting
+        } else {
+            self.status
+        }
+    }
+
     pub fn finish_request(&self) -> Option<&TaskFinishRequest> {
         self.metadata.as_ref()?.finish_request.as_ref()
     }
@@ -1195,6 +1214,23 @@ pub struct TaskRun {
     pub updated_at: i64,
 }
 
+impl TaskRun {
+    /// A blocked physical attempt can still have a pending logical retry.
+    pub fn effective_status(&self, task: &Task) -> TaskRunStatus {
+        if self.status == TaskRunStatus::Blocked
+            && task.finish_request().is_none()
+            && self
+                .error
+                .as_ref()
+                .is_some_and(TaskError::is_revision_retry_pending)
+        {
+            TaskRunStatus::Waiting
+        } else {
+            self.status
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRunExecution {
@@ -1275,6 +1311,155 @@ pub struct TaskRunTurn {
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
+}
+
+/// Automatic fresh executions allowed after one logical revision is blocked.
+pub const TASK_REVISION_AUTOMATIC_RETRIES: u32 = 3;
+pub const TASK_REVISION_RETRY_PENDING: &str = "task_revision_retry_pending";
+pub const TASK_REVISION_RETRY_REQUIRED: &str = "task_revision_retry_required";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRevisionRetryBlocker {
+    NewerRun,
+    MissingBinding,
+    MissingRevisionTurn,
+    BindingScopeChanged,
+    NativeExecutionRecorded,
+    MissingExecutionOwner,
+    MissingRecoveryJob,
+    MissingTaskAdmission,
+    TaskClosed,
+}
+
+impl TaskRevisionRetryBlocker {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NewerRun => "task_revision_superseded",
+            Self::MissingBinding => "task_revision_missing_cli_binding",
+            Self::MissingRevisionTurn => "task_revision_missing_blocked_turn",
+            Self::BindingScopeChanged => "task_revision_cli_scope_changed",
+            Self::NativeExecutionRecorded => "task_revision_native_execution_recorded",
+            Self::MissingExecutionOwner => "task_revision_missing_execution_owner",
+            Self::MissingRecoveryJob => "task_revision_missing_recovery_job",
+            Self::MissingTaskAdmission => "task_revision_missing_task_admission",
+            Self::TaskClosed => "task_revision_task_closed",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NewerRun => {
+                "A newer run superseded this blocked revision. Its execution cannot be restarted."
+            }
+            Self::MissingBinding => {
+                "The previous CLI binding is missing. Pioneer cannot confirm a safe restart."
+            }
+            Self::MissingRevisionTurn => {
+                "The previous blocked CLI turn cannot be verified. Pioneer cannot confirm a safe restart."
+            }
+            Self::BindingScopeChanged => {
+                "The previous CLI binding belongs to a different execution scope."
+            }
+            Self::NativeExecutionRecorded => {
+                "The previous CLI binding records native execution or MCP activation. Pioneer cannot confirm a safe fresh restart."
+            }
+            Self::MissingExecutionOwner => {
+                "The previous CLI or Task execution owner cannot be verified."
+            }
+            Self::MissingRecoveryJob => {
+                "The blocked CLI recovery job is missing. Pioneer cannot confirm a safe restart."
+            }
+            Self::MissingTaskAdmission => {
+                "The original Task execution authorization cannot be verified."
+            }
+            Self::TaskClosed => "The task is closed or has a permanent stop request.",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::NewerRun,
+            Self::MissingBinding,
+            Self::MissingRevisionTurn,
+            Self::BindingScopeChanged,
+            Self::NativeExecutionRecorded,
+            Self::MissingExecutionOwner,
+            Self::MissingRecoveryJob,
+            Self::MissingTaskAdmission,
+            Self::TaskClosed,
+        ]
+        .into_iter()
+        .find(|blocker| blocker.code() == code)
+    }
+
+    pub fn apply(self, error: &mut TaskError) {
+        error.code = self.code().to_owned();
+        error.message = self.message().to_owned();
+        error.class = TaskErrorClass::Internal;
+        error.recovery_diagnostic = None;
+    }
+}
+
+impl std::fmt::Display for TaskRevisionRetryBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for TaskRevisionRetryBlocker {}
+
+pub const CLI_MCP_ACTIVATION_CONTRACT_MISSING: &str =
+    "CLI recovery has frozen MCP tools but no activated MCP session contract";
+
+/// Exact persisted legacy message emitted by CLI recovery. Other invalid
+/// bindings (including tool drift and authorization failures) stay blocked.
+pub fn is_missing_cli_mcp_activation_block(reason: &str) -> bool {
+    reason.strip_prefix(
+        "CLI runtime recovery is blocked: frozen CLI runtime MCP projection is invalid: ",
+    ) == Some(CLI_MCP_ACTIVATION_CONTRACT_MISSING)
+}
+
+impl TaskRunTurn {
+    /// The link ID stays fixed for the entire review round. Each fresh
+    /// execution has its own conversation Turn and frozen runtime contract.
+    pub fn revision_execution_retry(&self, turn_id: &str) -> Option<u32> {
+        if self.kind != TaskRunTurnKind::Revision {
+            return None;
+        }
+        let initial = self.id.strip_prefix("trt_")?;
+        if turn_id == initial {
+            return Some(0);
+        }
+        let (attempt, source) = turn_id
+            .strip_prefix("revision_retry_")
+            .or_else(|| turn_id.strip_prefix("revision_manual_retry_"))?
+            .split_once('_')?;
+        if source != initial {
+            return None;
+        }
+        let attempt = attempt.parse().ok()?;
+        (attempt > 0).then_some(attempt)
+    }
+
+    pub fn is_retried_revision_execution(&self) -> bool {
+        self.revision_execution_retry(&self.turn_id)
+            .is_some_and(|retry| retry > 0)
+    }
+
+    pub fn is_manual_revision_retry(&self) -> bool {
+        self.turn_id.starts_with("revision_manual_retry_")
+            && self.revision_execution_retry(&self.turn_id).is_some()
+    }
+
+    pub fn revision_retry_turn_id(&self, retry: u32, automatic: bool) -> Option<String> {
+        let initial = self.id.strip_prefix("trt_")?;
+        self.revision_execution_retry(&self.turn_id)?;
+        let label = if automatic {
+            "revision_retry"
+        } else {
+            "revision_manual_retry"
+        };
+        Some(format!("{label}_{retry}_{initial}"))
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2527,6 +2712,9 @@ pub struct TaskPauseResponse {
 #[serde(rename_all = "camelCase")]
 pub struct TaskResumeParams {
     pub task_id: String,
+    /// Explicitly restart this exact blocked revision execution in a fresh Turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_revision_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -3103,6 +3291,8 @@ pub struct PublicTaskGetResponse {
     /// Current review candidates only; full immutable content uses task_result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_required: Vec<PublicTaskWaitReviewItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revision_executions: Vec<PublicTaskRevisionExecution>,
     pub task: PublicTask,
     #[serde(default)]
     pub triggers: Vec<PublicTaskTrigger>,
@@ -3114,6 +3304,20 @@ pub struct PublicTaskGetResponse {
     pub configuration: Option<PublicTaskConfiguration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<TaskOperatorDetails>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskRevisionExecution {
+    pub run_id: String,
+    pub round: u32,
+    pub turn_id: String,
+    pub status: TaskRunTurnStatus,
+    /// Zero identifies the initial execution of this revision.
+    pub retry_number: u32,
+    pub automatic_retry_limit: u32,
+    pub automatic_retry_pending: bool,
+    pub requires_intervention: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

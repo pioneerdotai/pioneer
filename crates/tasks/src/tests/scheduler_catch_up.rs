@@ -483,6 +483,7 @@ async fn pause_resume_rearms_skip_missed_future_schedule() {
             .resume_task(
                 TaskMutationContext::default(),
                 TaskResumeParams {
+                    retry_revision_turn_id: None,
                     task_id: created.task.id.clone(),
                     reason: None,
                 },

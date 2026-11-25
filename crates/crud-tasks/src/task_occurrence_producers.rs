@@ -62,7 +62,11 @@ async fn contract_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
     .await?;
     Ok(())
 }
-async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
+async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str, retry_settled: bool) -> Result<()> {
+    use crate::occurrence_reconcile::terminal_turn_status;
+    use crate::projection::pending_revision_retry_predicate;
+    use crate::status::task_run_status_from_db;
+    use pioneer_crud_conversations::values::turn_status_to_db;
     use pioneer_entity::{
         task_run_occurrence_reconcile_pending as p, task_run_occurrence_reconcile_sequence as seq,
     };
@@ -73,8 +77,15 @@ async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
     let run_status = task_run::Entity::find_by_id(id.to_owned())
         .select_only()
         .column(task_run::Column::Status)
+        .column_as(
+            pending_revision_retry_predicate(
+                Expr::col(task_run::Column::Status).into(),
+                Expr::col(task_run::Column::ErrorJson).into(),
+            ),
+            "pending_revision_retry",
+        )
         .lock_exclusive()
-        .into_tuple::<String>()
+        .into_tuple::<(String, bool)>()
         .one(db)
         .await?;
     let parent = turn::Entity::find_by_id(id.to_owned())
@@ -84,27 +95,22 @@ async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
         .into_tuple::<(String, String)>()
         .one(db)
         .await?;
-    let mismatch = match (run_status.as_deref(), parent.as_ref()) {
-        (Some(status), Some((parent_status, kind))) => {
-            kind == "task_run"
-                && match status {
-                    "succeeded" => parent_status != "completed",
-                    "failed" | "timed_out" => parent_status != "failed",
-                    "blocked" => parent_status != "blocked",
-                    "cancelled" => parent_status != "interrupted",
-                    _ => false,
-                }
+    let terminal_status = run_status.as_ref().and_then(|(status, pending)| {
+        if *pending {
+            None
+        } else {
+            task_run_status_from_db(status).and_then(terminal_turn_status)
         }
-        // A terminal Run may have an invisible TaskRun Turn birth, or the
-        // TaskRun Turn may have an invisible terminal Run birth under RR.
-        // Positive nonterminal/non-TaskRun headers cannot be mismatches; their
-        // own later eligible transition publishes while these locks exclude it.
-        (Some(status), None) => matches!(
-            status,
-            "succeeded" | "failed" | "timed_out" | "blocked" | "cancelled"
-        ),
-        (None, Some((_, kind))) => kind == "task_run",
-        (None, None) => false,
+    });
+    let mismatch = match (run_status.is_some(), parent.as_ref()) {
+        (true, Some((parent_status, kind))) => {
+            kind == "task_run"
+                && terminal_status.is_some_and(|status| parent_status != turn_status_to_db(status))
+        }
+        // An absent counterpart can be invisible in a repeatable-read snapshot.
+        (true, None) => terminal_status.is_some(),
+        (false, Some((_, kind))) => kind == "task_run",
+        (false, None) => false,
     };
     if !mismatch {
         p::Entity::delete_by_id(id.to_owned()).exec(db).await?;
@@ -129,6 +135,12 @@ async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
         // Escape the owning transaction; its caller retries from a fresh snapshot.
         return Err(OccurrencePublicationRace.into());
     }
+    let mut refresh = vec![p::Column::Generation, p::Column::ClaimToken];
+    if retry_settled {
+        // A pre-upgrade pending ticket can still carry an old deferral.
+        // This error-only transition makes parent repair newly eligible.
+        refresh.extend([p::Column::NextAttemptAt, p::Column::AttemptCount]);
+    }
     p::Entity::insert(p::ActiveModel {
         run_id: Set(id.into()),
         generation: Set(generation),
@@ -138,7 +150,7 @@ async fn parent_ticket<C: ConnectionTrait>(db: &C, id: &str) -> Result<()> {
     })
     .on_conflict(
         OnConflict::column(p::Column::RunId)
-            .update_columns([p::Column::Generation, p::Column::ClaimToken])
+            .update_columns(refresh)
             .to_owned(),
     )
     .exec_without_returning(db)
@@ -249,7 +261,11 @@ pub async fn run_change<C: ConnectionTrait>(
             contract_ticket(db, &r.id).await?;
         }
         if p {
-            parent_ticket(db, &r.id).await?;
+            let retry_settled = old
+                .is_some_and(crate::occurrence_reconcile::has_pending_revision_retry)
+                && r.status == "blocked"
+                && !crate::occurrence_reconcile::has_pending_revision_retry(r);
+            parent_ticket(db, &r.id, retry_settled).await?;
         }
     }
     Ok(())
@@ -280,7 +296,7 @@ pub async fn turn_change<C: ConnectionTrait>(
         }
     }
     if let Some(r) = new {
-        parent_ticket(db, &r.id).await?;
+        parent_ticket(db, &r.id, false).await?;
     }
     Ok(())
 }

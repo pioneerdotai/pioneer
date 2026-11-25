@@ -64,9 +64,48 @@ pub(crate) fn project_task_get_with_configuration(
                 Some(project_review_item(&review, None))
             })
             .collect(),
+        revision_executions: response
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let revision = response
+                    .task_run_turns
+                    .iter()
+                    .filter(|turn| {
+                        turn.run_id == run.id
+                            && turn.kind != pioneer_protocol::TaskRunTurnKind::Review
+                    })
+                    .max_by_key(|turn| turn.sequence)?;
+                let retry_number = revision.revision_execution_retry(&revision.turn_id)?;
+                let blocked = run.status == pioneer_protocol::TaskRunStatus::Blocked
+                    && revision.status == pioneer_protocol::TaskRunTurnStatus::Blocked;
+                let automatic_retry_pending = blocked
+                    && run.effective_status(&response.task)
+                        == pioneer_protocol::TaskRunStatus::Waiting;
+                let requires_intervention = blocked
+                    && response.task.finish_request().is_none()
+                    && run.error.as_ref().is_some_and(|error| {
+                        error.code == pioneer_protocol::TASK_REVISION_RETRY_REQUIRED
+                    });
+                Some(pioneer_protocol::PublicTaskRevisionExecution {
+                    run_id: run.id.clone(),
+                    round: revision.round,
+                    turn_id: revision.turn_id.clone(),
+                    status: revision.status,
+                    retry_number,
+                    automatic_retry_limit: pioneer_protocol::TASK_REVISION_AUTOMATIC_RETRIES,
+                    automatic_retry_pending,
+                    requires_intervention,
+                })
+            })
+            .collect(),
         task: project_task(&response.task),
         triggers: response.triggers.iter().map(project_trigger).collect(),
-        runs: response.runs.iter().map(project_run).collect(),
+        runs: response
+            .runs
+            .iter()
+            .map(|run| project_run(&response.task, run))
+            .collect(),
         dependencies: response
             .dependencies
             .iter()
@@ -84,6 +123,87 @@ pub(crate) fn project_task_get_with_configuration(
             result_review_events: response.result_review_events.clone(),
         }),
     }
+}
+
+/// A legacy blocked TaskError did not retain the native diagnostic. Read the
+/// exact child Turn only for the current blocked revision of that run.
+pub(crate) async fn observe_revision_recovery(
+    store: &pioneer_crud::CrudStore,
+    response: &mut TaskGetResponse,
+) -> anyhow::Result<()> {
+    for run in &mut response.runs {
+        let Some(error) = run.error.as_ref() else {
+            continue;
+        };
+        if run.status != pioneer_protocol::TaskRunStatus::Blocked
+            || !(matches!(
+                error.code.as_str(),
+                "child_turn_blocked" | pioneer_protocol::TASK_REVISION_RETRY_REQUIRED
+            ) || pioneer_protocol::is_missing_cli_mcp_activation_block(&error.message))
+        {
+            continue;
+        }
+        let Some(revision) = response
+            .task_run_turns
+            .iter()
+            .filter(|turn| {
+                turn.run_id == run.id && turn.kind != pioneer_protocol::TaskRunTurnKind::Review
+            })
+            .max_by_key(|turn| turn.sequence)
+            .filter(|turn| {
+                turn.status == pioneer_protocol::TaskRunTurnStatus::Blocked
+                    && turn.revision_execution_retry(&turn.turn_id).is_some()
+            })
+        else {
+            continue;
+        };
+        let cause_confirmed = store
+            .get_turn(&revision.thread_id, &revision.turn_id)
+            .await?
+            .is_some_and(|(_, turn)| {
+                turn.status == pioneer_protocol::TurnStatus::Blocked
+                    && turn
+                        .error
+                        .as_deref()
+                        .is_some_and(pioneer_protocol::is_missing_cli_mcp_activation_block)
+            });
+        if !cause_confirmed
+            && error.code != pioneer_protocol::TASK_REVISION_RETRY_REQUIRED
+            && !pioneer_protocol::is_missing_cli_mcp_activation_block(&error.message)
+        {
+            continue;
+        }
+        use pioneer_protocol::TaskRevisionRetryBlocker as Blocker;
+        let mut blocker = if cause_confirmed {
+            store
+                .task_revision_retry_blocker(&response.task, run, revision)
+                .await?
+        } else {
+            Some(Blocker::MissingRevisionTurn)
+        };
+        if blocker.is_none()
+            && store.get_task_execution_admission(&response.task.id).await?
+                .is_none_or(|admission| {
+                    crate::authorization::ExecutionAuthorizationContext::task_revision_admission_seed(&admission).is_err()
+                })
+        {
+            blocker = Some(Blocker::MissingTaskAdmission);
+        }
+        if let Some(error) = run.error.as_mut() {
+            let owns_task_error = response.task.error.as_ref() == Some(&*error);
+            if let Some(blocker) = blocker {
+                blocker.apply(error);
+            } else {
+                error.code = pioneer_protocol::TASK_REVISION_RETRY_REQUIRED.to_owned();
+                error.class = TaskErrorClass::Internal;
+                error.recovery_diagnostic = None;
+            }
+            if owns_task_error {
+                response.task.error = Some(error.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn project_task_configuration(response: &TaskGetResponse) -> PublicTaskConfiguration {
@@ -434,7 +554,10 @@ pub(crate) fn project_task_agenda(response: &TaskAgendaResponse) -> PublicTaskAg
             .map(|item| PublicTaskAgendaItem {
                 task: project_task(&item.task),
                 trigger: item.trigger.as_ref().map(project_trigger),
-                latest_run: item.latest_run.as_ref().map(project_run),
+                latest_run: item
+                    .latest_run
+                    .as_ref()
+                    .map(|run| project_run(&item.task, run)),
                 latest_delivery: item.latest_delivery.as_ref().map(project_delivery),
                 goal_preview: item.goal_preview.clone(),
                 result_preview: item.result_preview.clone(),
@@ -444,6 +567,7 @@ pub(crate) fn project_task_agenda(response: &TaskAgendaResponse) -> PublicTaskAg
 }
 
 pub(crate) fn project_task(task: &Task) -> PublicTask {
+    let status = task.effective_status();
     PublicTask {
         id: task.id.clone(),
         workspace_id: task.workspace_id.clone(),
@@ -454,7 +578,7 @@ pub(crate) fn project_task(task: &Task) -> PublicTask {
         root_task_id: task.root_task_id.clone(),
         parent_task_id: task.parent_task_id.clone(),
         executor_kind: task.executor_kind,
-        status: task.status,
+        status,
         title: task.title.clone(),
         goal: task.goal.clone(),
         priority: task.priority,
@@ -463,7 +587,7 @@ pub(crate) fn project_task(task: &Task) -> PublicTask {
         revision: task.revision,
         created_at: task.created_at,
         updated_at: task.updated_at,
-        completed_at: task.completed_at,
+        completed_at: task.completed_at.filter(|_| status == task.status),
         finish_request: task.finish_request().cloned(),
     }
 }
@@ -488,13 +612,34 @@ pub(crate) fn project_error(error: &TaskError) -> PublicTaskFailure {
         task_public_error_code(error.class),
         PublicErrorStage::Execution,
     );
-    if let Some(message) = error.recovery_public_message() {
+    if let Some(message) = task_failure_detail(error) {
         public_error.message = message;
+    }
+    if pioneer_protocol::TaskRevisionRetryBlocker::from_code(&error.code).is_some() {
+        public_error.code = pioneer_protocol::PublicErrorCode::Conflict;
+        public_error.retryable = false;
     }
     PublicTaskFailure {
         recovery_diagnostic: error.recovery_diagnostic.clone(),
         class: error.class,
         error: public_error,
+    }
+}
+
+/// Only recognized revision states and typed recovery diagnostics supply public detail.
+pub(crate) fn task_failure_detail(error: &TaskError) -> Option<String> {
+    match error.code.as_str() {
+        pioneer_protocol::TASK_REVISION_RETRY_PENDING => Some(
+            "CLI recovery lost the MCP activation contract. A fresh revision execution is pending."
+                .to_owned(),
+        ),
+        pioneer_protocol::TASK_REVISION_RETRY_REQUIRED => Some(
+            "CLI recovery lost the MCP activation contract. To restart the revision, an authorized agent or operator can pass retryRevisionTurnId from task_get to task_resume."
+                .to_owned(),
+        ),
+        code => pioneer_protocol::TaskRevisionRetryBlocker::from_code(code)
+            .map(|blocker| blocker.message().to_owned())
+            .or_else(|| error.recovery_public_message()),
     }
 }
 
@@ -513,17 +658,18 @@ fn task_public_error_code(class: TaskErrorClass) -> pioneer_protocol::PublicErro
     }
 }
 
-pub(crate) fn project_run(run: &TaskRun) -> PublicTaskRun {
+pub(crate) fn project_run(task: &Task, run: &TaskRun) -> PublicTaskRun {
+    let status = run.effective_status(task);
     PublicTaskRun {
         id: run.id.clone(),
         task_id: run.task_id.clone(),
         attempt_number: run.attempt_number,
         run_number: run.run_number,
-        status: run.status,
+        status,
         executor_kind: run.executor_kind,
         execution: None,
         started_at: run.started_at,
-        completed_at: run.completed_at,
+        completed_at: run.completed_at.filter(|_| status == run.status),
         result: run.result.as_ref().map(project_result),
         error: run.error.as_ref().map(project_error),
         created_at: run.created_at,
@@ -548,7 +694,11 @@ fn project_tree(tree: &TaskTree) -> PublicTaskTree {
     PublicTaskTree {
         task: project_task(&tree.task),
         triggers: tree.triggers.iter().map(project_trigger).collect(),
-        runs: tree.runs.iter().map(project_run).collect(),
+        runs: tree
+            .runs
+            .iter()
+            .map(|run| project_run(&tree.task, run))
+            .collect(),
         dependencies: tree.dependencies.iter().map(project_dependency).collect(),
         children: tree.children.iter().map(project_tree).collect(),
     }
@@ -599,7 +749,7 @@ pub(crate) fn project_delivery_attempt(attempt: &TaskDeliveryAttempt) -> PublicT
 fn project_wait_item(item: &TaskWaitItem) -> PublicTaskWaitItem {
     PublicTaskWaitItem {
         task: project_task(&item.task),
-        run: item.run.as_ref().map(project_run),
+        run: item.run.as_ref().map(|run| project_run(&item.task, run)),
     }
 }
 
@@ -994,7 +1144,7 @@ mod tests {
                 // Repeat the shared projections used by read responses and notifications.
                 for _ in 0..3 {
                     let task = project_task(&response.task);
-                    let projected_run = project_run(&run);
+                    let projected_run = project_run(&response.task, &run);
                     let projected_delivery = project_delivery(&delivery);
                     for failure in [
                         task.error.unwrap(),
@@ -1153,7 +1303,7 @@ mod tests {
         });
         // The same projection feeds general run lifecycle notifications.
         let notification_run =
-            serde_json::to_string(&super::project_run(&response.runs[0])).unwrap();
+            serde_json::to_string(&super::project_run(&response.task, &response.runs[0])).unwrap();
         assert!(!notification_run.contains(raw_webhook_body));
         assert!(!notification_run.contains("triggerInput"));
         let mut run_spec = response.agent_specs[0].clone();

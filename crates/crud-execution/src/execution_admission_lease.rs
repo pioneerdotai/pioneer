@@ -97,6 +97,27 @@ pub struct NewExecutionAdmissionLease {
     pub policy: ExecutionAdmissionQuotaPolicy,
 }
 
+#[derive(Clone, Debug)]
+pub struct ExecutionAdmissionQuotaExhausted {
+    scope: &'static str,
+    bucket: ExecutionQuotaBucket,
+    limit: u32,
+}
+
+impl std::fmt::Display for ExecutionAdmissionQuotaExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} execution quota is exhausted (limit {})",
+            self.scope,
+            self.bucket.as_str(),
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for ExecutionAdmissionQuotaExhausted {}
+
 pub async fn reserve(
     db: &DatabaseTransaction,
     lease: NewExecutionAdmissionLease,
@@ -138,8 +159,8 @@ pub async fn reserve(
 ///
 /// A released lease is never reopened by the ordinary `reserve` path: that
 /// would let a replayed creation write resurrect terminal work. This separate
-/// operation is used only by the transactional Task resume path after Gateway
-/// has validated an explicit authorization readmission.
+/// operation is used by transactional Task resume after Gateway has checked
+/// the durable execution authority.
 pub async fn reacquire(
     db: &DatabaseTransaction,
     lease: NewExecutionAdmissionLease,
@@ -226,11 +247,12 @@ async fn check_quotas(
     .await?;
     let gateway_count = active_bucket_query(bucket).count(db).await?;
     if gateway_count >= u64::from(ceilings.gateway) {
-        bail!(
-            "Gateway {} execution quota is exhausted (limit {})",
-            bucket.as_str(),
-            ceilings.gateway
-        );
+        return Err(ExecutionAdmissionQuotaExhausted {
+            scope: "Gateway",
+            bucket,
+            limit: ceilings.gateway,
+        }
+        .into());
     }
     Ok(())
 }
@@ -288,17 +310,19 @@ async fn enforce_scope_ceiling<C: ConnectionTrait>(
     column: execution_admission_lease::Column,
     scope_id: &str,
     limit: u32,
-    scope_name: &str,
+    scope_name: &'static str,
 ) -> Result<()> {
     let count = active_bucket_query(bucket)
         .filter(column.eq(scope_id))
         .count(db)
         .await?;
     if count >= u64::from(limit) {
-        bail!(
-            "{scope_name} {} execution quota is exhausted (limit {limit})",
-            bucket.as_str()
-        );
+        return Err(ExecutionAdmissionQuotaExhausted {
+            scope: scope_name,
+            bucket,
+            limit,
+        }
+        .into());
     }
     Ok(())
 }

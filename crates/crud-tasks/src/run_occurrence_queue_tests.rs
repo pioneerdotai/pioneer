@@ -1096,3 +1096,101 @@ async fn task_run_occurrence_terminalization_rejects_non_task_run_canonical_bind
         Some(TurnKind::Conversation)
     );
 }
+
+#[pioneer_postgres_test::postgres_test]
+async fn pending_revision_retires_parent_work_until_error_only_settlement() {
+    for settle_before_ack in [false, true] {
+        let (store, run) = terminal_fixture().await;
+        let previous = row(&store, &run.id).await.unwrap();
+        let queue = TaskRunOccurrenceQueue::new(&store);
+        let set_error = |code| {
+            Expr::val(Some(
+                serde_json::json!({
+                    "code": code,
+                    "message": "Revision\0recovery",
+                    "class": "internal"
+                })
+                .to_string(),
+            ))
+        };
+        let tx = store.begin().await.unwrap();
+        update_run_in_transaction(
+            &tx,
+            &run.id,
+            runs::Entity::update_many()
+                .col_expr(runs::Column::Status, Expr::val("blocked"))
+                .col_expr(
+                    runs::Column::ErrorJson,
+                    set_error(pioneer_protocol::TASK_REVISION_RETRY_PENDING),
+                ),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            queue
+                .discover_task_run_occurrence_reconcile(NOW, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!queue::is_mismatch(&store, &run.id).await.unwrap());
+
+        // A pre-upgrade source could already have published a parent ticket.
+        pending::Entity::insert(pending::ActiveModel {
+            next_attempt_at: Set(NOW),
+            ..previous.into_active_model()
+        })
+        .exec(&store)
+        .await
+        .unwrap();
+        let old_claim = claimed(&store).await;
+        if !settle_before_ack {
+            assert_eq!(
+                reconcile_without_publication(&store, &old_claim)
+                    .await
+                    .unwrap(),
+                TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent
+            );
+            assert!(
+                queue
+                    .discover_task_run_occurrence_reconcile(old_claim.next_attempt_at, 64,)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let tx = store.begin().await.unwrap();
+        update_run_in_transaction(
+            &tx,
+            &run.id,
+            runs::Entity::update_many().col_expr(
+                runs::Column::ErrorJson,
+                set_error(pioneer_protocol::TaskRevisionRetryBlocker::NewerRun.code()),
+            ),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(queue::is_mismatch(&store, &run.id).await.unwrap());
+        assert_eq!(
+            reconcile_without_publication(&store, &old_claim)
+                .await
+                .unwrap(),
+            TaskRunOccurrenceTerminalizationOutcome::StaleClaim
+        );
+        let final_claim = claimed(&store).await;
+        assert!(final_claim.generation > old_claim.generation);
+        assert_eq!(final_claim.attempt_count, 1);
+        let facts = prepared_facts(&store, &run.id).await;
+        assert_eq!(facts.desired_status, TurnStatus::Blocked);
+        assert!(
+            facts
+                .prepared_run_model
+                .error_json
+                .as_deref()
+                .is_some_and(|json| json.contains(r"Revision\u0000recovery"))
+        );
+    }
+}

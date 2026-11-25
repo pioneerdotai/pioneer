@@ -92,8 +92,8 @@ pub use pioneer_crud_execution::cli_runtime_binding::{
 };
 pub use pioneer_crud_execution::cli_runtime_store::CliRuntimeTurnTerminalGuard;
 pub use pioneer_crud_execution::execution_admission_lease::{
-    ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
-    ExecutionQuotaCeilings, NewExecutionAdmissionLease,
+    ExecutionAdmissionClass, ExecutionAdmissionQuotaExhausted, ExecutionAdmissionQuotaPolicy,
+    ExecutionQuotaBucket, ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
 pub use pioneer_crud_execution::execution_observability::{
     ExecutionObservationInput, PreparedExecutionObservation,

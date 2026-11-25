@@ -37,6 +37,33 @@ pub async fn upsert_turn<C: ConnectionTrait>(db: &C, turn: NewTaskRunTurn) -> Re
         .lock_exclusive()
         .one(db)
         .await?;
+    if let Some(old) = old.as_ref()
+        && old.turn_id != turn.turn_id
+        && old.kind == task_run_turn_kind_to_db(TaskRunTurnKind::Revision)
+    {
+        let current = task_run_turn_from_db_model(old.clone())?;
+        let before = current.revision_execution_retry(&current.turn_id);
+        let after = current.revision_execution_retry(&turn.turn_id);
+        // The logical row can move forward to a new execution, but a stale
+        // terminal callback must never reattach its superseded native Turn.
+        if !matches!((before, after), (Some(before), Some(after)) if after > before) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            current.status == TaskRunTurnStatus::Blocked
+                && turn.status == TaskRunTurnStatus::InProgress
+                && turn.task_id == current.task_id
+                && turn.run_id == current.run_id
+                && turn.thread_id == current.thread_id
+                && turn.execution_id == current.execution_id
+                && turn.kind == current.kind
+                && turn.sequence == current.sequence
+                && turn.round == current.round
+                && turn.requested_by_candidate_id == current.requested_by_candidate_id
+                && turn.requested_by_review_event_id == current.requested_by_review_event_id,
+            "invalid revision execution transition",
+        );
+    }
     task_run_turn::Entity::insert(active_model_from_new_turn(turn)?)
         .on_conflict(
             OnConflict::column(task_run_turn::Column::Id)

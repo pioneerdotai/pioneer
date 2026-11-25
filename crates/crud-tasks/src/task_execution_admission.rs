@@ -84,6 +84,40 @@ pub async fn readmit_immutable(
     Ok(persisted)
 }
 
+pub(crate) async fn readmit_revision(
+    db: &DatabaseTransaction,
+    admission: &NewTaskExecutionAdmission,
+    now: sea_orm::entity::prelude::DateTimeWithTimeZone,
+) -> Result<()> {
+    use execution_admission_lease::ExecutionAdmissionClass;
+
+    let original = find_by_task(db, &admission.task_id)
+        .await?
+        .context("revision retry has no immutable Task execution admission")?;
+    ensure_matches(&original, admission)?;
+    let mut lease = admission
+        .execution_lease
+        .clone()
+        .context("revision retry requires a Task execution quota lease")?;
+    // A reschedule may have changed the trigger since this lease was
+    // created. Reacquire its original bucket; a legacy Task without a
+    // lease uses the same trigger-based classification as ordinary resume.
+    if let Some(saved) =
+        execution_admission_lease::find_by_subject(db, "task", &admission.task_id).await?
+    {
+        lease.operation_class =
+            if saved.operation_class == ExecutionAdmissionClass::ScheduledTask.as_str() {
+                ExecutionAdmissionClass::ScheduledTask
+            } else if saved.operation_class == ExecutionAdmissionClass::QueuedTask.as_str() {
+                ExecutionAdmissionClass::QueuedTask
+            } else {
+                anyhow::bail!("revision retry has an invalid Task execution quota class");
+            };
+    }
+    execution_admission_lease::reacquire(db, lease, now).await?;
+    Ok(())
+}
+
 pub async fn find_by_task<C: ConnectionTrait>(
     db: &C,
     task_id: &str,

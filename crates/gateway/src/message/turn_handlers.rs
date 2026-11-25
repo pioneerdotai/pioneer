@@ -5880,17 +5880,30 @@ impl MessageProcessor {
             // decisions. Re-read the durable binding and persisted thread head
             // after waiting: an in-memory Thread snapshot can be empty after a
             // cold seed or stale after another owner completed while we waited.
-            let mut persisted_context_binding = match self
-                .crud_store
-                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
-                .await
-            {
-                Ok(binding) => binding,
-                Err(error) => {
-                    send_turn_start_failure!(format!(
-                        "failed to inspect CLI runtime context continuity: {error:#}"
-                    ));
-                    return None;
+            let fresh_revision_execution = if success_response.is_task() {
+                match self.crud_store.get_task_run_turn_by_turn(&thread.id, &response_turn_id).await {
+                    Ok(link) => link.as_ref().is_some_and(pioneer_protocol::TaskRunTurn::is_retried_revision_execution),
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to identify CLI Task revision execution: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { false };
+            let mut persisted_context_binding = if fresh_revision_execution {
+                None
+            } else {
+                match self
+                    .crud_store
+                    .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        send_turn_start_failure!(format!(
+                            "failed to inspect CLI runtime context continuity: {error:#}"
+                        ));
+                        return None;
+                    }
                 }
             };
             if let Some(pending) = persisted_context_binding.as_ref()
@@ -6632,6 +6645,12 @@ impl MessageProcessor {
                     && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind) => !current_receipt,
                 Some(_) => true,
                 None => true,
+            };
+            let bootstrap_provider_context = bootstrap_provider_context || fresh_revision_execution;
+            let continuation_context_basis = if fresh_revision_execution {
+                None
+            } else {
+                continuation_context_basis
             };
             let continuation_head = match latest_parent_turn_id.as_deref() {
                 Some(id) => match self.crud_store.get_turn(continuation_thread_id.as_str(), id).await {

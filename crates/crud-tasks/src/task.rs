@@ -169,7 +169,17 @@ pub async fn list_tasks_by_workspace_status_scoped<C: ConnectionTrait>(
     );
 
     if let Some(status) = status {
-        query = query.filter(task::Column::Status.eq(status.to_owned()));
+        let persisted_status = task::Column::Status;
+        let status_filter = match status {
+            "waiting" => persisted_status
+                .is_in(["waiting", "blocked"])
+                .and(crate::projection::effective_task_status_expr().eq(status)),
+            "blocked" => persisted_status
+                .eq(status)
+                .and(crate::projection::effective_task_status_expr().eq(status)),
+            _ => persisted_status.eq(status),
+        };
+        query = query.filter(status_filter);
     }
     if let Some(limit) = limit {
         query = query.limit(limit);
