@@ -122,7 +122,7 @@ pub(crate) fn prepare_interrupted_dispatch_effect(
         Ok(payload)
     })();
     NativeTerminalEffectSpec {
-        effect_id: format!("{turn_id}:terminal-effect:post-turn"),
+        effect_id: NativeTerminalEffectPreparation::post_turn_effect_id(turn_id),
         effect_kind: NativeTerminalEffectKind::PostTurnHook,
         gate,
         payload: payload.unwrap_or_else(|failure| {
@@ -165,7 +165,7 @@ fn prepare_effect(
         Ok(payload)
     })();
     NativeTerminalEffectSpec {
-        effect_id: format!("{turn_id}:terminal-effect:post-turn"),
+        effect_id: NativeTerminalEffectPreparation::post_turn_effect_id(turn_id),
         effect_kind: NativeTerminalEffectKind::PostTurnHook,
         gate,
         payload: payload.unwrap_or_else(|failure| {
@@ -253,7 +253,10 @@ impl PostTurnHookRuntime {
         );
         let effect = prepare_effect(&turn.turn_id, runtime, gate, request);
         Ok(Some(NativeTerminalEffectPreparation {
-            batch_id: format!("{}:terminal-effects:external:{generation}", turn.turn_id),
+            batch_id: NativeTerminalEffectPreparation::bounded_id(format!(
+                "{}:terminal-effects:external:{generation}",
+                turn.turn_id
+            )),
             workspace_id: turn.workspace_id,
             thread_id: turn.thread_id,
             turn_id: turn.turn_id,
@@ -327,7 +330,10 @@ pub(crate) fn identify_native_cancellation(
             NativeTerminalEffectKind::PostTurnHook => "post-turn",
             NativeTerminalEffectKind::AttachedTaskCleanup => "attached-task-cleanup",
         };
-        effect.effect_id = format!("{}:cancellation-effect:{suffix}", preparation.turn_id);
+        effect.effect_id = NativeTerminalEffectPreparation::bounded_id(format!(
+            "{}:cancellation-effect:{suffix}",
+            preparation.turn_id
+        ));
     }
     preparation
 }

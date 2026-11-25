@@ -6549,7 +6549,7 @@ fn task_revise_response(
 }
 
 fn stable_revision_turn_id(candidate_id: &str, round: u32) -> String {
-    format!("revise_{candidate_id}_{round}")
+    pioneer_protocol::stable_derived_id("rv1_", &[candidate_id, &round.to_string()])
 }
 
 fn task_run_turn_id_for_turn(turn_id: &str) -> String {
