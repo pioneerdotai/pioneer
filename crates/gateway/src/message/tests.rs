@@ -25810,7 +25810,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         content.push_str(page["content"].as_str().unwrap());
         cursor = page["nextCursor"].clone();
     }
-    assert!(cursor.is_null());
+    assert!(JsonValue::is_null(&cursor));
     assert_eq!(content, result_text);
 
     let mut binding = processor
