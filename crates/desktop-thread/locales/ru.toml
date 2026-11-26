@@ -289,6 +289,7 @@
 "timeline.task_review.details.review_required_count" = "Кандидатов на проверку: %{count}"
 "timeline.task_review.details.revision_blocked" = "Правка заблокирована"
 "timeline.task_review.details.revision_rounds_remaining" = "Осталось раундов правок"
+"timeline.task_review.details.revision_rounds_unlimited" = "Без лимита"
 "timeline.task_review.details.round" = "Раунд"
 "timeline.task_review.details.run_id" = "ID запуска"
 "timeline.task_review.details.summary" = "Сводка"

@@ -2668,8 +2668,8 @@ fn review_guard_observation(
         diagnostics: vec!["candidate diagnostic".to_owned()],
         child_thread_id: Some("child_thread_review_guard".to_owned()),
         child_turn_id: Some(format!("child_turn_review_guard_{round}")),
-        max_revision_rounds: 2,
-        remaining_revision_rounds,
+        max_revision_rounds: Some(2),
+        remaining_revision_rounds: Some(remaining_revision_rounds),
         allowed_actions: allowed_actions
             .iter()
             .map(|action| (*action).to_owned())

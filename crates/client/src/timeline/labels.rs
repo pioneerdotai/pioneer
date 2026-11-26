@@ -780,6 +780,8 @@ pub struct TaskWaitReviewDisplayItem {
     pub diagnostics: Vec<String>,
     pub max_revision_rounds: Option<u32>,
     pub remaining_revision_rounds: Option<u32>,
+    #[serde(default)]
+    pub unlimited_revision_rounds: bool,
     pub allowed_actions: Vec<String>,
     pub revision_blocked_reason: Option<String>,
 }
@@ -808,6 +810,7 @@ pub enum TaskWaitReviewDetailRow {
         remaining: u32,
         max: Option<u32>,
     },
+    UnlimitedRevisionRounds,
     Diagnostics {
         diagnostics: Vec<String>,
     },
@@ -978,7 +981,9 @@ impl TaskWaitReviewDisplayItem {
                 actions: self.allowed_actions.clone(),
             });
         }
-        if let Some(remaining) = self.remaining_revision_rounds {
+        if self.unlimited_revision_rounds {
+            rows.push(TaskWaitReviewDetailRow::UnlimitedRevisionRounds);
+        } else if let Some(remaining) = self.remaining_revision_rounds {
             rows.push(TaskWaitReviewDetailRow::RevisionRoundsRemaining {
                 remaining,
                 max: self.max_revision_rounds,
@@ -1122,6 +1127,16 @@ fn task_wait_review_display_item(value: &JsonValue) -> Option<TaskWaitReviewDisp
         diagnostics: json_string_array(value, "diagnostics"),
         max_revision_rounds: json_u32(value, "maxRevisionRounds"),
         remaining_revision_rounds: json_u32(value, "remainingRevisionRounds"),
+        unlimited_revision_rounds: json_bool(value, "unlimitedRevisionRounds").unwrap_or_else(
+            || {
+                value
+                    .get("maxRevisionRounds")
+                    .is_some_and(JsonValue::is_null)
+                    && value
+                        .get("remainingRevisionRounds")
+                        .is_some_and(JsonValue::is_null)
+            },
+        ),
         allowed_actions: json_string_array(value, "allowedActions"),
         revision_blocked_reason: json_string(value, "revisionBlockedReason"),
     })

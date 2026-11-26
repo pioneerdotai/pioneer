@@ -291,6 +291,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} समीक्षा-आवश्यक उम्मीदवार"
 "timeline.task_review.details.revision_blocked" = "संशोधन ब्लॉक"
 "timeline.task_review.details.revision_rounds_remaining" = "शेष संशोधन राउंड"
+"timeline.task_review.details.revision_rounds_unlimited" = "असीमित"
 "timeline.task_review.details.round" = "राउंड"
 "timeline.task_review.details.run_id" = "रन ID"
 "timeline.task_review.details.summary" = "सारांश"

@@ -296,6 +296,7 @@ mod tests {
             diagnostics: Vec::new(),
             max_revision_rounds: Some(2),
             remaining_revision_rounds: Some(1),
+            unlimited_revision_rounds: false,
             allowed_actions: vec![
                 "task_accept".to_owned(),
                 "task_revise".to_owned(),

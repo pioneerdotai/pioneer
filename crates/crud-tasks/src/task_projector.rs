@@ -64,6 +64,17 @@ fn target_lineage_from_legacy(lineage: &ThreadLineage) -> TaskThreadLineage {
 #[derive(Clone, Default)]
 pub struct TaskProjector;
 
+#[derive(Debug)]
+pub struct TaskRevisionBudgetConflict;
+
+impl std::fmt::Display for TaskRevisionBudgetConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("task revision budget or run changed before commit")
+    }
+}
+
+impl std::error::Error for TaskRevisionBudgetConflict {}
+
 #[derive(Clone, Debug, Default)]
 pub struct PreparedTaskProjection {
     task: Option<task::PreparedTaskProjection>,
@@ -153,7 +164,8 @@ impl PreparedTaskProjection {
                 prepared.dependency =
                     Some(task_dependency::prepare_dependency_projection(dependency)?);
             }
-            TaskEventPayload::AgentSpecCreated { agent_spec } => {
+            TaskEventPayload::AgentSpecCreated { agent_spec }
+            | TaskEventPayload::TaskRunRevisionBudgetUpdated { agent_spec, .. } => {
                 prepared
                     .agent_specs
                     .push(task_agent_spec::prepare_agent_spec_projection(agent_spec)?);
@@ -927,6 +939,25 @@ impl TaskProjector {
                 }
                 TaskEventPayload::TaskResultCandidateCreated { candidate } => {
                     project_future(async move {
+                        if candidate.status == TaskResultCandidateStatus::ExtractionFailed {
+                            let spec = task_agent_spec::find_terminal_agent_spec(
+                                db,
+                                &candidate.task_id,
+                                &candidate.run_id,
+                            )
+                            .await?;
+                            let policy = task_agent_spec::effective_run_review_policy(
+                                db,
+                                &candidate.task_id,
+                                spec.as_ref(),
+                            )
+                            .await?;
+                            if policy
+                                .is_none_or(|policy| !policy.allows_revision_after(candidate.round))
+                            {
+                                return Err(TaskRevisionBudgetConflict.into());
+                            }
+                        }
                         task_result_candidate::upsert_candidate(
                         db,
                         candidate_projection.with_context(|| {
@@ -1050,6 +1081,67 @@ impl TaskProjector {
                     }
                     Ok(())
                 }),
+                TaskEventPayload::TaskRunRevisionBudgetUpdated {
+                    task_id,
+                    run_id,
+                    expected_task_revision,
+                    expected_agent_spec_id,
+                    agent_spec,
+                    ..
+                } => project_future(async move {
+                    // The Task stream lock serializes this write with revision,
+                    // finish, cancellation and other Task events.
+                    let task = task::find_task_by_id(db, task_id)
+                        .await?
+                        .ok_or(TaskRevisionBudgetConflict)?;
+                    let run = task_run::find_run_by_id(db, run_id)
+                        .await?
+                        .ok_or(TaskRevisionBudgetConflict)?;
+                    let current = task_agent_spec::find_terminal_agent_spec(db, task_id, run_id)
+                        .await?
+                        .ok_or(TaskRevisionBudgetConflict)?;
+                    if is_terminal_task_status_db(&task.status)
+                        || expected_task_revision.is_some_and(|revision| revision != task.revision)
+                        || run.task_id != *task_id
+                        || task_run_status_from_db(&run.status)
+                            .is_none_or(TaskRunStatus::is_terminal)
+                        || current.id != *expected_agent_spec_id
+                        || (current.run_id.is_some() && current.id != agent_spec.id)
+                        || agent_spec.task_id != *task_id
+                        || agent_spec.run_id.as_deref() != Some(run_id.as_str())
+                    {
+                        return Err(TaskRevisionBudgetConflict.into());
+                    }
+                    let mut policy =
+                        task_agent_spec::effective_run_review_policy(db, task_id, Some(&current))
+                            .await?
+                            .ok_or(TaskRevisionBudgetConflict)?;
+                    policy.run_revision_budget = agent_spec
+                        .review_policy
+                        .as_ref()
+                        .and_then(|policy| policy.run_revision_budget.clone());
+                    if policy.run_revision_budget.is_none()
+                        || agent_spec.review_policy.as_ref() != Some(&policy)
+                    {
+                        return Err(TaskRevisionBudgetConflict.into());
+                    }
+                    // Acceptance can commit before the run's terminal update.
+                    // Treat the accepted candidate as final across that gap.
+                    if run.status == "waiting_review"
+                        && task_result_candidate::has_accepted_candidate_by_run(db, run_id).await?
+                    {
+                        return Err(TaskRevisionBudgetConflict.into());
+                    }
+                    let prepared = agent_spec_projections
+                        .into_iter()
+                        .next()
+                        .context("run revision budget projection was not prepared")?;
+                    if current.run_id.is_some() {
+                        task_agent_spec::update_prepared_review_policy(db, prepared).await
+                    } else {
+                        task_agent_spec::upsert_prepared_agent_spec(db, prepared).await
+                    }
+                }),
                 TaskEventPayload::TaskRevisionRequested {
                     task_id,
                     run_id,
@@ -1062,6 +1154,28 @@ impl TaskProjector {
                     requested_at,
                     ..
                 } => project_future(async move {
+                    // The earlier review and rejection events are part of this
+                    // same transaction. A cap changed since service validation
+                    // rolls back the whole request, including its action receipt.
+                    let run = task_run::find_run_by_id(db, run_id)
+                        .await?
+                        .ok_or(TaskRevisionBudgetConflict)?;
+                    let spec = task_agent_spec::find_terminal_agent_spec(db, task_id, run_id)
+                        .await?
+                        .ok_or(TaskRevisionBudgetConflict)?;
+                    let policy =
+                        task_agent_spec::effective_run_review_policy(db, task_id, Some(&spec))
+                            .await?;
+                    if run.task_id != *task_id
+                        || run.status != "waiting_review"
+                        || task_is_terminal_db(db, task_id).await?
+                        || *round == 0
+                        || policy.is_none_or(|policy| {
+                            !policy.is_enabled() || !policy.allows_revision_after(*round - 1)
+                        })
+                    {
+                        return Err(TaskRevisionBudgetConflict.into());
+                    }
                     task_run_turn::upsert_turn(
                         db,
                         task_run_turn::NewTaskRunTurn {

@@ -420,8 +420,8 @@ pub struct ReviewRequiredTaskObservation {
     pub diagnostics: Vec<String>,
     pub child_thread_id: Option<String>,
     pub child_turn_id: Option<String>,
-    pub max_revision_rounds: u32,
-    pub remaining_revision_rounds: u32,
+    pub max_revision_rounds: Option<u32>,
+    pub remaining_revision_rounds: Option<u32>,
     pub allowed_actions: Vec<String>,
     pub revision_blocked_reason: Option<String>,
 }

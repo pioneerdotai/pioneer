@@ -4435,7 +4435,7 @@ async fn review_required_attached_task_observation(
         .collect::<Vec<_>>();
     let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). unlimitedRevisionRounds=true indicates unlimited revisions. If a finite cap is exhausted, an authorized task manager and reviewer can change the target run via task_update with revisionBudget; re-read its actions before revising. Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
     );
     let details = json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
@@ -4452,12 +4452,13 @@ async fn review_required_attached_task_observation(
 
 fn review_required_observation_signature(observation: &ReviewRequiredTaskObservation) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}",
         observation.task_id,
         observation.run_id,
         observation.candidate_id,
         observation.candidate_status,
         observation.round,
+        observation.max_revision_rounds,
         observation.remaining_revision_rounds,
         observation.allowed_actions.join(","),
         observation.revision_blocked_reason.as_deref().unwrap_or("")
@@ -4483,8 +4484,10 @@ fn review_required_observation_payload(observation: &ReviewRequiredTaskObservati
             .collect::<Vec<_>>(),
             "childThreadId": observation.child_thread_id,
             "childTurnId": observation.child_turn_id,
-            "maxRevisionRounds": observation.max_revision_rounds,
-            "remainingRevisionRounds": observation.remaining_revision_rounds,
+            "maxRevisionRounds": observation.max_revision_rounds.unwrap_or(u32::MAX),
+            "remainingRevisionRounds": observation.remaining_revision_rounds
+                .unwrap_or_else(|| u32::MAX.saturating_sub(observation.round)),
+            "unlimitedRevisionRounds": observation.max_revision_rounds.is_none(),
             "allowedActions": observation.allowed_actions,
             "revisionBlockedReason": observation.revision_blocked_reason,
     })
@@ -4559,7 +4562,7 @@ fn render_review_required_snapshot(
         .collect::<Vec<_>>();
     let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). unlimitedRevisionRounds=true indicates unlimited revisions. If a finite cap is exhausted, an authorized task manager and reviewer can change the target run via task_update with revisionBudget; re-read its actions before revising. Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
     );
     Some(RenderedReviewRequiredObservation {
         signatures,
@@ -9823,8 +9826,8 @@ mod tests {
             diagnostics: vec!["d".repeat(500), "diagnostic two".to_owned()],
             child_thread_id: Some("child_thread_review_payload".to_owned()),
             child_turn_id: Some("child_turn_review_payload".to_owned()),
-            max_revision_rounds: 2,
-            remaining_revision_rounds: 0,
+            max_revision_rounds: Some(2),
+            remaining_revision_rounds: Some(0),
             allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
             revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
         };
@@ -11139,8 +11142,8 @@ mod tests {
             diagnostics: Vec::new(),
             child_thread_id: None,
             child_turn_id: None,
-            max_revision_rounds: 2,
-            remaining_revision_rounds: 0,
+            max_revision_rounds: Some(2),
+            remaining_revision_rounds: Some(0),
             allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
             revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
         }];

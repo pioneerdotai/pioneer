@@ -1240,6 +1240,7 @@ impl MessageProcessor {
             | TaskEventPayload::TaskResultCandidateCreated { .. }
             | TaskEventPayload::TaskResultReviewEventRecorded { .. }
             | TaskEventPayload::TaskRevisionRequested { .. }
+            | TaskEventPayload::TaskRunRevisionBudgetUpdated { .. }
             | TaskEventPayload::TaskRunEnteredReview { .. }
             | TaskEventPayload::DepthLimitExceeded { .. }
             | TaskEventPayload::WriteLockExtended { .. } => {

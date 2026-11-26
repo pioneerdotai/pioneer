@@ -631,6 +631,8 @@ async fn reviewed_task_in(
     params.agent_spec.as_mut().unwrap().review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: vec![],

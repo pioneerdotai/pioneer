@@ -512,6 +512,11 @@ fn task_wait_review_details_text(rows: &[TaskWaitReviewDetailRow]) -> String {
                     t!("timeline.task_review.details.revision_rounds_remaining")
                 ));
             }
+            TaskWaitReviewDetailRow::UnlimitedRevisionRounds => lines.push(format!(
+                "{}: {}",
+                t!("timeline.task_review.details.revision_rounds_remaining"),
+                t!("timeline.task_review.details.revision_rounds_unlimited")
+            )),
             TaskWaitReviewDetailRow::Diagnostics { diagnostics } => lines.push(format!(
                 "{}: {}",
                 t!("timeline.task_review.details.diagnostics"),

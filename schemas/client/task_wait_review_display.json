@@ -143,6 +143,10 @@
             "null"
           ]
         },
+        "unlimited_revision_rounds": {
+          "type": "boolean",
+          "default": false
+        },
         "user_approval_required": {
           "type": "boolean"
         }

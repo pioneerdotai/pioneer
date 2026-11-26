@@ -289,6 +289,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} review-required candidate(s)"
 "timeline.task_review.details.revision_blocked" = "Revision blocked"
 "timeline.task_review.details.revision_rounds_remaining" = "Revision rounds remaining"
+"timeline.task_review.details.revision_rounds_unlimited" = "Unlimited"
 "timeline.task_review.details.round" = "Round"
 "timeline.task_review.details.run_id" = "Run id"
 "timeline.task_review.details.summary" = "Summary"

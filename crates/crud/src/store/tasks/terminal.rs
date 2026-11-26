@@ -18,6 +18,16 @@ impl CrudStore {
             .await
     }
 
+    pub async fn prepare_task_terminal_with_extraction_failure(
+        &self,
+        prepared: PreparedTaskTerminalTransition,
+        turn: TaskRunTurn,
+    ) -> Result<PreparedTaskTerminalTransition> {
+        self.task_event_store()
+            .prepare_task_terminal_with_extraction_failure(prepared, turn)
+            .await
+    }
+
     pub async fn prepare_task_terminal_transition(
         &self,
         terminal: TaskEventPayload,

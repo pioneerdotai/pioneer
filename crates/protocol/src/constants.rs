@@ -517,6 +517,7 @@ pub mod events {
     pub const TASK_RESULT_CANDIDATE_ACCEPTED: &str = "task/result_candidate/accepted";
     pub const TASK_RESULT_CANDIDATE_REJECTED: &str = "task/result_candidate/rejected";
     pub const TASK_RESULT_CANDIDATE_CANCELLED: &str = "task/result_candidate/cancelled";
+    pub const TASK_RUN_REVISION_BUDGET_UPDATED: &str = "task/run/revision_budget_updated";
     pub const TASK_REVISION_REQUESTED: &str = "task/revision/requested";
     pub const TASK_RUN_ENTERED_REVIEW: &str = "task/run/entered_review";
     pub const TASK_DELIVERY_QUEUED: &str = "task/delivery/queued";

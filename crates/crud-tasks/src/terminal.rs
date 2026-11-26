@@ -12,7 +12,7 @@ use crate::status::{
 };
 use crate::task::task_from_db_model;
 use crate::task_agent_spec::task_agent_spec_from_db_model;
-use crate::task_projector::TaskOutputBinder;
+use crate::task_projector::{TaskOutputBinder, TaskRevisionBudgetConflict};
 use crate::task_run::task_run_from_db_model;
 use crate::task_run_turn::task_run_turn_from_db_model;
 use crate::task_trigger::task_trigger_from_db_model;
@@ -107,7 +107,8 @@ pub struct PreparedTaskTerminalTransition {
     delivery: Option<task_delivery::PreparedTaskDeliveryProjection>,
     at: i64,
     retry_scheduled: bool,
-    terminal_revision: Option<TaskRunTurn>,
+    terminal_turn: Option<TaskRunTurn>,
+    reviewed_extraction_failure: bool,
 }
 
 impl PreparedTaskTerminalTransition {
@@ -160,8 +161,27 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     /// the writer revalidates every field and latest-revision ownership.
     pub async fn prepare_task_terminal_with_revision(
         &self,
+        prepared: PreparedTaskTerminalTransition,
+        revision: TaskRunTurn,
+    ) -> Result<PreparedTaskTerminalTransition> {
+        self.prepare_task_terminal_with_turn(prepared, revision, false)
+            .await
+    }
+
+    pub async fn prepare_task_terminal_with_extraction_failure(
+        &self,
+        prepared: PreparedTaskTerminalTransition,
+        turn: TaskRunTurn,
+    ) -> Result<PreparedTaskTerminalTransition> {
+        self.prepare_task_terminal_with_turn(prepared, turn, true)
+            .await
+    }
+
+    async fn prepare_task_terminal_with_turn(
+        &self,
         mut prepared: PreparedTaskTerminalTransition,
         revision: TaskRunTurn,
+        reviewed_extraction_failure: bool,
     ) -> Result<PreparedTaskTerminalTransition> {
         let (status, error) = match &prepared.terminal {
             TaskEventPayload::RunBlocked { error, .. } => (TaskRunTurnStatus::Blocked, error),
@@ -171,18 +191,24 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         if prepared.events.len() >= MAX_ATOMIC_TASK_EVENT_BATCH_SIZE {
             bail!("revision exceeds the atomic Task event batch limit");
         }
+        let valid_turn_kind = if reviewed_extraction_failure {
+            revision.kind != TaskRunTurnKind::Review && status == TaskRunTurnStatus::Failed
+        } else {
+            revision.kind == TaskRunTurnKind::Revision
+        };
         if revision.task_id != prepared.state.task.id
             || revision.run_id != prepared.state.run.id
-            || revision.kind != TaskRunTurnKind::Revision
+            || !valid_turn_kind
             || revision.status != TaskRunTurnStatus::InProgress
             || revision.completed_at.is_some()
-            || revision.execution_id.as_deref()
-                != prepared
-                    .state
-                    .execution_fence
-                    .as_ref()
-                    .map(|(id, _)| id.as_str())
-            || prepared.terminal_revision.is_some()
+            || ((!reviewed_extraction_failure || revision.execution_id.is_some())
+                && revision.execution_id.as_deref()
+                    != prepared
+                        .state
+                        .execution_fence
+                        .as_ref()
+                        .map(|(id, _)| id.as_str()))
+            || prepared.terminal_turn.is_some()
         {
             return conflict("revision does not belong to the dispatch attempt");
         }
@@ -203,7 +229,8 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         let mut events = prepare_task_events_for_write(&self.connection, vec![event]).await?;
         events.append(&mut prepared.events);
         prepared.events = events;
-        prepared.terminal_revision = Some(revision);
+        prepared.terminal_turn = Some(revision);
+        prepared.reviewed_extraction_failure = reviewed_extraction_failure;
         Ok(prepared)
     }
 
@@ -470,7 +497,8 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             delivery,
             at,
             retry_scheduled,
-            terminal_revision: None,
+            terminal_turn: None,
+            reviewed_extraction_failure: false,
         })
     }
 
@@ -632,7 +660,8 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<TaskTerminalCommitOutcome> {
         let fence = prepared.state.execution_fence.clone();
         let terminal = prepared.terminal.clone();
-        let terminal_revision = prepared.terminal_revision.clone();
+        let terminal_turn = prepared.terminal_turn.clone();
+        let reviewed_extraction_failure = prepared.reviewed_extraction_failure;
         let mut prepared = prepared;
         for _ in 0..16 {
             match self
@@ -648,9 +677,13 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                     if prepared.state.execution_fence != fence {
                         return conflict("execution fence changed while reconciling finish");
                     }
-                    if let Some(revision) = &terminal_revision {
+                    if let Some(revision) = &terminal_turn {
                         prepared = self
-                            .prepare_task_terminal_with_revision(prepared, revision.clone())
+                            .prepare_task_terminal_with_turn(
+                                prepared,
+                                revision.clone(),
+                                reviewed_extraction_failure,
+                            )
                             .await?;
                     }
                 }
@@ -664,9 +697,13 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                             "protected terminal facts changed while reloading additional work",
                         );
                     }
-                    prepared = if let Some(revision) = &terminal_revision {
-                        self.prepare_task_terminal_with_revision(refreshed, revision.clone())
-                            .await?
+                    prepared = if let Some(revision) = &terminal_turn {
+                        self.prepare_task_terminal_with_turn(
+                            refreshed,
+                            revision.clone(),
+                            reviewed_extraction_failure,
+                        )
+                        .await?
                     } else {
                         refreshed
                     };
@@ -688,9 +725,13 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                             "protected terminal facts changed while reloading webhook progress",
                         );
                     }
-                    prepared = if let Some(revision) = &terminal_revision {
-                        self.prepare_task_terminal_with_revision(refreshed, revision.clone())
-                            .await?
+                    prepared = if let Some(revision) = &terminal_turn {
+                        self.prepare_task_terminal_with_turn(
+                            refreshed,
+                            revision.clone(),
+                            reviewed_extraction_failure,
+                        )
+                        .await?
                     } else {
                         refreshed
                     };
@@ -1002,6 +1043,11 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         // These exact, bounded reads happen BEFORE RunCompleted/Failed/etc.
         // Serialization, random identity allocation and retry calculation have
         // already finished. No provider work or notification runs in this scope.
+        if prepared.reviewed_extraction_failure {
+            // Budget edits and candidate publication use the same stream lock.
+            // Take it before reading writer-side transition facts.
+            crate::event_log::lock_task(db, &prepared.state.task.id).await?;
+        }
         let current =
             load_terminal_state(db, &prepared.state.task.id, &prepared.state.run.id).await?;
         validate_terminal_policy(&prepared.state, &current)?;
@@ -1014,7 +1060,20 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         let run_terminal = task_run_status_from_db(&current.run.status)
             .context("invalid terminal run status")?
             .is_terminal();
-        if let Some(expected) = &prepared.terminal_revision {
+        if let Some(expected) = &prepared.terminal_turn {
+            if prepared.reviewed_extraction_failure && !run_terminal {
+                let policy = task_agent_spec::effective_run_review_policy(
+                    db,
+                    &current.task.id,
+                    current.agent_spec.as_ref(),
+                )
+                .await?;
+                if policy.is_none_or(|policy| policy.allows_revision_after(expected.round))
+                    || current.agent_spec != prepared.state.agent_spec
+                {
+                    return Err(TaskRevisionBudgetConflict.into());
+                }
+            }
             if !run_terminal
                 && task_status_from_db(&current.task.status)
                     .is_some_and(|status| status.is_terminal())
