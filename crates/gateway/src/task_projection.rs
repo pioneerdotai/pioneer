@@ -1192,6 +1192,7 @@ mod tests {
             let review = pioneer_tasks::task_review_wait_item(
                 &response,
                 TaskWaitItem {
+                    auto_accepted_candidate_id: None,
                     task: response.task.clone(),
                     run: Some(run.clone()),
                     child_thread_id: None,
