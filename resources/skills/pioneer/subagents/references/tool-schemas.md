@@ -112,11 +112,12 @@ Rules:
 - Do not use singular `taskId` or `runId`.
 - A timeout does not cancel child work.
 - `timedOut:true` means this wait window expired. Active `taskIds` or `runIds` can be waited on again even when no counts changed. A run timeout appears separately in its run status and error.
-- Authorized result readers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
+- Authorized result readers receive `reviewContent` for each `reviewRequired` candidate.
+- Automatically accepted results with a saved candidate expose `completed[].run.candidateId`. `completed[].reviewContent` is available to authorized result readers within the response budget. If omitted, use `task_result` with the candidate ID.
 
 ## task_result
 
-Use `task_result` to re-read the reviewer-safe content of the exact immutable candidate, or to continue a truncated result.
+Use `task_result` to read the exact immutable candidate or continue a truncated result. For an automatically accepted result, use the run's `candidateId` from `task_get` or `task_wait`. For a review candidate, use its ID from `reviewRequired`.
 
 ```json
 {
@@ -124,7 +125,7 @@ Use `task_result` to re-read the reviewer-safe content of the exact immutable ca
 }
 ```
 
-When the response has `truncated: true`, continue with the returned cursor:
+When `reviewContent.truncated` is true in `task_wait` or `task_result`, continue with the returned `nextCursor` as `cursor`:
 
 ```json
 {
