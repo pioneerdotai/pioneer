@@ -1,5 +1,6 @@
 use crate::TerminalTaskObservation;
 use pioneer_protocol::TaskStatus;
+use pioneer_provider::{ChatMessage, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -95,5 +96,81 @@ pub fn observed_terminal_task_outcomes_from_payload(
             candidate().into_iter().collect()
         }
         _ => BTreeSet::new(),
+    }
+}
+
+pub fn reports_terminal_outcome(tool: &str) -> bool {
+    matches!(
+        tool,
+        "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
+    )
+}
+
+/// Interpret the final provider representation. A bounded non-JSON excerpt
+/// provides no complete structured evidence for suppressing a notice.
+pub fn observed_terminal_task_outcomes_from_message(
+    message: &ChatMessage,
+) -> BTreeSet<ObservedTaskOutcome> {
+    if message.role == Role::Tool
+        && let Some(name) = message
+            .name
+            .as_deref()
+            .filter(|name| reports_terminal_outcome(name))
+        && let Ok(payload) = serde_json::from_str(&message.content)
+    {
+        return observed_terminal_task_outcomes_from_payload(name, &payload);
+    }
+    BTreeSet::new()
+}
+
+const OBSERVATIONS: &str = "observed_task_outcomes_v1";
+
+#[derive(Serialize, Deserialize)]
+struct SavedObservations {
+    had_context: bool,
+    outcomes: BTreeSet<ObservedTaskOutcome>,
+}
+
+pub fn save_observations(message: &mut ChatMessage, observed: &BTreeSet<ObservedTaskOutcome>) {
+    remove_observations(message);
+    let had_context = message.application_context.is_some();
+    if let Some(metadata) = message
+        .application_context
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    {
+        // An explicit empty set proves that this result was already assessed.
+        metadata.insert(
+            OBSERVATIONS.into(),
+            serde_json::json!(SavedObservations {
+                had_context,
+                outcomes: observed.clone(),
+            }),
+        );
+    }
+}
+
+pub fn saved_observations(message: &ChatMessage) -> BTreeSet<ObservedTaskOutcome> {
+    message
+        .application_context
+        .as_ref()
+        .and_then(|metadata| metadata.get(OBSERVATIONS))
+        .and_then(|value| serde_json::from_value::<SavedObservations>(value.clone()).ok())
+        .map(|saved| saved.outcomes)
+        .unwrap_or_default()
+}
+
+/// Outcome evidence is local bookkeeping. Preserve the original envelope,
+/// including an originally empty context, when building the provider request.
+pub(crate) fn remove_observations(message: &mut ChatMessage) {
+    if let Some(metadata) = message
+        .application_context
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        && let Some(saved) = metadata.remove(OBSERVATIONS)
+        && metadata.is_empty()
+        && saved.get("had_context").and_then(Value::as_bool) != Some(true)
+    {
+        message.application_context = None;
     }
 }
