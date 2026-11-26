@@ -264,9 +264,9 @@ dependencies = [
 
 [[package]]
 name = "allocator-api2"
-version = "0.2.21"
+version = "0.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+checksum = "57b212daf2e827b1ccdd778b7eb48ba433e58cb0e4f27b43cd6b7a608425a014"
 
 [[package]]
 name = "allocator-api2"
@@ -1286,7 +1286,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "percent-encoding",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "time",
  "tracing",
 ]
@@ -5227,7 +5227,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5271,7 +5271,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "anyhow",
  "core-text",
@@ -5318,7 +5318,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5662,7 +5662,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -5679,7 +5679,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -6213,7 +6213,7 @@ checksum = "f0de0aaa67d6974e0983f6d4ded918b73547db6cb82b61ac2de88576a45b0e81"
 [[package]]
 name = "gpui-webview"
 version = "0.11.0"
-source = "git+https://github.com/longbridge/gpui-kit#f8993a53721439f119d492fbf3c57c0b963e33f5"
+source = "git+https://github.com/longbridge/gpui-kit#f807c1b2c49ef25ddfbe73e465e33b8a5fa5632e"
 dependencies = [
  "anyhow",
  "gdkx11",
@@ -6399,7 +6399,7 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "allocator-api2 0.2.21",
+ "allocator-api2 0.2.22",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -6410,7 +6410,7 @@ version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
- "allocator-api2 0.2.21",
+ "allocator-api2 0.2.22",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -8130,7 +8130,7 @@ dependencies = [
  "nom 8.0.0",
  "rand 0.10.4",
  "rangemap",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "stringprep",
  "thiserror 2.0.21",
  "weezl 0.2.1",
@@ -8486,7 +8486,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "socket2 0.6.5",
  "tar",
  "tempfile",
@@ -8571,7 +8571,7 @@ dependencies = [
  "msb_krun_utils",
  "scopeguard",
  "serde",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -8603,7 +8603,7 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tar",
  "thiserror 2.0.21",
  "tokio",
@@ -8706,7 +8706,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -8728,7 +8728,7 @@ dependencies = [
  "microsandbox-types-macros",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "thiserror 2.0.21",
  "typed-path",
  "zeroize",
@@ -9370,7 +9370,7 @@ dependencies = [
  "regress",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sigstore-trust-root",
  "sigstore-verify",
  "syn 2.0.119",
@@ -10184,7 +10184,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -11045,7 +11045,7 @@ checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "pioneer-agent"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11067,7 +11067,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -11077,14 +11077,14 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "libc",
  "semver",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "windows-sys 0.61.2",
  "zip",
@@ -11092,7 +11092,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-apps"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "image",
@@ -11107,7 +11107,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11126,7 +11126,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -11134,7 +11134,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -11149,7 +11149,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "toml 1.2.3+spec-1.1.0",
@@ -11160,7 +11160,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11172,7 +11172,7 @@ dependencies = [
  "process-wrap",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "toml 1.2.3+spec-1.1.0",
@@ -11182,7 +11182,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -11196,7 +11196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11216,7 +11216,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "shell-words",
  "tar",
  "tempfile",
@@ -11231,7 +11231,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11250,7 +11250,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11258,12 +11258,12 @@ dependencies = [
  "pioneer-protocol",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
 ]
 
 [[package]]
 name = "pioneer-config"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "config",
@@ -11276,7 +11276,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11306,7 +11306,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -11317,7 +11317,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-access"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11333,7 +11333,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-artifacts"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11351,7 +11351,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tokio-util",
  "tracing",
@@ -11360,7 +11360,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-compaction"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11381,7 +11381,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
  "uuid",
@@ -11389,7 +11389,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-conversations"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11403,14 +11403,14 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "pioneer-crud-execution"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11429,7 +11429,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
  "uuid",
@@ -11437,7 +11437,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-memory"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11451,13 +11451,13 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
 ]
 
 [[package]]
 name = "pioneer-crud-packages"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11473,13 +11473,13 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
 ]
 
 [[package]]
 name = "pioneer-crud-payloads"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -11487,7 +11487,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "uuid",
  "zstd 0.14.5",
@@ -11495,7 +11495,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-self-improvement"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11516,7 +11516,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-signals"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "pioneer-entity",
  "pioneer-postgres-pools",
@@ -11526,7 +11526,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud-tasks"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11544,14 +11544,14 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "pioneer-crud-timeline"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11571,7 +11571,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -11604,7 +11604,7 @@ dependencies = [
  "rust-i18n",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "syn 2.0.119",
  "sys-locale",
  "tempfile",
@@ -11624,7 +11624,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11638,7 +11638,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11649,7 +11649,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-apps"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -11666,7 +11666,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11676,7 +11676,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -11688,7 +11688,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11701,7 +11701,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-packages"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11712,7 +11712,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11724,7 +11724,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11741,7 +11741,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -11753,7 +11753,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11765,7 +11765,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11778,7 +11778,7 @@ dependencies = [
  "rust-i18n",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "syntect",
  "terminal",
  "tokio",
@@ -11791,7 +11791,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -11802,14 +11802,14 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "url",
 ]
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11822,7 +11822,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -11830,7 +11830,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -11898,7 +11898,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "subtle",
  "tar",
  "tempfile",
@@ -11920,7 +11920,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -11929,7 +11929,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -11937,7 +11937,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -11950,7 +11950,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11966,7 +11966,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sse-stream",
  "tokio",
  "tokio-util",
@@ -11976,7 +11976,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp-oauth"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -11990,7 +11990,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tokio-util",
  "tracing",
@@ -12000,7 +12000,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12017,7 +12017,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tracing",
@@ -12025,7 +12025,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "sea-orm-migration",
  "tokio",
@@ -12033,7 +12033,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12053,7 +12053,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tracing",
@@ -12064,7 +12064,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-packages"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12075,13 +12075,13 @@ dependencies = [
  "pioneer-skills",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
 ]
 
 [[package]]
 name = "pioneer-plugins"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12091,14 +12091,14 @@ dependencies = [
  "pioneer-skills",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "url",
 ]
 
 [[package]]
 name = "pioneer-postgres"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "fs4",
@@ -12118,7 +12118,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-pools"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12134,7 +12134,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-test"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -12150,7 +12150,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-postgres-test-macros"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12159,7 +12159,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12172,13 +12172,13 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
 ]
 
 [[package]]
 name = "pioneer-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -12187,14 +12187,14 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "url",
  "zeroize",
 ]
 
 [[package]]
 name = "pioneer-provider"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12217,7 +12217,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "symphonia",
  "tempfile",
  "tokio",
@@ -12230,7 +12230,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "pioneer-observability",
  "pioneer-protocol",
@@ -12241,7 +12241,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12251,7 +12251,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "toml 1.2.3+spec-1.1.0",
  "tracing",
@@ -12260,7 +12260,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12277,7 +12277,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tracing",
@@ -12285,7 +12285,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12316,7 +12316,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -12329,7 +12329,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12339,7 +12339,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "toml 1.2.3+spec-1.1.0",
@@ -13689,7 +13689,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sse-stream",
  "thiserror 2.0.21",
  "tokio",
@@ -13840,7 +13840,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "915e33dccbe7deb2b8a342dc4c517503fe85e0230ddbae40a4fb0220493dad9b"
 dependencies = [
  "globset",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "walkdir",
 ]
 
@@ -14547,7 +14547,7 @@ dependencies = [
  "num",
  "once_cell",
  "serde",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "zbus 5.19.0",
 ]
 
@@ -15032,9 +15032,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -15656,7 +15656,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "smallvec",
  "thiserror 2.0.21",
  "time",
@@ -15696,7 +15696,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx-core",
  "sqlx-mysql",
  "sqlx-postgres",
@@ -15728,7 +15728,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "sha1 0.11.0",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx-core",
  "thiserror 2.0.21",
  "time",
@@ -15764,7 +15764,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "smallvec",
  "sqlx-core",
  "stringprep",
@@ -20250,18 +20250,18 @@ checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.65"
+version = "0.8.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32bc8a75f879cd6fe53a6bedf3c28f0e1b914c77424fc2be9e2ec85d7d25aff5"
+checksum = "cba8a86aee14fc8cc6c208af60854b3d4ab7185a9a369a12c648faa2716ff42a"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.65"
+version = "0.8.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8bfd2644ea1681f60cf95029ff18aa8ad1cc3f7b8fe37286f8e473bb29f816b"
+checksum = "f89bca3b96ceb3cfcb4572790402f977442270d252b9a8504ebc258760c55f94"
 dependencies = [
  "proc-macro2",
  "quote",
