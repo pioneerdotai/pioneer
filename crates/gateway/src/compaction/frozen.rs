@@ -7264,18 +7264,53 @@ async fn finish_restored_entry(
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("invalid frozen replay scope"))?;
         let locator=serde_json::json!({"workspace_id":workspace,"thread_id":reference.source_thread,"turn_id":turn,"item_id":item}).to_string();
+        let replay = if candidates.iter().any(|candidate| {
+            pioneer_agent::compaction::thread_pages::is_thread_reader(&candidate.wire)
+        }) {
+            super::thread_pages::frozen_replay(store, &locator).await?
+        } else {
+            None
+        };
         let full = candidates.clone();
         for candidate in full
             .into_iter()
             .filter(|candidate| candidate.wire.role == pioneer_provider::Role::Tool)
         {
-            let wire =
-                pioneer_agent::compaction::restored_tool_result_message(&candidate.wire, &locator)?;
-            let model = pioneer_agent::compaction::restored_tool_result_message(
+            let wire = super::thread_pages::restore_tool_result(
+                store,
+                &candidate.wire,
+                &locator,
+                None,
+                replay.as_ref(),
+            )
+            .await?;
+            let model = super::thread_pages::restore_tool_result(
+                store,
                 &candidate.model,
                 &locator,
-            )?;
+                None,
+                replay.as_ref(),
+            )
+            .await?;
             candidates.push(FrozenModelCandidate::upgraded(wire, model));
+            if replay.is_none()
+                && pioneer_agent::compaction::thread_pages::is_thread_reader(&candidate.wire)
+                && let Ok(framed) =
+                    pioneer_agent::compaction::thread_pages::restore_frame(&candidate.wire, None)
+            {
+                // A recorded digest selects the exact old representation.
+                candidates.push(FrozenModelCandidate::exact(framed));
+            }
+            if let Some(presented) = super::thread_pages::frozen_presentation(
+                store,
+                &candidate.wire,
+                &locator,
+                replay.as_ref(),
+            )
+            .await?
+            {
+                candidates.push(FrozenModelCandidate::exact(presented));
+            }
         }
     }
     // The wire hash chooses an exact deterministic projection of a known source,

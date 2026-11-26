@@ -4,6 +4,7 @@ pub mod composition;
 pub mod controller;
 pub mod history;
 pub mod request;
+pub mod thread_pages;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;

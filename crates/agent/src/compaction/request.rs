@@ -29,9 +29,38 @@ pub struct EvaluatedRequest {
     pub fixed_input_tokens: u64,
     /// Framing plus materialized media, in final request message order.
     pub message_input_tokens: Vec<u64>,
+    message_utf16_units: Vec<u64>,
+    request_utf16_units: u64,
     pub output_reserve: u64,
     pub fits: bool,
 }
+
+impl EvaluatedRequest {
+    /// Rank shortening only a message's JSON `content` string. A measured
+    /// prefix is fixed, and each appended message is rounded on its own.
+    pub fn text_replacement_saving(
+        &self,
+        index: usize,
+        saved_units: u64,
+        measured_prefix: Option<usize>,
+    ) -> Option<(u64, u64)> {
+        let message_units = *self.message_utf16_units.get(index)?;
+        if let Some(prefix_len) = measured_prefix {
+            if index < prefix_len {
+                return None;
+            }
+            let saving = tokens_from_utf16(message_units)
+                - tokens_from_utf16(message_units.checked_sub(saved_units)?);
+            return (saving > 0).then_some((saving, 0));
+        }
+        let saving = tokens_from_utf16(self.request_utf16_units)
+            - tokens_from_utf16(self.request_utf16_units.checked_sub(saved_units)?);
+        // Local framing rounds once. Keep the larger raw reduction when two
+        // choices save the same number of tokens at the current boundary.
+        Some((saving, saved_units))
+    }
+}
+
 impl NativeRequestProjection {
     pub fn new(
         mut request: ChatRequest,
@@ -220,6 +249,7 @@ impl NativeRequestProjection {
         let mut request = self.request.clone();
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
         let mut message_input_tokens = Vec::with_capacity(request.messages.len() + 1);
+        let mut message_utf16_units = Vec::with_capacity(request.messages.len() + 1);
         let mut units = self.envelope_units;
         let mut media_tokens = 0_u64;
         let mut inserted = false;
@@ -251,6 +281,7 @@ impl NativeRequestProjection {
                     .saturating_add(1)
                     .saturating_add(media),
             );
+            message_utf16_units.push(size);
             messages.push(message);
         }
         request.messages = messages;
@@ -282,6 +313,8 @@ impl NativeRequestProjection {
             estimated_input_tokens,
             fixed_input_tokens: self.fixed_input_tokens,
             message_input_tokens,
+            message_utf16_units,
+            request_utf16_units: units,
             output_reserve: self.output_reserve,
             fits: self
                 .budget

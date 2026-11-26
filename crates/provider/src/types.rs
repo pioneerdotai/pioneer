@@ -839,7 +839,8 @@ impl ModelInputItem {
     }
 }
 
-fn canonical_json_string(value: &JsonValue) -> String {
+/// Serialize model tool payloads with recursively ordered object keys.
+pub fn canonical_json_string(value: &JsonValue) -> String {
     serde_json::to_string(&canonicalize_json(value)).unwrap_or_else(|_| value.to_string())
 }
 

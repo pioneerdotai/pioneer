@@ -9,6 +9,7 @@ use pioneer_agent::compaction::{
     },
     history::NativeHistoryLayout,
     request::NativeRequestProjection,
+    thread_pages,
 };
 use pioneer_compaction::{
     CompactionMode, CompactionSettings, CoverageDomain, ModelSelection, Transport,
@@ -518,16 +519,6 @@ async fn prepare_native_projection_with_prepared(
             None,
         )
         .await?;
-        // Resolve and pin media under the selected provider authority before
-        // evaluating either the full request or any compaction candidate.
-        let materialized = context.provider.prepare_input_budget(request).await?;
-        let media = materialized.media;
-        let full = NativeRequestProjection::full(
-            materialized.request,
-            media.clone(),
-            budget.clone(),
-            recovery,
-        )?;
         let api_identity = format!(
             "{}:{}",
             context.provider.name(),
@@ -536,19 +527,118 @@ async fn prepare_native_projection_with_prepared(
                 .authority_fingerprint()
                 .unwrap_or("unbound")
         );
-        let mut receipt = NativeInputReceipt::for_request(
-            &full.request,
-            &context.provider_instance,
-            &api_identity,
-            version,
-            basis.clone(),
-        )?;
+        // Freeze the adapter's media bytes and message positions once. The
+        // text-only alternatives keep the same media estimates and authority.
+        let mut candidates = Vec::new();
+        for message in &mut request.messages {
+            let Some((reference, check_dispatch)) = thread_pages::take_fresh_reference(message)?
+            else {
+                continue;
+            };
+            ensure!(
+                reference.workspace_id == workspace
+                    && reference.thread_id == thread
+                    && reference.turn_id == context.turn_id,
+                "thread page presentation crosses its execution scope"
+            );
+            if check_dispatch
+                && !super::thread_pages::recheck_pending_page(store, &reference, message).await?
+            {
+                continue;
+            }
+            candidates.push((message.clone(), reference));
+        }
+        let confirmed_declarations = request.tool_declarations.clone();
+        let materialized = context.provider.prepare_input_budget(request).await?;
+        let media = materialized.media;
+        let mut prepared = materialized.request;
+        let uses_declarations = prepared.tool_declarations.is_some();
+        let mut replacements = Vec::new();
+        for (candidate, reference) in candidates {
+            let Some((index, message)) = prepared
+                .messages
+                .iter()
+                .enumerate()
+                .find(|(_, message)| thread_pages::same_result(message, &candidate))
+            else {
+                continue;
+            };
+            // Preview follow-ups may have moved this result. Only its text
+            // changes, so every materialized media index remains valid.
+            let pointer = thread_pages::pointer_content(&reference);
+            let size = pioneer_compaction::estimator::json_string_content_size(&message.content)
+                .utf16_units;
+            let pointer_size =
+                pioneer_compaction::estimator::json_string_content_size(&pointer).utf16_units;
+            if size > pointer_size {
+                replacements.push((size - pointer_size, index, pointer, reference));
+            }
+        }
+        let mut selected = Vec::new();
+        let (full, mut receipt, input) = loop {
+            let full =
+                NativeRequestProjection::full(prepared, media.clone(), budget.clone(), recovery)?;
+            let receipt = NativeInputReceipt::for_request(
+                &full.request,
+                &context.provider_instance,
+                &api_identity,
+                version,
+                basis.clone(),
+            )?;
+            let input = receipt.calibrated_estimate(
+                full.estimated_input_tokens,
+                &full.message_input_tokens,
+                measured.as_ref(),
+            )?;
+            if budget.fits_estimate(input, full.output_reserve, recovery) {
+                break (full, receipt, input);
+            }
+            let result_reader = "threads_tools_result_read";
+            let can_read = match full.request.tool_choice.as_ref() {
+                Some(pioneer_provider::ToolChoice::None) => false,
+                Some(pioneer_provider::ToolChoice::Tool { name }) => name == result_reader,
+                _ => full
+                    .request
+                    .tools
+                    .iter()
+                    .flatten()
+                    .any(|tool| tool.name == result_reader),
+            };
+            if !can_read {
+                break (full, receipt, input);
+            }
+            let measured_prefix = measured
+                .as_ref()
+                .and_then(|measurement| receipt.measured_prefix_len(measurement));
+            let Some((position, _)) = replacements
+                .iter()
+                .enumerate()
+                .filter_map(|(position, (units, index, ..))| {
+                    let saving = full.text_replacement_saving(*index, *units, measured_prefix)?;
+                    Some((position, (saving, std::cmp::Reverse(*index))))
+                })
+                .max_by_key(|(_, priority)| *priority)
+            else {
+                break (full, receipt, input);
+            };
+            let (_, index, pointer, reference) = replacements.swap_remove(position);
+            prepared = full.request;
+            prepared.messages[index].content = pointer;
+            if uses_declarations {
+                // The adapter already selected positional declarations. Only
+                // rebind their suffix; ordinary authority/schema fallback stays
+                // at the adapter and an invalid confirmed prefix still resets.
+                prepared.tool_declarations = Some(
+                    pioneer_provider::tool_declarations::ToolDeclarations::reconcile(
+                        confirmed_declarations.clone(),
+                        &prepared.messages,
+                        prepared.tools.as_deref().unwrap_or_default(),
+                    )?,
+                );
+            }
+            selected.push(reference);
+        };
         let message_tokens = &full.message_input_tokens;
-        let input = receipt.calibrated_estimate(
-            full.estimated_input_tokens,
-            message_tokens,
-            measured.as_ref(),
-        )?;
         let input_capacity = estimated_input_capacity(&budget, full.output_reserve, false);
         receipt.remaining_input_tokens = Some(input_capacity.saturating_sub(input.total()));
         // Canonical tool results have already been bounded at their owner (or
@@ -557,7 +647,7 @@ async fn prepare_native_projection_with_prepared(
         // the history.
         let history_check = history_check_metadata(&full)?;
         if !recovery && budget.fits_estimate(input, full.output_reserve, false) {
-            return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
+            return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None, selected));
         }
         let _startup_compaction = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::CompactionWork,
@@ -741,9 +831,10 @@ async fn prepare_native_projection_with_prepared(
             receipt,
             history_check,
             Some((snapshot, summarizer, projection, first, input_capacity)),
+            selected,
         ))
     };
-    let (request, receipt, history_check, operation) = tokio::select! { biased;
+    let (request, receipt, history_check, operation, selected) = tokio::select! { biased;
         _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
         _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native context preparation deadline exceeded"),
         prepared = prepared => prepared?,
@@ -754,7 +845,31 @@ async fn prepare_native_projection_with_prepared(
     if let Some(AcceptedProjection::Prepared(projection)) = &mut accepted_projection {
         drop(projection.frozen_hold.take());
     }
+    let persist_presentations = |request: &ChatRequest| {
+        // Only commit pointers that survived preparation. The compacted
+        // round's complete source remains available to history and readers.
+        let references = selected
+            .iter()
+            .filter(|reference| {
+                let pointer = thread_pages::pointer_content(reference);
+                request.messages.iter().any(|message| {
+                    thread_pages::is_thread_reader(message) && message.content == pointer
+                })
+            })
+            .collect::<Vec<_>>();
+        async move {
+            for reference in references {
+                thread_pages::persist_presentation(context, reference).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+    };
     let Some((snapshot, summarizer, projection, summary_index, input_capacity)) = operation else {
+        tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("thread page presentation cancelled"),
+            _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("thread page presentation deadline exceeded"),
+            result = persist_presentations(&request) => result?,
+        }
         return Ok(NativePreparedRequest {
             request,
             receipt,
@@ -830,6 +945,7 @@ async fn prepare_native_projection_with_prepared(
         receipt.remaining_input_tokens =
             Some(input_capacity.saturating_sub(evaluated.estimated_input_tokens));
         let history_check = history_check_metadata(&evaluated)?;
+        persist_presentations(&evaluated.request).await?;
         Ok(NativePreparedRequest {
             request: evaluated.request,
             receipt,

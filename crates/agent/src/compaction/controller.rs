@@ -135,9 +135,7 @@ impl NativeInputReceipt {
             local_messages.len() == self.messages.len(),
             "missing message estimates"
         );
-        let Some(measured) = measured.filter(|m| {
-            self.identity == m.receipt.identity && self.messages.starts_with(&m.receipt.messages)
-        }) else {
+        let Some(measured) = measured.filter(|m| self.matches_measurement(m)) else {
             return Ok(InputEstimate::local(local_complete));
         };
         let appended = local_messages[measured.receipt.messages.len()..]
@@ -147,6 +145,16 @@ impl NativeInputReceipt {
             measured: measured.input_tokens,
             estimated: appended,
         })
+    }
+
+    pub fn measured_prefix_len(&self, measured: &NativeUsageMeasurement) -> Option<usize> {
+        self.matches_measurement(measured)
+            .then_some(measured.receipt.messages.len())
+    }
+
+    fn matches_measurement(&self, measured: &NativeUsageMeasurement) -> bool {
+        self.identity == measured.receipt.identity
+            && self.messages.starts_with(&measured.receipt.messages)
     }
 }
 
