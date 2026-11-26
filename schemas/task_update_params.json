@@ -177,6 +177,17 @@
         }
       ]
     },
+    "revisionBudget": {
+      "description": "Target one existing reviewed run. Supply this as a standalone patch.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskRunRevisionBudgetPatch"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "taskId": {
       "type": "string"
     },
@@ -1318,6 +1329,40 @@
       "required": [
         "maxAttempts",
         "backoff"
+      ]
+    },
+    "TaskRevisionBudget": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "description": "Required. A non-negative integer sets the cap. Null removes the cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "maxRevisionRounds"
+      ]
+    },
+    "TaskRunRevisionBudgetPatch": {
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/TaskRevisionBudget"
+        },
+        "runId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runId",
+        "budget"
       ]
     },
     "TaskSchema": {

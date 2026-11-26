@@ -441,7 +441,14 @@ pub struct TaskResultReviewerSpec {
 #[serde(rename_all = "camelCase")]
 pub struct TaskAgentReviewPolicy {
     pub mode: TaskAgentReviewMode,
+    /// Configured cap for new occurrences. Unlimited uses u32::MAX for older clients.
     pub max_revision_rounds: u32,
+    /// True when the configured cap is unlimited. A run override takes precedence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlimited_revision_rounds: bool,
+    /// Server-owned override for this occurrence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_revision_budget: Option<TaskRevisionBudget>,
     pub require_explicit_acceptance: bool,
     /// Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.
     #[serde(default)]
@@ -453,9 +460,15 @@ pub struct TaskAgentReviewPolicy {
 
 impl TaskAgentReviewPolicy {
     pub fn parent_agent_default(max_revision_rounds: u32) -> Self {
+        Self::parent_agent_with_revision_limit(Some(max_revision_rounds))
+    }
+
+    pub fn parent_agent_with_revision_limit(max_revision_rounds: Option<u32>) -> Self {
         Self {
             mode: TaskAgentReviewMode::ParentAgent,
-            max_revision_rounds,
+            max_revision_rounds: max_revision_rounds.unwrap_or(u32::MAX),
+            unlimited_revision_rounds: max_revision_rounds.is_none(),
+            run_revision_budget: None,
             require_explicit_acceptance: true,
             disable_timeout_acceptance: false,
             reviewers: Vec::new(),
@@ -466,6 +479,55 @@ impl TaskAgentReviewPolicy {
     pub const fn is_enabled(&self) -> bool {
         !matches!(self.mode, TaskAgentReviewMode::None)
     }
+
+    pub fn configured_max_revision_rounds(&self) -> Option<u32> {
+        (!self.unlimited_revision_rounds).then_some(self.max_revision_rounds)
+    }
+
+    pub fn set_configured_max_revision_rounds(&mut self, max_revision_rounds: Option<u32>) {
+        self.max_revision_rounds = max_revision_rounds.unwrap_or(u32::MAX);
+        self.unlimited_revision_rounds = max_revision_rounds.is_none();
+    }
+
+    pub fn effective_max_revision_rounds(&self) -> Option<u32> {
+        self.run_revision_budget.as_ref().map_or_else(
+            || self.configured_max_revision_rounds(),
+            |budget| budget.max_revision_rounds,
+        )
+    }
+
+    pub fn allows_revision_after(&self, round: u32) -> bool {
+        round < u32::MAX
+            && self
+                .effective_max_revision_rounds()
+                .is_none_or(|max| round < max)
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskRevisionBudget {
+    /// Required. A non-negative integer sets the cap. Null removes the cap.
+    #[serde(deserialize_with = "deserialize_revision_limit")]
+    #[schemars(schema_with = "explicit_revision_limit_schema")]
+    pub max_revision_rounds: Option<u32>,
+}
+
+fn explicit_revision_limit_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    generator.subschema_for::<Option<u32>>()
+}
+
+fn deserialize_revision_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    Option::deserialize(deserializer)
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskRunRevisionBudgetPatch {
+    pub run_id: String,
+    pub budget: TaskRevisionBudget,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1853,6 +1915,14 @@ pub enum TaskEventPayload {
         feedback: String,
         requested_at: i64,
     },
+    TaskRunRevisionBudgetUpdated {
+        task_id: String,
+        run_id: String,
+        expected_task_revision: Option<i64>,
+        expected_agent_spec_id: String,
+        agent_spec: TaskAgentSpec,
+        mutation_id: String,
+    },
     TaskRunEnteredReview {
         task_id: String,
         run_id: String,
@@ -1963,7 +2033,8 @@ impl TaskEventPayload {
             | Self::TaskResultCandidateRejected { candidate, .. }
             | Self::TaskResultCandidateCancelled { candidate, .. } => candidate.task_id.as_str(),
             Self::TaskResultReviewEventRecorded { review_event } => review_event.task_id.as_str(),
-            Self::TaskRevisionRequested { task_id, .. }
+            Self::TaskRunRevisionBudgetUpdated { task_id, .. }
+            | Self::TaskRevisionRequested { task_id, .. }
             | Self::TaskRunEnteredReview { task_id, .. } => task_id.as_str(),
         }
     }
@@ -2013,7 +2084,8 @@ impl TaskEventPayload {
             Self::TaskResultReviewEventRecorded { review_event } => {
                 Some(review_event.run_id.as_str())
             }
-            Self::TaskRevisionRequested { run_id, .. }
+            Self::TaskRunRevisionBudgetUpdated { run_id, .. }
+            | Self::TaskRevisionRequested { run_id, .. }
             | Self::TaskRunEnteredReview { run_id, .. } => Some(run_id.as_str()),
             Self::DeliveryQueued { delivery }
             | Self::DeliveryStarted { delivery, .. }
@@ -2127,6 +2199,7 @@ impl TaskEventPayload {
             Self::TaskResultCandidateRejected { .. } => events::TASK_RESULT_CANDIDATE_REJECTED,
             Self::TaskResultCandidateCancelled { .. } => events::TASK_RESULT_CANDIDATE_CANCELLED,
             Self::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
+            Self::TaskRunRevisionBudgetUpdated { .. } => events::TASK_RUN_REVISION_BUDGET_UPDATED,
             Self::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             Self::DepthLimitExceeded { .. } => events::TASK_FAILED,
             Self::DeliveryQueued { .. } => events::TASK_DELIVERY_QUEUED,
@@ -2301,6 +2374,11 @@ impl TaskEventPayload {
             Self::TaskRevisionRequested {
                 run_id, turn_id, ..
             } => Some(format!("run:{run_id}:revision:{turn_id}:requested")),
+            Self::TaskRunRevisionBudgetUpdated {
+                run_id,
+                mutation_id,
+                ..
+            } => Some(format!("run:{run_id}:revision_budget:{mutation_id}")),
             Self::TaskRunEnteredReview {
                 run_id,
                 candidate_id,
@@ -2468,6 +2546,9 @@ pub struct TaskCreateResponse {
 #[serde(rename_all = "camelCase")]
 pub struct TaskUpdateParams {
     pub task_id: String,
+    /// Target one existing reviewed run. Supply this as a standalone patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_budget: Option<TaskRunRevisionBudgetPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2572,6 +2653,34 @@ pub struct TaskGetResponse {
     pub result_candidates: Vec<TaskResultCandidate>,
     #[serde(default)]
     pub result_review_events: Vec<TaskResultReviewEvent>,
+}
+
+impl TaskGetResponse {
+    pub fn agent_spec_for_run(&self, run_id: &str) -> Option<&TaskAgentSpec> {
+        self.agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.as_deref() == Some(run_id))
+            .or_else(|| {
+                self.agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+            })
+    }
+
+    pub fn review_policy_for_run(&self, run_id: &str) -> Option<&TaskAgentReviewPolicy> {
+        self.agent_spec_for_run(run_id)
+            .and_then(|spec| spec.review_policy.as_ref())
+            .or_else(|| {
+                self.agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .and_then(|spec| spec.review_policy.as_ref())
+            })
+            .filter(|policy| policy.is_enabled())
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
@@ -2891,6 +3000,9 @@ pub struct TaskWaitReviewItem {
     pub max_revision_rounds: u32,
     #[serde(default)]
     pub remaining_revision_rounds: u32,
+    /// Authoritative unlimited indicator. Numeric counts remain available to older clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlimited_revision_rounds: bool,
     #[serde(default)]
     pub allowed_actions: Vec<TaskWaitReviewAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3096,6 +3208,9 @@ pub struct PublicTask {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskRun {
+    /// Present on task_get for reviewed runs. A null cap is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_budget: Option<TaskRevisionBudget>,
     pub id: String,
     pub task_id: String,
     pub attempt_number: u32,
@@ -3395,6 +3510,10 @@ pub struct PublicTaskEventsResponse {
     pub has_more: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_events: Option<Vec<TaskEvent>>,
+    /// Full revision-budget events for operators. Merge by sequence with
+    /// operatorEvents. Every event also appears in the common metadata page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_revision_budget_events: Option<Vec<TaskEvent>>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -3512,7 +3631,12 @@ pub struct PublicTaskWaitReviewItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_content: Option<PublicTaskReviewContent>,
     #[serde(default)]
+    pub max_revision_rounds: u32,
+    #[serde(default)]
     pub remaining_revision_rounds: u32,
+    /// Authoritative unlimited indicator. Numeric counts remain available to older clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlimited_revision_rounds: bool,
     #[serde(default)]
     pub allowed_actions: Vec<TaskWaitReviewAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4556,6 +4680,89 @@ mod tests {
         };
         assert_eq!(decoded.security_cap, Some(security_cap));
         assert_eq!(decoded, agent_spec);
+    }
+
+    #[test]
+    fn revision_budget_fields_match_checked_in_schemas() {
+        macro_rules! check_field {
+            ($ty:ty, $file:literal, $field:literal) => {{
+                let generated = serde_json::to_value(schemars::schema_for!($ty)).unwrap();
+                let checked_in: serde_json::Value =
+                    serde_json::from_str(include_str!(concat!("../../../schemas/", $file)))
+                        .unwrap();
+                let generated_field = &generated["properties"][$field];
+                assert!(
+                    generated_field.is_object(),
+                    "missing exported field {}",
+                    $field
+                );
+                assert_eq!(
+                    generated_field, &checked_in["properties"][$field],
+                    "{} in {} differs from the exported schema",
+                    $field, $file,
+                );
+            }};
+        }
+
+        check_field!(
+            super::TaskAgentReviewPolicy,
+            "task_agent_review_policy.json",
+            "unlimitedRevisionRounds"
+        );
+        check_field!(
+            super::TaskWaitReviewItem,
+            "task_wait_review_item.json",
+            "unlimitedRevisionRounds"
+        );
+        check_field!(
+            super::PublicTaskWaitReviewItem,
+            "public_task_wait_review_item.json",
+            "unlimitedRevisionRounds"
+        );
+        check_field!(
+            super::PublicTaskEventsResponse,
+            "public_task_events_response.json",
+            "operatorRevisionBudgetEvents"
+        );
+    }
+
+    #[test]
+    fn revision_budget_preserves_legacy_finite_policies_and_requires_explicit_patch_value() {
+        let legacy = json!({
+            "mode": "parent_agent",
+            "maxRevisionRounds": 5,
+            "requireExplicitAcceptance": true,
+            "resolutionStrategy": "parent_final"
+        });
+        let mut policy: super::TaskAgentReviewPolicy = serde_json::from_value(legacy).unwrap();
+        assert_eq!(policy.effective_max_revision_rounds(), Some(5));
+        assert!(!policy.allows_revision_after(5));
+        assert!(policy.run_revision_budget.is_none());
+        policy.run_revision_budget = Some(super::TaskRevisionBudget {
+            max_revision_rounds: None,
+        });
+        let persisted = serde_json::to_value(&policy).unwrap();
+        assert_eq!(persisted["maxRevisionRounds"], 5);
+        assert_eq!(
+            persisted["runRevisionBudget"],
+            json!({"maxRevisionRounds": null})
+        );
+        let restored: super::TaskAgentReviewPolicy = serde_json::from_value(persisted).unwrap();
+        assert_eq!(restored.effective_max_revision_rounds(), None);
+        assert!(restored.allows_revision_after(200));
+        assert!(restored.require_explicit_acceptance);
+        assert!(
+            serde_json::from_value::<super::TaskRunRevisionBudgetPatch>(
+                json!({"runId": "run", "budget": {}})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<super::TaskRunRevisionBudgetPatch>(
+                json!({"runId": "run", "budget": {"maxRevisionRounds": null}})
+            )
+            .is_ok()
+        );
     }
 
     #[test]

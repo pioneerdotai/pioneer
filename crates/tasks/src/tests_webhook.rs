@@ -37,7 +37,7 @@ async fn postgres_runtime(
                 review: TaskReviewRuntimeConfig {
                     enabled: true,
                     allow_task_create_review_policy: true,
-                    default_max_revision_rounds: 2,
+                    default_max_revision_rounds: Some(2),
                     auto_accept_after_seconds: 300,
                 },
             },

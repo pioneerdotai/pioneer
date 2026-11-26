@@ -197,7 +197,7 @@ impl Default for TaskRuntimeConfig {
 pub struct TaskReviewRuntimeConfig {
     pub enabled: bool,
     pub allow_task_create_review_policy: bool,
-    pub default_max_revision_rounds: u32,
+    pub default_max_revision_rounds: Option<u32>,
     pub auto_accept_after_seconds: u64,
 }
 
@@ -206,7 +206,7 @@ impl Default for TaskReviewRuntimeConfig {
         Self {
             enabled: false,
             allow_task_create_review_policy: false,
-            default_max_revision_rounds: 5,
+            default_max_revision_rounds: None,
             auto_accept_after_seconds: 300,
         }
     }
@@ -655,7 +655,7 @@ impl TaskService {
                 .find(|run| run.id == candidate.run_id)
                 .ok_or_else(|| anyhow!("task run `{}` not found", candidate.run_id))?,
         );
-        self.validate_review_actor_contract(&response, &candidate, &params.actor, false)
+        self.validate_review_actor_contract(&response, Some(&candidate), &params.actor, false)
             .await?;
         if params.event_kind == TaskResultReviewEventKind::SystemAuto
             && policy.is_some_and(|policy| {
@@ -1039,8 +1039,12 @@ impl TaskService {
         })?;
 
         validate_no_active_candidate_child_turn(&response, &run, "accept")?;
-        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "accept")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor, false)
+        let actor = resolve_parent_or_user_review_actor(
+            &context,
+            Some(candidate.thread_id.as_str()),
+            "accept",
+        )?;
+        self.validate_review_actor_contract(&response, Some(&candidate), &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1080,8 +1084,12 @@ impl TaskService {
         if !response.runs.iter().any(|run| run.id == candidate.run_id) {
             bail!("candidate run not found for task");
         }
-        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "read")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor, true)
+        let actor = resolve_parent_or_user_review_actor(
+            &context,
+            Some(candidate.thread_id.as_str()),
+            "read",
+        )?;
+        self.validate_review_actor_contract(&response, Some(&candidate), &actor, true)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1281,17 +1289,20 @@ impl TaskService {
                 run.id
             )
         })?;
-        if candidate.round >= review_policy.max_revision_rounds {
+        if !review_policy.allows_revision_after(candidate.round) {
             bail!(
-                "task result candidate `{}` reached max_revision_rounds {}",
-                candidate.id,
-                review_policy.max_revision_rounds
+                "task result candidate `{}` reached max_revision_rounds",
+                candidate.id
             );
         }
 
         validate_no_active_candidate_child_turn(&response, &run, "revise")?;
-        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "revise")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor, false)
+        let actor = resolve_parent_or_user_review_actor(
+            &context,
+            Some(candidate.thread_id.as_str()),
+            "revise",
+        )?;
+        self.validate_review_actor_contract(&response, Some(&candidate), &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1348,7 +1359,7 @@ impl TaskService {
             .validate_task_result_candidate_revise(context, &params)
             .await?;
         let now = now_timestamp_secs();
-        let next_round = validated.candidate.round.saturating_add(1);
+        let next_round = validated.candidate.round + 1;
         let child_turn_id = stable_revision_turn_id(validated.candidate.id.as_str(), next_round);
         let task_run_turn_id = task_run_turn_id_for_turn(child_turn_id.as_str());
         let execution_id = self
@@ -1462,7 +1473,8 @@ impl TaskService {
         ];
         let appended = self
             .append_events_with_optional_agent_action(events, now, agent_action)
-            .await?;
+            .await
+            .map_err(revision_budget_write_error)?;
         self.publish_and_wake(appended).await;
 
         let response = self
@@ -1547,8 +1559,12 @@ impl TaskService {
                     params.task_id
                 )
             })?;
-        let actor = resolve_parent_or_user_review_actor(context, &candidate, "revise")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor, false)
+        let actor = resolve_parent_or_user_review_actor(
+            context,
+            Some(candidate.thread_id.as_str()),
+            "revise",
+        )?;
+        self.validate_review_actor_contract(&response, Some(&candidate), &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1632,8 +1648,12 @@ impl TaskService {
                     params.task_id
                 )
             })?;
-        let actor = resolve_parent_or_user_review_actor(context, &candidate, "accept")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor, false)
+        let actor = resolve_parent_or_user_review_actor(
+            context,
+            Some(candidate.thread_id.as_str()),
+            "accept",
+        )?;
+        self.validate_review_actor_contract(&response, Some(&candidate), &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1852,7 +1872,7 @@ impl TaskService {
     async fn validate_review_actor_contract(
         &self,
         response: &TaskGetResponse,
-        candidate: &TaskResultCandidate,
+        candidate: Option<&TaskResultCandidate>,
         actor: &TaskResultReviewActor,
         reading: bool,
     ) -> TaskRuntimeResult<()> {
@@ -1898,7 +1918,7 @@ impl TaskService {
                 if actual_thread != thread_id || workspace != response.task.workspace_id {
                     bail!("reviewer turn does not match its thread/workspace");
                 }
-                if !reading && thread_id == candidate.thread_id {
+                if !reading && candidate.is_some_and(|candidate| thread_id == candidate.thread_id) {
                     bail!("candidate source thread cannot review its own result");
                 }
                 let root = self.collaboration_root_thread_id(thread_id).await?;
@@ -1918,6 +1938,7 @@ impl TaskService {
                 TaskResultReviewerKind::ReviewAgent,
                 TaskResultReviewerRef::AgentExecution(reviewer_execution_id),
             ) => {
+                let candidate = candidate.context("review-agent event requires a candidate")?;
                 let reviewer_thread_id = actor
                     .reviewer_thread_id
                     .as_deref()
@@ -3433,7 +3454,7 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
-        if response.task.finish_request().is_some() {
+        if params.revision_budget.is_none() && response.task.finish_request().is_some() {
             return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
                 .context("task_finish_requested: final stop cannot be reopened or updated"));
         }
@@ -3464,6 +3485,12 @@ impl TaskService {
         {
             bail!("finishRequest is server-owned; use task_finish");
         }
+        if let Some(patch) = params.revision_budget.clone() {
+            return self
+                .update_run_revision_budget(context, response, params.expected_revision, patch)
+                .await;
+        }
+
         let now = now_timestamp_secs();
         let wants_agent_update = update_has_agent_patch(&params);
         let mut task = response.task.clone();
@@ -3624,6 +3651,9 @@ impl TaskService {
                 .map(|mut spec| {
                     spec.id = generate_id(ID_LEN);
                     spec.run_id = None;
+                    if let Some(policy) = spec.review_policy.as_mut() {
+                        policy.run_revision_budget = None;
+                    }
                     spec.created_at = now;
                     spec.updated_at = now;
                     spec
@@ -3833,6 +3863,97 @@ impl TaskService {
             trigger: updated_trigger,
             agent_spec: updated_agent_spec,
             changed_fields,
+        })
+    }
+
+    async fn update_run_revision_budget(
+        &self,
+        context: TaskMutationContext,
+        response: TaskGetResponse,
+        expected_task_revision: Option<i64>,
+        patch: pioneer_protocol::TaskRunRevisionBudgetPatch,
+    ) -> TaskRuntimeResult<TaskUpdateResponse> {
+        let run = response
+            .runs
+            .iter()
+            .find(|run| run.id == patch.run_id && !run.status.is_terminal())
+            .ok_or(crate::TaskOperationError::StateConflict)?;
+        let mut spec = response
+            .agent_spec_for_run(&run.id)
+            .cloned()
+            .ok_or(crate::TaskOperationError::StateConflict)?;
+        let mut policy = response
+            .review_policy_for_run(&run.id)
+            .cloned()
+            .ok_or(crate::TaskOperationError::StateConflict)?;
+        let candidate = response
+            .result_candidates
+            .iter()
+            .filter(|candidate| candidate.run_id == run.id)
+            .max_by_key(|candidate| candidate.round);
+        if context.thread_id.as_ref().is_some_and(|thread| {
+            response
+                .task_run_thread_bindings
+                .iter()
+                .any(|binding| &binding.thread_id == thread)
+                || response
+                    .task_run_turns
+                    .iter()
+                    .any(|turn| &turn.thread_id == thread)
+        }) {
+            return Err(crate::TaskOperationError::AccessDenied.into());
+        }
+        let actor = resolve_parent_or_user_review_actor(
+            &context,
+            candidate.map(|candidate| candidate.thread_id.as_str()),
+            "update revision budget",
+        )?;
+        self.validate_review_actor_contract(&response, candidate, &actor, false)
+            .await?;
+        // Budget management carries no review decision and does not depend on
+        // whether the reviewer quorum has finished for the current candidate.
+        let now = now_timestamp_secs();
+        let expected_agent_spec_id = spec.id.clone();
+        // A legacy fallback copies the task default, so fence against a
+        // concurrent update of that default even without an explicit CAS.
+        let expected_task_revision = expected_task_revision
+            .or_else(|| spec.run_id.is_none().then_some(response.task.revision));
+        if spec.run_id.is_none() {
+            // Older runs can still use the task default. Keep that row and its
+            // bindings intact and snapshot its current values for this run.
+            spec.id = generate_id(ID_LEN);
+            spec.run_id = Some(run.id.clone());
+            spec.created_at = now;
+        }
+        policy.run_revision_budget = Some(patch.budget);
+        spec.review_policy = Some(policy);
+
+        let mutation_id = context
+            .agent_action_commit
+            .as_ref()
+            .map(|action| action.action.id.to_string())
+            .unwrap_or_else(|| generate_id(ID_LEN));
+        let appended = self
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskRunRevisionBudgetUpdated {
+                    task_id: response.task.id.clone(),
+                    run_id: run.id.clone(),
+                    expected_task_revision,
+                    expected_agent_spec_id,
+                    agent_spec: spec.clone(),
+                    mutation_id,
+                }],
+                now,
+                context.agent_action_commit,
+            )
+            .await
+            .map_err(revision_budget_write_error)?;
+        self.publish_and_wake(appended).await;
+        Ok(TaskUpdateResponse {
+            task: response.task,
+            trigger: None,
+            agent_spec: Some(spec),
+            changed_fields: vec!["revisionBudget".to_owned()],
         })
     }
 
@@ -4770,19 +4891,27 @@ impl TaskService {
         &self,
         params: &TaskCreateParams,
     ) -> TaskRuntimeResult<()> {
-        let Some(review_policy) = params.agent_spec.as_ref().and_then(|spec| {
-            spec.review_policy
-                .as_ref()
-                .filter(|policy| policy.is_enabled())
-        }) else {
+        let Some(review_policy) = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.review_policy.as_ref())
+        else {
             return Ok(());
         };
-        // The fixed built-in choice is available without advanced policy admission.
-        // Compare the whole policy, including the configured revision budget;
-        // the timeout opt-in alone must not admit arbitrary reviewer policies.
+        if review_policy.run_revision_budget.is_some() {
+            bail!("runRevisionBudget is server-owned; use task_update on an existing reviewed run");
+        }
+        if !review_policy.is_enabled() {
+            return Ok(());
+        }
+        // Only the budget may vary within built-in explicit review. An override
+        // belongs to one existing run and is never accepted at creation.
+        let mut explicit_policy = self.explicit_review_policy();
+        explicit_policy
+            .set_configured_max_revision_rounds(review_policy.configured_max_revision_rounds());
         if !self.config.review.enabled
             || (!self.config.review.allow_task_create_review_policy
-                && review_policy != &self.explicit_review_policy())
+                && review_policy != &explicit_policy)
         {
             bail!(
                 "task review policy `{}` is not enabled for task_create",
@@ -4797,7 +4926,7 @@ impl TaskService {
 
     /// Model-facing explicit review uses the configured revision budget.
     pub fn explicit_review_policy(&self) -> TaskAgentReviewPolicy {
-        let mut policy = TaskAgentReviewPolicy::parent_agent_default(
+        let mut policy = TaskAgentReviewPolicy::parent_agent_with_revision_limit(
             self.config.review.default_max_revision_rounds,
         );
         policy.disable_timeout_acceptance = true;
@@ -5981,6 +6110,18 @@ fn validate_composer_work_create_params(params: &TaskCreateParams) -> TaskRuntim
 fn validate_update_params(params: &TaskUpdateParams) -> TaskRuntimeResult<()> {
     TaskAdmissionNormalizer::new().validate_update(params)?;
     required_trimmed(params.task_id.as_str(), "task_id")?;
+    if let Some(patch) = params.revision_budget.as_ref() {
+        required_trimmed(&patch.run_id, "run_id")?;
+        let standalone = TaskUpdateParams {
+            task_id: params.task_id.clone(),
+            expected_revision: params.expected_revision,
+            revision_budget: Some(patch.clone()),
+            ..TaskUpdateParams::default()
+        };
+        if params != &standalone {
+            bail!("a run revision budget must be updated separately from task settings");
+        }
+    }
     if params.clear_input && (params.input_text.is_some() || params.input.is_some()) {
         bail!("task update cannot clear and set input in the same request");
     }
@@ -6469,17 +6610,14 @@ fn validate_no_active_candidate_child_turn(
 
 fn resolve_parent_or_user_review_actor(
     context: &TaskMutationContext,
-    candidate: &TaskResultCandidate,
+    source_thread_id: Option<&str>,
     action: &str,
 ) -> TaskRuntimeResult<TaskResultReviewActor> {
     if let (Some(thread_id), Some(turn_id)) =
         (context.thread_id.as_deref(), context.turn_id.as_deref())
     {
-        if action != "read" && thread_id == candidate.thread_id {
-            bail!(
-                "candidate source thread `{}` cannot accept its own result",
-                candidate.thread_id
-            );
+        if action != "read" && Some(thread_id) == source_thread_id {
+            return Err(crate::TaskOperationError::AccessDenied.into());
         }
         return Ok(TaskResultReviewActor {
             reviewer_kind: TaskResultReviewerKind::ParentAgent,
@@ -6850,14 +6988,27 @@ pub fn task_review_wait_item(
 ) -> TaskWaitReviewItem {
     let run = item.run.as_ref().expect("review item has a run");
     let review_policy = wait_review_policy(response, run).cloned();
-    let max_revision_rounds = review_policy
+    let effective_limit = review_policy
         .as_ref()
-        .map(|policy| policy.max_revision_rounds)
-        .unwrap_or_default();
+        .and_then(TaskAgentReviewPolicy::effective_max_revision_rounds);
+    let unlimited_revision_rounds = review_policy.is_some() && effective_limit.is_none();
+    let max_revision_rounds = if unlimited_revision_rounds {
+        u32::MAX
+    } else {
+        effective_limit.unwrap_or(0)
+    };
     let remaining_revision_rounds = max_revision_rounds.saturating_sub(candidate.round);
-    let allowed_actions = wait_review_allowed_actions(candidate.status, remaining_revision_rounds);
-    let revision_blocked_reason =
-        wait_review_revision_blocked_reason(candidate.status, remaining_revision_rounds);
+    let revision_blocked_reason = if review_policy.is_none() {
+        Some(TaskWaitRevisionBlockedReason::ReviewNotAllowed)
+    } else if !wait_review_candidate_can_revise(candidate.status) {
+        Some(TaskWaitRevisionBlockedReason::CandidateNotRevisable)
+    } else if remaining_revision_rounds == 0 {
+        Some(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
+    } else {
+        None
+    };
+    let allowed_actions =
+        wait_review_allowed_actions(candidate.status, revision_blocked_reason.is_none());
 
     TaskWaitReviewItem {
         item,
@@ -6865,6 +7016,7 @@ pub fn task_review_wait_item(
         review_policy,
         max_revision_rounds,
         remaining_revision_rounds,
+        unlimited_revision_rounds,
         allowed_actions,
         revision_blocked_reason,
     }
@@ -6873,45 +7025,33 @@ fn wait_review_policy<'a>(
     response: &'a TaskGetResponse,
     run: &TaskRun,
 ) -> Option<&'a TaskAgentReviewPolicy> {
-    response
-        .agent_specs
-        .iter()
-        .find(|spec| spec.run_id.as_deref() == Some(run.id.as_str()))
-        .and_then(|spec| spec.review_policy.as_ref())
-        .or_else(|| {
-            response
-                .agent_specs
-                .iter()
-                .find(|spec| spec.run_id.is_none())
-                .and_then(|spec| spec.review_policy.as_ref())
-        })
-        .filter(|policy| policy.is_enabled())
+    response.review_policy_for_run(run.id.as_str())
 }
 
 fn wait_review_allowed_actions(
     candidate_status: TaskResultCandidateStatus,
-    remaining_revision_rounds: u32,
+    can_revise: bool,
 ) -> Vec<TaskWaitReviewAction> {
     let mut actions = Vec::new();
     if candidate_status == TaskResultCandidateStatus::PendingReview {
         actions.push(TaskWaitReviewAction::TaskAccept);
     }
-    if wait_review_candidate_can_revise(candidate_status) && remaining_revision_rounds > 0 {
+    if can_revise {
         actions.push(TaskWaitReviewAction::TaskRevise);
     }
     actions.push(TaskWaitReviewAction::TaskCancel);
     actions
 }
 
-fn wait_review_revision_blocked_reason(
-    candidate_status: TaskResultCandidateStatus,
-    remaining_revision_rounds: u32,
-) -> Option<TaskWaitRevisionBlockedReason> {
-    if !wait_review_candidate_can_revise(candidate_status) {
-        return Some(TaskWaitRevisionBlockedReason::CandidateNotRevisable);
+fn revision_budget_write_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<pioneer_crud::TaskRevisionBudgetConflict>()
+        .is_some()
+    {
+        error.context(crate::TaskOperationError::StateConflict)
+    } else {
+        error
     }
-    (remaining_revision_rounds == 0)
-        .then_some(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
 }
 
 fn wait_review_candidate_can_revise(candidate_status: TaskResultCandidateStatus) -> bool {

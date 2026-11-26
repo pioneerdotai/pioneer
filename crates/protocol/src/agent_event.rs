@@ -749,6 +749,7 @@ impl TaskEventPayload {
             | Self::TaskResultCandidateRejected { .. }
             | Self::TaskResultCandidateCancelled { .. }
             | Self::TaskRevisionRequested { .. }
+            | Self::TaskRunRevisionBudgetUpdated { .. }
             | Self::TaskRunEnteredReview { .. }
             | Self::DepthLimitExceeded { .. }
             | Self::DeliveryQueued { .. }

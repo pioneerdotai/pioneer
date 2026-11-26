@@ -954,6 +954,11 @@ async fn task_review_projector_replays_rejection_revision_and_failed_turn_events
         run.task_id = task.id.clone();
         run.trigger_id = None;
         run.run_group_id = run.id.clone();
+        run.status = TaskRunStatus::WaitingReview;
+        let mut spec = crate::test_support::task_projection::sample_task_agent_spec(timestamp);
+        spec.task_id = task.id.clone();
+        spec.run_id = Some(run.id.clone());
+        spec.review_policy = Some(pioneer_protocol::TaskAgentReviewPolicy::parent_agent_default(1));
 
         let initial_turn = TaskRunTurn {
             id: "task_run_turn_revision_initial".to_owned(),
@@ -1052,7 +1057,7 @@ async fn task_review_projector_replays_rejection_revision_and_failed_turn_events
                     TaskEventPayload::TaskCreated { task: task.clone() },
                     TaskEventPayload::RunCreated {
                         run: run.clone(),
-                        agent_spec: None,
+                        agent_spec: Some(spec.clone()),
                     },
                     TaskEventPayload::TaskRunTurnCompleted {
                         task_run_turn: initial_turn,
@@ -1060,34 +1065,92 @@ async fn task_review_projector_replays_rejection_revision_and_failed_turn_events
                     TaskEventPayload::TaskResultCandidateCreated {
                         candidate: candidate.clone(),
                     },
-                    TaskEventPayload::TaskResultReviewEventRecorded {
-                        review_event: review_event.clone(),
-                    },
-                    TaskEventPayload::TaskResultCandidateRejected {
-                        candidate: rejected_candidate,
-                        review_event_id: review_event.id.clone(),
-                    },
-                    TaskEventPayload::TaskRevisionRequested {
-                        task_id: run.task_id.clone(),
-                        run_id: run.id.clone(),
-                        previous_candidate_id: candidate.id.clone(),
-                        requested_by_review_event_id: review_event.id.clone(),
-                        task_run_turn_id: failed_revision_turn.id.clone(),
-                        thread_id: failed_revision_turn.thread_id.clone(),
-                        turn_id: failed_revision_turn.turn_id.clone(),
-                        round: failed_revision_turn.round,
-                        feedback: "tighten result".to_owned(),
-                        requested_at: timestamp + 5,
-                    },
-                    TaskEventPayload::TaskRunTurnFailed {
-                        task_run_turn: failed_revision_turn.clone(),
-                        error: None,
-                    },
                 ],
-                timestamp + 10,
+                timestamp + 3,
             )
+            .await?;
+        let revision = vec![
+            TaskEventPayload::TaskResultReviewEventRecorded {
+                review_event: review_event.clone(),
+            },
+            TaskEventPayload::TaskResultCandidateRejected {
+                candidate: rejected_candidate,
+                review_event_id: review_event.id.clone(),
+            },
+            TaskEventPayload::TaskRevisionRequested {
+                task_id: run.task_id.clone(),
+                run_id: run.id.clone(),
+                previous_candidate_id: candidate.id.clone(),
+                requested_by_review_event_id: review_event.id.clone(),
+                task_run_turn_id: failed_revision_turn.id.clone(),
+                thread_id: failed_revision_turn.thread_id.clone(),
+                turn_id: failed_revision_turn.turn_id.clone(),
+                round: failed_revision_turn.round,
+                feedback: "tighten result".to_owned(),
+                requested_at: timestamp + 5,
+            },
+            TaskEventPayload::TaskRunTurnFailed {
+                task_run_turn: failed_revision_turn.clone(),
+                error: None,
+            },
+        ];
+        // Model a revision prepared against cap=1, followed by a budget
+        // change that wins the task stream lock before that request commits.
+        let update = |max_revision_rounds, mutation_id: &str| {
+            let mut updated = spec.clone();
+            updated.review_policy.as_mut().unwrap().run_revision_budget =
+                Some(pioneer_protocol::TaskRevisionBudget {
+                    max_revision_rounds,
+                });
+            TaskEventPayload::TaskRunRevisionBudgetUpdated {
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                expected_task_revision: None,
+                expected_agent_spec_id: spec.id.clone(),
+                agent_spec: updated,
+                mutation_id: mutation_id.to_owned(),
+            }
+        };
+        events
+            .append_task_events(vec![update(Some(0), "set")], timestamp + 3)
+            .await?;
+        let rejected = events
+            .append_task_events(revision.clone(), timestamp + 10)
             .await
-            .expect("revision events should project");
+            .unwrap_err();
+        assert!(
+            rejected
+                .downcast_ref::<crate::task_projector::TaskRevisionBudgetConflict>()
+                .is_some()
+        );
+        assert_eq!(
+            store.get_task_result_candidate(&candidate.id).await?,
+            Some(candidate.clone())
+        );
+        assert!(
+            store
+                .list_task_result_review_events(&candidate.id)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_task_run_turn(&failed_revision_turn.id)
+                .await?
+                .is_none()
+        );
+
+        let clear = update(None, "clear");
+        events
+            .append_task_events(vec![clear.clone()], timestamp + 4)
+            .await?;
+        events.append_task_events(revision, timestamp + 10).await?;
+        // The same durable update is safe to replay without changing status
+        // or performing a second write, even after the candidate advances.
+        let replay = events
+            .append_task_events(vec![clear], timestamp + 11)
+            .await?;
+        assert!(!replay[0].append_status.is_inserted());
 
         let rejected = store
             .get_task_result_candidate(candidate.id.as_str())
@@ -1106,6 +1169,55 @@ async fn task_review_projector_replays_rejection_revision_and_failed_turn_events
                 .expect("latest turn should load"),
             Some(failed_revision_turn)
         );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_delivery_still_requires_review_without_an_exact_or_base_spec() {
+    pioneer_postgres_test::with_database(async |fixture| {
+        let workspace = "ws_legacy_delivery_review";
+        let db = postgres_store_with_workspace(fixture, workspace).await;
+        let events = TaskEventStore::new(db.clone(), NoFrozenOutput);
+        let at = 1_700_004_000;
+        let mut task = sample_task(at);
+        task.workspace_id = workspace.to_owned();
+        let mut sibling = sample_task_run(at);
+        sibling.trigger_id = None;
+        let mut target = sibling.clone();
+        target.id = "run_legacy_review_target".to_owned();
+        target.run_group_id = target.id.clone();
+        target.run_number += 1;
+        let mut snapshot = crate::test_support::task_projection::sample_task_agent_spec(at);
+        let mut policy = pioneer_protocol::TaskAgentReviewPolicy::parent_agent_default(5);
+        policy.disable_timeout_acceptance = true;
+        snapshot.review_policy = Some(policy.clone());
+        events
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: sibling,
+                        agent_spec: Some(snapshot.clone()),
+                    },
+                    TaskEventPayload::RunCreated {
+                        run: target.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                at,
+            )
+            .await?;
+
+        let facts = crate::task_agent_spec::find_delivery_review_policy(&db, &task.id, &target.id)
+            .await?
+            .expect("legacy result keeps its configured review requirement");
+        assert_eq!(facts.id, snapshot.id);
+        let restored: pioneer_protocol::TaskAgentReviewPolicy =
+            serde_json::from_str(facts.review_policy_json.as_deref().unwrap())?;
+        assert_eq!(restored, policy);
         Ok(())
     })
     .await

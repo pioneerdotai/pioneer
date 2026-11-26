@@ -192,8 +192,9 @@ pub struct GatewayTaskReviewConfig {
     pub enabled: bool,
     #[serde(default = "default_tasks_review_allow_task_create_review_policy")]
     pub allow_task_create_review_policy: bool,
-    #[serde(default = "default_tasks_review_max_revision_rounds")]
-    pub default_max_revision_rounds: u32,
+    /// Optional site default for reviewed tasks. Omit for unlimited revisions.
+    #[serde(default)]
+    pub default_max_revision_rounds: Option<u32>,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
     pub auto_accept_after_seconds: u64,
 }
@@ -270,7 +271,7 @@ impl Default for GatewayTaskReviewConfig {
         Self {
             enabled: default_tasks_review_enabled(),
             allow_task_create_review_policy: default_tasks_review_allow_task_create_review_policy(),
-            default_max_revision_rounds: default_tasks_review_max_revision_rounds(),
+            default_max_revision_rounds: None,
             auto_accept_after_seconds: default_tasks_review_auto_accept_after_seconds(),
         }
     }
@@ -282,10 +283,6 @@ const fn default_tasks_review_enabled() -> bool {
 
 const fn default_tasks_review_allow_task_create_review_policy() -> bool {
     false
-}
-
-const fn default_tasks_review_max_revision_rounds() -> u32 {
-    5
 }
 
 const fn default_tasks_review_auto_accept_after_seconds() -> u64 {
@@ -3986,7 +3983,10 @@ service_name = "com.pioneer.gateway.env"
         assert!(!config.gateway.keepawake);
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
-        assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
+        assert_eq!(
+            config.gateway.tasks.review.default_max_revision_rounds,
+            None
+        );
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
         assert_eq!(config.gateway.cli_agent_runtime.mcp_tools.max_tools, 512);
@@ -5050,8 +5050,13 @@ enabled = false
 
         assert!(!config.review.enabled);
         assert!(!config.review.allow_task_create_review_policy);
-        assert_eq!(config.review.default_max_revision_rounds, 5);
+        assert_eq!(config.review.default_max_revision_rounds, None);
         assert_eq!(config.review.auto_accept_after_seconds, 300);
+        let pinned = toml::from_str::<super::GatewayTasksConfig>(
+            "[review]\ndefault_max_revision_rounds = 5",
+        )
+        .unwrap();
+        assert_eq!(pinned.review.default_max_revision_rounds, Some(5));
     }
 
     #[test]

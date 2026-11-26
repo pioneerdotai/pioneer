@@ -1173,6 +1173,7 @@
           "default": false
         },
         "maxRevisionRounds": {
+          "description": "Configured cap for new occurrences. Unlimited uses u32::MAX for older clients.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -1192,6 +1193,21 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "runRevisionBudget": {
+          "description": "Server-owned override for this occurrence only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRevisionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unlimitedRevisionRounds": {
+          "description": "True when the configured cap is unlimited. A run override takes precedence.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -2014,6 +2030,24 @@
       "required": [
         "maxAttempts",
         "backoff"
+      ]
+    },
+    "TaskRevisionBudget": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "description": "Required. A non-negative integer sets the cap. Null removes the cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "maxRevisionRounds"
       ]
     },
     "TaskRun": {

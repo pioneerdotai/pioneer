@@ -362,9 +362,27 @@ Scheduled, interval, and cron tasks often return `waitable:false` or `runId:null
 `requireReview` defaults to false for every task type and attachment mode.
 Normally pass false. Set true explicitly when each run result requires acceptance
 or same-worker revision; this also applies to scheduled, interval, cron and
-webhook tasks. True has no timeout acceptance and uses the configured saved
-revision budget. The built-in choice requires review to be enabled; arbitrary
-advanced policies retain their existing admission gate.
+webhook tasks. True has no timeout acceptance. Review must be enabled for this
+built-in choice. Arbitrary advanced policies retain their existing admission gate.
+
+At creation, omit `maxRevisionRounds` to use the site default, which ships
+unlimited. An explicit `null` selects unlimited revisions even on a site with a
+finite default. A non-negative integer sets a cap. Zero permits zero requests
+for changes. Round 0 is the initial candidate, so a cap of 5 permits requests
+for changes from rounds 0 through 4.
+
+Inspect `task_get.runs[].reviewBudget.maxRevisionRounds` for the effective cap of
+a reviewed run. In this nested budget, `maxRevisionRounds:null` means unlimited.
+In `task_get.reviewRequired` and `task_wait.reviewRequired`, check
+`unlimitedRevisionRounds` first. True means unlimited. If false or absent, use
+the numeric fields. Zero remaining means the finite budget is exhausted.
+The numeric fields are retained for older clients, so a large number alone
+does not indicate an unlimited budget. Check `allowedActions` before revising.
+
+When reading a saved `reviewPolicy`, `runRevisionBudget` takes precedence if
+present. Otherwise `unlimitedRevisionRounds:true` means the configured cap is
+unlimited, and the numeric `maxRevisionRounds` is authoritative when the flag
+is false or absent.
 
 Read exact candidate references through task_get.reviewRequired or task_wait,
 then page task_result by candidateId. Accept/revise the exact run/candidate under
@@ -372,3 +390,28 @@ current capsule permissions. False completes automatically; task_revise does not
 reopen a completed result. For reviewed background, omitted deliveryPolicy means
 none; explicit permitted policy overrides it for results and terminal errors.
 Background without review and scheduled tasks keep their existing delivery defaults.
+
+
+### Change or remove an active run's revision cap
+
+Use `task_update` with task management and review authority. Pass the exact
+`runId` from `task_get` and supply the cap explicitly. This is a standalone patch.
+
+```json
+{
+  "taskId": "TASK_ID",
+  "revisionBudget": {
+    "runId": "RUN_ID",
+    "budget": { "maxRevisionRounds": null }
+  }
+}
+```
+
+Use a non-negative integer to set or change the cap. Omit `revisionBudget`
+from ordinary task updates to leave it alone. The patch applies only to this
+active reviewed run, including a run waiting for review at an exhausted cap.
+It preserves the current candidate and round count. Future occurrences and new
+run attempts use their own snapshots. A retry of an already-admitted revision
+turn uses the existing execution retry rules. After updating, read the candidate
+and `allowedActions` again, then call `task_revise` with concrete feedback if
+allowed. Accepted or otherwise terminal runs cannot be reopened.

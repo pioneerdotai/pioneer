@@ -1881,7 +1881,7 @@ mod runtime_tests {
 
         assert!(runtime_config.review.enabled);
         assert!(!runtime_config.review.allow_task_create_review_policy);
-        assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
+        assert_eq!(runtime_config.review.default_max_revision_rounds, None);
         assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
     }
 

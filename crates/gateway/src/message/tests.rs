@@ -10122,7 +10122,7 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
         review: pioneer_tasks::TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_max_revision_rounds: 2,
+            default_max_revision_rounds: Some(2),
             auto_accept_after_seconds: 300,
         },
     }
@@ -26252,6 +26252,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26528,6 +26530,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26561,6 +26565,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26609,8 +26615,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         observation_a.child_turn_id.as_deref(),
         Some(candidate_a.turn_id.as_str())
     );
-    assert_eq!(observation_a.max_revision_rounds, 2);
-    assert_eq!(observation_a.remaining_revision_rounds, 2);
+    assert_eq!(observation_a.max_revision_rounds, Some(2));
+    assert_eq!(observation_a.remaining_revision_rounds, Some(2));
     assert!(
         observation_a
             .allowed_actions
@@ -26702,6 +26708,8 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 3,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26926,6 +26934,8 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -27081,6 +27091,8 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),

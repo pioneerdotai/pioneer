@@ -3,7 +3,8 @@ use pioneer_entity::task_agent_spec;
 use pioneer_protocol::TaskAgentSpec;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
 use crate::values::{
@@ -53,6 +54,22 @@ pub async fn upsert_prepared_agent_spec<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to upsert task agent spec")?;
+    Ok(())
+}
+
+pub async fn update_prepared_review_policy<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskAgentSpecProjection,
+) -> Result<()> {
+    let spec = prepared.0;
+    task_agent_spec::ActiveModel {
+        id: spec.id,
+        review_policy_json: spec.review_policy_json,
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .context("failed to update run review policy")?;
     Ok(())
 }
 
@@ -187,9 +204,28 @@ pub async fn find_delivery_review_policy<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to read exact delivery review policy")?;
-    if run_spec.is_some() {
+    if run_spec
+        .as_ref()
+        .is_some_and(|spec| spec.review_policy_json.is_some())
+    {
         return Ok(run_spec);
     }
+    if run_spec.is_some() {
+        // A legacy exact run snapshot can omit its review policy.
+        let base = task_agent_spec::Entity::find()
+            .select_only()
+            .columns(columns)
+            .column_as(policy.clone(), "review_policy_json")
+            .filter(task_agent_spec::Column::TaskId.eq(task_id.to_owned()))
+            .filter(task_agent_spec::Column::RunId.is_null())
+            .order_by_desc(task_agent_spec::Column::CreatedAt)
+            .into_model::<TaskDeliveryReviewPolicyFacts>()
+            .one(db)
+            .await
+            .context("failed to read base delivery review policy")?;
+        return Ok(base.or(run_spec));
+    }
+    // Preserve the original fallback for deliveries with no exact snapshot.
     task_agent_spec::Entity::find()
         .select_only()
         .columns(columns)
@@ -200,6 +236,26 @@ pub async fn find_delivery_review_policy<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to read legacy delivery review policy")
+}
+
+/// An exact snapshot takes precedence unless its policy is absent.
+pub async fn effective_run_review_policy<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    spec: Option<&task_agent_spec::Model>,
+) -> Result<Option<pioneer_protocol::TaskAgentReviewPolicy>> {
+    let policy = match spec {
+        Some(spec) if spec.review_policy_json.is_some() || spec.run_id.is_none() => {
+            spec.review_policy_json.clone()
+        }
+        _ => find_latest_base_agent_spec(db, task_id)
+            .await?
+            .and_then(|spec| spec.review_policy_json),
+    };
+    Ok(
+        optional_json_value_from_db::<pioneer_protocol::TaskAgentReviewPolicy>(policy)?
+            .filter(pioneer_protocol::TaskAgentReviewPolicy::is_enabled),
+    )
 }
 
 pub fn task_agent_spec_from_db_model(
