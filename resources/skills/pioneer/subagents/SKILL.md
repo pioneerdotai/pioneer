@@ -44,7 +44,7 @@ Before delegating, decide whether attached subagents improve the current answer.
 2. If independent focused work improves speed, coverage, verification, or auditability, use `task_create` to create attached subagents.
 3. Create independent child tasks first. Use requireReview:false normally; explicitly select true when the assignment needs formal acceptance and same-worker revisions.
 4. Call `task_wait` until the next child result is terminal or requires review.
-5. Inspect each returned terminal result. For review-required candidates, read complete reviewContent, paging through task_result when necessary.
+5. Inspect each returned result. Read the complete `reviewContent` when available, paging through `task_result` when necessary.
 6. For review-required candidates, accept good work or request revisions. Automatically completed results need no task_accept and cannot be reopened with task_revise. Cancel or detach active work only when appropriate.
 7. Call `task_wait` again for the remaining active runs and repeat the review cycle until all child work is resolved.
 8. Synthesize the parent answer from accepted results and direct parent work.
@@ -132,6 +132,8 @@ An access or runtime error is not proof that a child stopped. Do not recreate wo
 For independent attached subagents, create them all first, then call `task_wait` with `taskIds` or `runIds`. Prefer `runIds` when available. By default, `task_wait` returns as soon as any target is terminal or requires review. Handle every returned result before calling `task_wait` again for the remaining active runs.
 
 The parent may also keep working and check a child with `task_get`. A `running` run has not finished; a missing result or unchanged `updatedAt` does not show that it is stuck. In `task_get`, `execution.heartbeatAt` is a liveness signal, while `execution.lastActivityAt` records confirmed task activity when available. Missing activity data is unknown. Do not cancel or repeat a child's work solely because time passed or repeated observations look the same. A `task_wait` `timedOut` result ends only that wait window; wait again for active attached work when needed.
+
+For an automatically completed child with a saved candidate, `task_wait.completed[]` includes the exact `run.candidateId` and can return `reviewContent` to an authorized result reader within the response budget. If the page is omitted, read from the start with `task_result(candidateId)`. If it is truncated, pass its `nextCursor` as `cursor` with the same `candidateId`. When checking with `task_get`, use `runs[].candidateId` for the exact run.
 
 `task_wait` can return terminal results, pending work, or `reviewRequired`. A review-required candidate is not final. Inspect every candidate and accept only when it satisfies:
 

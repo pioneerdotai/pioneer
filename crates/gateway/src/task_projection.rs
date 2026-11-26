@@ -53,6 +53,7 @@ pub(crate) fn project_task_get_with_configuration(
                     })
                     .max_by_key(|candidate| (candidate.round, candidate.created_at))?;
                 let item = TaskWaitItem {
+                    auto_accepted_candidate_id: None,
                     task: response.task.clone(),
                     run: Some(run.clone()),
                     child_thread_id: None,
@@ -1387,6 +1388,7 @@ mod tests {
                         project_task_tree(&TaskTreeResponse { tree: tree.clone() }, true);
                     assert_eq!(tree_response.operator.unwrap(), tree);
                     let item = TaskWaitItem {
+                        auto_accepted_candidate_id: None,
                         task: response.task.clone(),
                         run: Some(run.clone()),
                         child_thread_id: None,

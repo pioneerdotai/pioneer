@@ -183,14 +183,17 @@ impl NativeToolFamily {
         static TASK_OPTIONS: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
         static TASK_CREATE: std::sync::OnceLock<[ToolSpec; 2]> = std::sync::OnceLock::new();
         static TASK_UPDATE: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
-        let previous_budget_spec = || {
-            let mut spec = self
-                .catalog()
+        static TASK_RESULT: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        let current_spec = || {
+            self.catalog()
                 .iter()
                 .find(|spec| spec.spec.name == name)
                 .expect("current Task tool definition")
                 .spec
-                .clone();
+                .clone()
+        };
+        let previous_budget_spec = || {
+            let mut spec = current_spec();
             crate::task_tools::restore_pre_revision_budget_catalog(&mut spec);
             spec
         };
@@ -217,6 +220,14 @@ impl NativeToolFamily {
             (Self::Tasks, "task_update") => {
                 [Some(TASK_UPDATE.get_or_init(previous_budget_spec)), None]
             }
+            (Self::Tasks, "task_result") => [
+                Some(TASK_RESULT.get_or_init(|| {
+                    let mut spec = current_spec();
+                    crate::task_tools::restore_legacy_task_result_catalog(&mut spec);
+                    spec
+                })),
+                None,
+            ],
             _ => [None, None],
         };
         definitions.into_iter().flatten()
@@ -477,7 +488,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn frozen_task_catalog_and_create_bindings_keep_their_original_identities() {
+    fn frozen_task_bindings_keep_their_original_identities() {
+        let family = NativeToolFamily::Tasks;
+        for name in ["threads_start_options", "task_create", "task_result"] {
+            let legacy = family.legacy_definitions(name).next().unwrap();
+            let (_, fingerprint, _) = canonical_schema_identity(&legacy.parameters).unwrap();
+            let binding = TurnMcpBindingRecord {
+                server_installation_id: family.server_id().into(),
+                server_name: family.server_name().into(),
+                raw_tool_name: name.into(),
+                callable_name: name.into(),
+                canonical_callable_name: name.into(),
+                provider_callable_name: format!("mcp__pioneer__{name}"),
+                catalog_version: family.server_id().into(),
+                fingerprint: family.server_id().into(),
+                canonical_schema_fingerprint: fingerprint,
+                provider_schema_fingerprint: String::new(),
+                annotations_json: "{}".into(),
+                annotations_digest: sha256_hex(b"{}"),
+                effective_timeout_ms: family.timeout_ms(name) as i64,
+                runtime_generation: 1,
+                projection_activation_generation: 1,
+                selection_reason: "implicit_policy".into(),
+                capability_id: None,
+            };
+            let restored = current_identity("workspace", &binding).unwrap();
+            assert_eq!(restored.canonical_schema, legacy.parameters);
+            assert_eq!(
+                restored.description.as_deref(),
+                Some(legacy.description.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_revision_budget_bindings_keep_their_original_identities() {
         let family = NativeToolFamily::Tasks;
         // Fingerprints captured from persisted bindings written before this change.
         for (name, fingerprint, description_hash) in [

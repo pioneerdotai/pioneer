@@ -205,6 +205,9 @@ Later authorized executions in the same capsule can inspect and review saved
 workers under current grants, without creator/graph ownership or adoption.
 `task_get.reviewRequired` exposes current candidate references and available
 actions; read full content through `task_result(candidateId)` and all pages.
+When `task_get.runs[]` includes a `candidateId` for an automatically
+completed run, use it to read the full result through `task_result`.
+Match the exact run ID when the task has multiple runs.
 For recurring/webhook work, decisions target the exact run and candidate, even
 when another run is queued or running. Read access does not require TaskReview;
 self-review, policy eligibility, finality and stale-candidate guards still apply.

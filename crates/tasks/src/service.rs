@@ -5323,7 +5323,8 @@ impl TaskService {
                     .map(|(_, turn)| turn.permission_profile),
                 _ => None,
             };
-            let item = TaskWaitItem {
+            let mut item = TaskWaitItem {
+                auto_accepted_candidate_id: None,
                 task: response.task.clone(),
                 run: run.clone(),
                 child_thread_id: child_anchor.child_thread_id,
@@ -5335,6 +5336,10 @@ impl TaskService {
                 WaitItemState::Completed => {
                     terminal_count = terminal_count.saturating_add(1);
                     if params.return_completed {
+                        item.auto_accepted_candidate_id = run
+                            .as_ref()
+                            .and_then(|run| auto_accepted_candidate_id(&response, run))
+                            .map(str::to_owned);
                         completed.push(item);
                     }
                 }
@@ -5496,6 +5501,7 @@ impl TaskService {
 
         Ok(Some(TaskWaitNonWaitableItem {
             item: TaskWaitItem {
+                auto_accepted_candidate_id: None,
                 task: response.task,
                 run: None,
                 child_thread_id: None,
@@ -6978,6 +6984,53 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
         TaskStatus::WaitingReview => WaitItemState::ReviewRequired,
         _ => WaitItemState::Pending,
     }
+}
+
+/// Reference to a successful run's immutable result when it completed without review.
+pub fn auto_accepted_candidate_id<'a>(
+    response: &'a TaskGetResponse,
+    run: &TaskRun,
+) -> Option<&'a str> {
+    if run.status != TaskRunStatus::Succeeded {
+        return None;
+    }
+
+    // A legacy review policy could permit timeout acceptance. Honor the
+    // run-specific spec before the task default, as the executor does.
+    let review_enabled = response
+        .agent_specs
+        .iter()
+        .rev()
+        .find(|spec| spec.run_id.as_deref() == Some(run.id.as_str()))
+        .or_else(|| {
+            response
+                .agent_specs
+                .iter()
+                .rev()
+                .find(|spec| spec.run_id.is_none())
+        })
+        .and_then(|spec| spec.review_policy.as_ref())
+        .is_some_and(TaskAgentReviewPolicy::is_enabled);
+    if review_enabled {
+        return None;
+    }
+
+    let candidate = response.result_candidates.iter().find(|candidate| {
+        candidate.task_id == run.task_id
+            && candidate.run_id == run.id
+            && candidate.status == TaskResultCandidateStatus::Accepted
+    })?;
+    let event_id = candidate.final_review_event_id.as_deref()?;
+    response
+        .result_review_events
+        .iter()
+        .any(|event| {
+            event.id == event_id
+                && event.candidate_id == candidate.id
+                && event.event_kind == TaskResultReviewEventKind::SystemAuto
+                && event.decision == TaskResultReviewDecision::Accept
+        })
+        .then_some(candidate.id.as_str())
 }
 
 /// Shared lifecycle projection for wait and ordinary task observation.
