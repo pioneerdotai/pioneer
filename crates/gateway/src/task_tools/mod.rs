@@ -1603,11 +1603,18 @@ impl TaskToolHandler {
         Ok(Some(context))
     }
 
-    async fn wait_review_content(
+    async fn wait_result_content(
         &self,
         response: &pioneer_protocol::TaskWaitResponse,
     ) -> Result<BTreeMap<String, PublicTaskReviewContent>, ToolError> {
-        if response.review_required.is_empty() {
+        let completed = response.completed.iter().filter_map(|item| {
+            Some((
+                item.auto_accepted_candidate_id.as_deref()?,
+                item.task.id.as_str(),
+            ))
+        });
+        let has_completed_candidates = completed.clone().next().is_some();
+        if response.review_required.is_empty() && !has_completed_candidates {
             return Ok(BTreeMap::new());
         }
         let Some(context) = self
@@ -1617,14 +1624,45 @@ impl TaskToolHandler {
             return Ok(BTreeMap::new());
         };
 
+        // The wait may have outlived its receiver's original read authority.
+        let completed_authorization = if has_completed_candidates {
+            resolve_task_tool_action_scope(
+                self.processor.as_ref(),
+                &self.context,
+                crate::authorization::ResourceAction::TaskRead,
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
         let service = self.processor.task_runtime.service();
         let mut contents = BTreeMap::new();
-        for item in &response.review_required {
-            // A wait may be visible to a summary-only observer. Failure of the
-            // exact reviewer check therefore withholds content for that item
-            // without turning an otherwise valid observation into an oracle.
+        let candidates = response
+            .review_required
+            .iter()
+            .map(|item| (item.candidate.id.as_str(), None))
+            .chain(completed.map(|(candidate, task)| (candidate, Some(task))));
+        for (candidate_id, completed_task_id) in candidates {
+            if let Some(task_id) = completed_task_id {
+                let Some(authorization) = &completed_authorization else {
+                    continue;
+                };
+                if authorization
+                    .authorize_task(
+                        self.processor.crud_store.as_ref(),
+                        task_id,
+                        crate::authorization::ResourceAction::TaskRead,
+                    )
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            // An otherwise valid observation can still have summary-only access.
             let Ok(candidate) = service
-                .get_task_result_candidate_for_reviewer(context.clone(), item.candidate.id.as_str())
+                .get_task_result_candidate_for_reviewer(context.clone(), candidate_id)
                 .await
             else {
                 continue;
@@ -2387,7 +2425,7 @@ impl TaskToolHandler {
             .wait_tasks(authorization.wait_context(Some(confirmed_activity)), params)
             .await
             .map_err(task_runtime_tool_error)?;
-        let review_content = self.wait_review_content(&response).await?;
+        let review_content = self.wait_result_content(&response).await?;
 
         Ok(function_output(task_wait_tool_output(
             &response,
@@ -4184,11 +4222,11 @@ impl TaskWaitToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for reading the full, reviewer-safe content of one immutable result candidate.
 struct TaskResultToolInput {
-    /// Exact candidate id returned by task_get or task_wait reviewRequired.
+    /// Exact candidate id of an automatically accepted result or a review candidate from task_get or task_wait.
     #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque continuation cursor returned by a previous task_result call.
+    /// Opaque continuation cursor returned by task_result or task_wait.
     #[schemars(length(min = 1, max = 32))]
     cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4661,7 +4699,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESULT_TOOL,
-            "Read reviewer-safe content for the exact immutable candidate returned by task_get or task_wait. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
+            "Read reviewer-safe content for the exact immutable candidate returned by task_get or task_wait. Use the run's candidateId for an automatically completed result or the candidate id from reviewRequired. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
             task_result_schema(),
             safe_read_recovery(),
         ),
@@ -4793,6 +4831,18 @@ pub(crate) fn restore_legacy_task_create_catalog(spec: &mut ToolSpec) {
         "Set useDefaultReasoning=true to use the model's native default instead\n",
         "of inheriting effort; this cannot be combined with reasoning."
     ));
+}
+
+pub(crate) fn restore_legacy_task_result_catalog(spec: &mut ToolSpec) {
+    spec.description = spec.description.replacen(
+        " Use the run's candidateId for an automatically completed result or the candidate id from reviewRequired.",
+        "",
+        1,
+    );
+    spec.parameters["properties"]["candidateId"]["description"] =
+        json!("Exact candidate id returned by task_get or task_wait reviewRequired.");
+    spec.parameters["properties"]["cursor"]["description"] =
+        json!("Opaque continuation cursor returned by a previous task_result call.");
 }
 
 fn task_create_schema() -> JsonValue {
@@ -4930,7 +4980,7 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
             "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
         }
         TASK_RESULT_TOOL => {
-            "Expected field: candidateId from task_get or task_wait reviewRequired. To continue truncated content, also pass the exact nextCursor returned by the previous task_result call."
+            "Expected field: candidateId for the completed run or review candidate returned by task_get or task_wait. To continue truncated content, pass nextCursor from task_wait or task_result as cursor."
         }
         TASK_ACCEPT_TOOL => {
             "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_get or task_wait reviewRequired."
@@ -5947,12 +5997,52 @@ fn task_wait_tool_output(
     signature: &TaskWaitSignature,
     review_content: &BTreeMap<String, PublicTaskReviewContent>,
 ) -> JsonValue {
-    let mut output = serde_json::to_value(
-        crate::task_projection::project_task_wait_with_review_content(response, review_content),
-    )
-    .unwrap_or_else(|_| json!({}));
+    let projected =
+        crate::task_projection::project_task_wait_with_review_content(response, review_content);
+    let mut output = serde_json::to_value(projected).unwrap_or_else(|_| json!({}));
     if let Some(object) = output.as_object_mut() {
         object.insert("waitSignature".to_owned(), signature.to_json());
+    }
+    if let Some(completed) = output
+        .get_mut("completed")
+        .and_then(JsonValue::as_array_mut)
+    {
+        for (item, projected) in response.completed.iter().zip(completed) {
+            if let Some(id) = &item.auto_accepted_candidate_id
+                && let Some(run) = projected.get_mut("run")
+            {
+                run["candidateId"] = json!(id);
+            }
+        }
+    }
+
+    // Each inserted field increases both JSON envelopes by the same number of
+    // bytes. Measure the larger envelope after adding all candidate references.
+    if !response.completed.is_empty() && !review_content.is_empty() {
+        let mut remaining_bytes = pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+            .saturating_sub(pioneer_tools::thread_read_page_bytes(&output));
+        if let Some(completed) = output
+            .get_mut("completed")
+            .and_then(JsonValue::as_array_mut)
+        {
+            for (item, projected) in response.completed.iter().zip(completed) {
+                let Some(content) = item
+                    .auto_accepted_candidate_id
+                    .as_ref()
+                    .and_then(|id| review_content.get(id))
+                else {
+                    continue;
+                };
+                let Ok(content) = serde_json::to_value(content) else {
+                    continue;
+                };
+                let bytes = content.to_string().len() + r#","reviewContent":"#.len();
+                if bytes <= remaining_bytes {
+                    projected["reviewContent"] = content;
+                    remaining_bytes -= bytes;
+                }
+            }
+        }
     }
     output
 }
@@ -5981,8 +6071,16 @@ fn task_get_tool_output(
             observed_at,
         });
     }
-    serde_json::to_value(projected)
-        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))
+    let mut output = serde_json::to_value(projected)
+        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))?;
+    if let Some(runs) = output.get_mut("runs").and_then(JsonValue::as_array_mut) {
+        for (source, projected) in response.runs.iter().zip(runs) {
+            if let Some(id) = pioneer_tasks::auto_accepted_candidate_id(response, source) {
+                projected["candidateId"] = json!(id);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn task_wait_non_waitable_output(
@@ -7240,6 +7338,7 @@ mod tests {
             cancelled: Vec::new(),
             review_required: vec![pioneer_protocol::TaskWaitReviewItem {
                 item: pioneer_protocol::TaskWaitItem {
+                    auto_accepted_candidate_id: None,
                     task: sample_task(TaskStatus::WaitingReview),
                     run: Some(sample_run(TaskRunStatus::WaitingReview)),
                     child_thread_id: Some("thread_child12345678".to_owned()),
@@ -7649,6 +7748,92 @@ mod tests {
         assert_eq!(content["format"], "text");
         assert_eq!(content["content"], "complete immutable candidate");
         assert_eq!(content["truncated"], false);
+    }
+
+    #[test]
+    fn task_wait_keeps_completed_references_when_a_page_exceeds_the_model_budget() {
+        let mut response =
+            sample_review_wait_response(vec![], 0, None, TaskResultCandidateStatus::PendingReview);
+        let review = response.review_required.pop().unwrap();
+        response.review_required_count = 0;
+        response.total_count = 2;
+        response.terminal_count = 2;
+
+        let mut pages = BTreeMap::new();
+        let page_text =
+            "\u{0001}".repeat(crate::task_projection::DEFAULT_TASK_REVIEW_CONTENT_BYTES);
+        for index in 0..2 {
+            let mut item = review.item.clone();
+            item.task.status = TaskStatus::Completed;
+            item.task.id = format!("task-{index}");
+            let run = item.run.as_mut().unwrap();
+            run.status = TaskRunStatus::Succeeded;
+            run.id = format!("run-{index}");
+            run.task_id = item.task.id.clone();
+            run.result = review.candidate.result.clone();
+            let id = format!("candidate-{index}");
+            item.auto_accepted_candidate_id = Some(id.clone());
+            response.completed.push(item);
+            pages.insert(
+                id,
+                PublicTaskReviewContent {
+                    format: pioneer_protocol::PublicTaskReviewContentFormat::Text,
+                    content: page_text.clone(),
+                    total_bytes: page_text.len() as u64,
+                    content_sha256: "sha256:test".to_owned(),
+                    truncated: false,
+                    next_cursor: None,
+                },
+            );
+        }
+        let signature = TaskWaitSignature {
+            task_ids: response
+                .completed
+                .iter()
+                .map(|item| item.task.id.clone())
+                .collect(),
+            run_ids: vec![],
+            mode: TaskWaitMode::AllTerminalOrReviewRequired,
+        };
+
+        let limit = pioneer_protocol::TOOL_RESPONSE_MAX_BYTES;
+        let both_pages = task_wait_tool_output(&response, &signature, &pages);
+        assert!(both_pages["completed"][1].get("reviewContent").is_some());
+        let view_bytes = |value| {
+            pioneer_tools::ToolResultView::Json {
+                value,
+                truncated: false,
+            }
+            .serialized_size_bytes()
+        };
+
+        // Pad the base payload so both pages still fit the view but overflow
+        // the delivered model JSON after its outcome fields are added.
+        let padding = limit - view_bytes(both_pages);
+        response.completed[0]
+            .task
+            .goal
+            .push_str(&"x".repeat(padding));
+        let mut with_both_pages = task_wait_tool_output(&response, &signature, &pages);
+        assert!(pioneer_tools::thread_read_page_fits(&with_both_pages));
+        assert_eq!(
+            with_both_pages["completed"][0]["reviewContent"]["content"],
+            page_text
+        );
+        assert!(
+            with_both_pages["completed"][1]
+                .get("reviewContent")
+                .is_none()
+        );
+        for index in 0..2 {
+            let run = &with_both_pages["completed"][index]["run"];
+            assert_eq!(run["candidateId"], format!("candidate-{index}"));
+            assert_eq!(run["result"]["summary"], "candidate summary");
+        }
+
+        with_both_pages["completed"][1]["reviewContent"] = json!(pages["candidate-1"]);
+        assert!(!pioneer_tools::thread_read_page_fits(&with_both_pages));
+        assert_eq!(view_bytes(with_both_pages), limit);
     }
 
     #[test]

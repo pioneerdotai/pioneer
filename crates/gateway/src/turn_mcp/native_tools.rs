@@ -182,6 +182,7 @@ impl NativeToolFamily {
     fn legacy_definition(self, name: &str) -> Option<&'static ToolSpec> {
         static TASK_OPTIONS: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
         static TASK_CREATE: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        static TASK_RESULT: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
         match (self, name) {
             (Self::Html, pioneer_tools::html::HTML_PREVIEW) => Some(legacy_html_preview_spec()),
             (Self::Tasks, "threads_start_options") => Some(TASK_OPTIONS.get_or_init(|| {
@@ -197,6 +198,17 @@ impl NativeToolFamily {
                     .spec
                     .clone();
                 crate::task_tools::restore_legacy_task_create_catalog(&mut spec);
+                spec
+            })),
+            (Self::Tasks, "task_result") => Some(TASK_RESULT.get_or_init(|| {
+                let mut spec = self
+                    .catalog()
+                    .iter()
+                    .find(|spec| spec.spec.name == name)
+                    .expect("native task_result definition")
+                    .spec
+                    .clone();
+                crate::task_tools::restore_legacy_task_result_catalog(&mut spec);
                 spec
             })),
             _ => None,
@@ -458,9 +470,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn frozen_task_catalog_and_create_bindings_keep_their_original_identities() {
+    fn frozen_task_bindings_keep_their_original_identities() {
         let family = NativeToolFamily::Tasks;
-        for name in ["threads_start_options", "task_create"] {
+        for name in ["threads_start_options", "task_create", "task_result"] {
             let legacy = family.legacy_definition(name).unwrap();
             let (_, fingerprint, _) = canonical_schema_identity(&legacy.parameters).unwrap();
             let binding = TurnMcpBindingRecord {

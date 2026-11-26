@@ -186,6 +186,8 @@ Use for exact current task state.
 
 Use before `task_update` when the update depends on preserving existing schedule, instructions, delivery, or revision.
 
+A run with an automatically accepted candidate includes `runs[].candidateId` alongside its result summary. An authorized result reader can pass that ID to `task_result` and follow `nextCursor` as `cursor` until the result is complete. Match the exact run ID for recurring and webhook tasks.
+
 Each returned run has an `execution` observation: `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. A heartbeat is a periodic liveness mark, not meaningful work progress. `lastActivityAt` is confirmed task activity for the current execution attempt when recorded; `null` means unknown. Task and run `updatedAt` fields do not measure child activity.
 
 ## task_update

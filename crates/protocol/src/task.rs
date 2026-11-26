@@ -2853,6 +2853,9 @@ impl Default for TaskWaitMode {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskWaitItem {
+    /// Internal reference from the same snapshot as the completed run.
+    #[serde(skip)]
+    pub auto_accepted_candidate_id: Option<String>,
     pub task: Task,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<TaskRun>,
