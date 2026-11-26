@@ -393,6 +393,23 @@ fn parse_persisted_trust_level(value: &str) -> Result<pioneer_skills::SkillTrust
     }
 }
 
+#[derive(Clone, Copy)]
+enum AppSkillLockWrite {
+    Budgeted,
+    RemovePackage,
+}
+
+impl AppSkillLockWrite {
+    fn reserve(
+        self,
+        storage: &super::apps::storage::AppStorage,
+        path: &Path,
+        bytes: usize,
+    ) -> Result<super::apps::storage::DiskReservation> {
+        storage.reserve_skill_lock(path, bytes, matches!(self, Self::RemovePackage))
+    }
+}
+
 impl MessageProcessor {
     pub(crate) async fn ensure_skills_lock_v2_locked(
         &self,
@@ -400,8 +417,35 @@ impl MessageProcessor {
         source_kind: SkillSourceKind,
         scope_key: &str,
     ) -> Result<pioneer_skills::SkillsLock> {
+        self.ensure_skills_lock_for_write(lock_path, source_kind, scope_key, None)
+            .await
+    }
+
+    async fn ensure_skills_lock_for_write(
+        &self,
+        lock_path: &Path,
+        source_kind: SkillSourceKind,
+        scope_key: &str,
+        app_write: Option<AppSkillLockWrite>,
+    ) -> Result<pioneer_skills::SkillsLock> {
         let candidates = self
-            .crud_store
+            .skill_lock_conversion_candidates(source_kind, scope_key)
+            .await?;
+        if let Some(write) = app_write {
+            pioneer_skills::ensure_skills_lock_v2_admitted(lock_path, &candidates, |path, bytes| {
+                write.reserve(&self.app_storage, path, bytes)
+            })
+        } else {
+            pioneer_skills::ensure_skills_lock_v2(lock_path, &candidates)
+        }
+    }
+
+    async fn skill_lock_conversion_candidates(
+        &self,
+        source_kind: SkillSourceKind,
+        scope_key: &str,
+    ) -> Result<Vec<pioneer_skills::SkillLockConversionCandidate>> {
+        self.crud_store
             .list_skill_installations()
             .await?
             .into_iter()
@@ -421,8 +465,7 @@ impl MessageProcessor {
                     fingerprint: row.fingerprint,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
-        pioneer_skills::ensure_skills_lock_v2(lock_path, candidates.as_slice())
+            .collect()
     }
 }
 

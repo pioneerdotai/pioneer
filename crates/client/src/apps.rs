@@ -386,7 +386,7 @@ impl crate::core::ClientCore {
             }
             if !matches!(
                 info.state.as_str(),
-                "stopped" | "preparing" | "starting" | "backoff"
+                "stopped" | "preparing" | "waiting" | "starting" | "backoff"
             ) || std::time::Instant::now() >= deadline
             {
                 // Gateway supplies a bounded, credential-redacted output tail
@@ -398,6 +398,11 @@ impl crate::core::ClientCore {
                     runtime_logs = ?info.logs,
                     "App runtime did not become ready"
                 );
+                if info.state == "waiting"
+                    && let Some(reason) = info.diagnostic
+                {
+                    anyhow::bail!("{reason}");
+                }
                 anyhow::bail!("app_not_ready");
             }
             std::thread::sleep(std::time::Duration::from_millis(500));

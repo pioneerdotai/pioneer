@@ -72,6 +72,7 @@ authors = ["Pioneer Contributors"]
 
 [workspace.dependencies]
 microsandbox = { version = "=0.7.15", default-features = false, features = ["local", "net"] }
+microsandbox-metrics = "=0.7.15"
 # Local
 pioneer-compaction = { path = "crates/compaction" }
 pioneer-agent = { path = "crates/agent" }
@@ -231,6 +232,7 @@ icu_collator = "2.4"
 base64 = "0.23"
 url = "2"
 libc = "0.2"
+sysinfo = { version = "0.31.4", default-features = false, features = ["disk", "system"] }
 mime_guess = "2"
 image = "0.25"
 qrcode = { version = "0.14", default-features = false }

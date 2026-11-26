@@ -1,5 +1,7 @@
 //! Gateway-owned authoring connections. Source files are never platform resources.
+use super::super::packages::dev_update_wait_reason;
 use super::super::*;
+use super::storage::AppStorage;
 use anyhow::{Context, Result, ensure};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pioneer_protocol::*;
@@ -236,7 +238,7 @@ impl MessageProcessor {
                         super::super::package_delivery::prepare_cancellable(move |cancel| {
                             pioneer_apps::PreparedAppSource::capture(
                                 &path,
-                                pioneer_apps::PACKAGE_LIMITS,
+                                pioneer_apps::SOURCE_LIMITS,
                                 || cancel.is_cancelled(),
                             )
                         })
@@ -297,7 +299,13 @@ impl MessageProcessor {
                         let source = read_source(&parent)?;
                         let views = self.dev_apps.views.lock().await;
                         let mut diagnostic = views.get(&parent.id).and_then(|v| v.diagnostic.clone());
-                        if diagnostic.is_none() && parent.state == "interrupted" { diagnostic = Some("apps.dev_operation_interrupted; source or component change not applied".into()); }
+                        if diagnostic.is_none() && parent.state == "interrupted" {
+                            diagnostic = Some(
+                                dev_update_wait_reason(&parent)
+                                    .unwrap_or("apps.dev_operation_interrupted; source or component change not applied")
+                                    .into(),
+                            );
+                        }
                         let state = if diagnostic.as_deref().is_some_and(|error| error.starts_with("apps.dev_component_failed")) {
                             "component_error"
                         } else if diagnostic.is_some() {
@@ -886,7 +894,7 @@ impl MessageProcessor {
                         pioneer_packages::Limits {
                             entry_bytes: 1024 * 1024,
                             expanded_bytes: 1024 * 1024,
-                            ..pioneer_apps::PACKAGE_LIMITS
+                            ..pioneer_apps::SOURCE_LIMITS
                         },
                         &BTreeMap::from([(
                             "app.json".into(),
@@ -906,7 +914,7 @@ impl MessageProcessor {
                     // Invalid component content must not hide its directories.
                     if let Ok(snapshot) = pioneer_packages::Snapshot::capture_selected(
                         &path,
-                        pioneer_apps::PACKAGE_LIMITS,
+                        pioneer_apps::SOURCE_LIMITS,
                         plan.entries(),
                         &|| cancel.is_cancelled() || discovery_stop.is_cancelled(),
                     ) {
@@ -923,31 +931,48 @@ impl MessageProcessor {
                     .unwrap_or_else(|p| p.into_inner())
                     .extend(inputs);
             }
-            let captured = super::super::package_delivery::prepare_cancellable(move |cancel| {
-                pioneer_apps::PreparedAppSource::capture(
-                    &path,
-                    pioneer_apps::PACKAGE_LIMITS,
-                    || cancel.is_cancelled() || cancellation.is_cancelled(),
-                )
-            })
-            .await;
             if stop.is_cancelled() {
                 break;
             }
             let retry_watch = watch_error.is_some();
             let outcome: Result<()> = async {
-                if let Some(error) = watch_error {
-                    anyhow::bail!("apps.dev_watch_failed: {error}");
-                }
                 let current = self
                     .crud_store
                     .find_package_installation(&parent.id)
                     .await?
                     .context("apps.dev_removed")?;
-                // Pending package operations belong to the management lifecycle.
-                // Retrying them on our own revision notifications causes a loop.
+                ensure!(
+                    current.enabled && current.state != "removing",
+                    "apps.dev_unavailable"
+                );
+                if let Some(reason) = dev_update_wait_reason(&current) {
+                    // Continue the staged update even if its fingerprint was
+                    // published or the live project has changed again.
+                    let resumed = self
+                        .continue_dev_update(&source.context(), &current, None)
+                        .await;
+                    if let Err(error) = &resumed
+                        && matches!(error.to_string().as_str(), "plugins.busy" | "plugins.stale")
+                    {
+                        anyhow::bail!("{reason}");
+                    }
+                    resumed?;
+                    wake.notify_one();
+                    return Ok(());
+                }
                 ensure!(current.pending_json.is_none(), "apps.dev_mutation_pending");
-                let captured = captured?;
+                if let Some(error) = watch_error {
+                    anyhow::bail!("apps.dev_watch_failed: {error}");
+                }
+                let captured = super::super::package_delivery::prepare_cancellable(move |cancel| {
+                    pioneer_apps::PreparedAppSource::capture(
+                        &path,
+                        pioneer_apps::SOURCE_LIMITS,
+                        || cancel.is_cancelled() || cancellation.is_cancelled(),
+                    )
+                })
+                .await?;
+                ensure!(!stop.is_cancelled(), "apps.cancelled");
                 ensure!(
                     captured.project == source.project,
                     "apps.dev_project_identity_changed"
@@ -973,6 +998,8 @@ impl MessageProcessor {
                     current.enabled && current.state != "removing",
                     "apps.dev_unavailable"
                 );
+                // Lifecycle state may have changed during source capture.
+                ensure!(current.pending_json.is_none(), "apps.dev_mutation_pending");
                 if current.package_fingerprint != captured.package.tree_digest {
                     self.refresh_dev_app(&source.context(), &current, captured)
                         .await?;
@@ -1006,6 +1033,12 @@ impl MessageProcessor {
                 result = self.dev_host_credentials(&parent.id, false) => result.map(|_| ()),
             };
             let outcome = outcome.and(host);
+            // Resource deferral leaves this source change outstanding. A
+            // different App or SDK setup can release capacity silently.
+            let retry_install = outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| AppStorage::install_should_retry(&error.to_string()));
             let mut views = self.dev_apps.views.lock().await;
             let view = views.entry(parent.id.clone()).or_insert_with(|| ViewState {
                 workspace: parent.workspace_id.clone(),
@@ -1039,11 +1072,22 @@ impl MessageProcessor {
                     }
                     Err(error) => {
                         failed_watch = true;
-                        if let Some(view) = self.dev_apps.views.lock().await.get_mut(&parent.id) {
+                        if !retry_install
+                            && let Some(view) = self.dev_apps.views.lock().await.get_mut(&parent.id)
+                        {
                             view.diagnostic = Some(format!("apps.dev_watch_failed: {error}"));
                         }
                     }
                 }
+            }
+            if retry_install {
+                // A failed Continue publishes a new revision. Keep the delay
+                // even if that notification is already queued.
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                }
+                continue;
             }
             if failed_watch || retry_watch {
                 tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }

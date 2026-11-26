@@ -24,12 +24,31 @@ const UPLOAD_STATUS_CONSUMED: &str = "consumed";
 const UPLOAD_STATUS_ABORTED: &str = "aborted";
 const UPLOAD_STATUS_EXPIRED: &str = "expired";
 
+pub(in crate::message) struct SkillUploadOwner {
+    pub(in crate::message) owner: AuthenticatedTransferOwner,
+    archive_space: Option<Arc<crate::message::apps::storage::DiskReservation>>,
+}
+
+#[cfg(test)]
+impl From<AuthenticatedTransferOwner> for SkillUploadOwner {
+    fn from(owner: AuthenticatedTransferOwner) -> Self {
+        Self {
+            owner,
+            archive_space: None,
+        }
+    }
+}
+
 pub(crate) struct MaterializedSkillSource {
     pub source_dir: PathBuf,
     pub cleanup_root: PathBuf,
     pub upload: SkillUploadSessionRecord,
     pub(in crate::message) package_limits: pioneer_packages::Limits,
-    _cleanup: super::TemporaryDirectory,
+    pub(in crate::message) cleanup: Arc<super::TemporaryDirectory>,
+    pub(in crate::message) publication_space:
+        Option<crate::message::apps::storage::DiskReservation>,
+    pub(in crate::message) app_install:
+        Option<Arc<crate::message::apps::storage::AppInstallAdmission>>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +189,31 @@ impl MessageProcessor {
         let upload_dir = workspace_upload_dir.join(upload_id.as_str());
         let payload_path = upload_dir.join("payload.tar.gz");
 
+        let archive_space = if params.purpose == SkillUploadPurpose::App {
+            let storage = self.app_storage.clone();
+            let path = upload_dir.clone();
+            let compressed = params.compressed_size_bytes;
+            match super::prepare(move || storage.reserve_archive(&path, compressed))
+                .await
+                .and_then(|result| result)
+            {
+                Ok(reservation) => Some(Arc::new(reservation)),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        crate::message::packages::plugin_error(
+                            &request_id,
+                            crate::message::apps::storage::AppStorage::error_code(&error),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         let directory_change = self
             .crud_store
             .database_connection()
@@ -228,10 +272,13 @@ impl MessageProcessor {
             .await;
             return;
         }
-        self.skill_upload_owners
-            .lock()
-            .await
-            .insert(upload_id.clone(), authenticated_owner);
+        self.skill_upload_owners.lock().await.insert(
+            upload_id.clone(),
+            SkillUploadOwner {
+                owner: authenticated_owner,
+                archive_space,
+            },
+        );
 
         let payload = SkillsUploadStartResponse {
             upload_id,
@@ -444,6 +491,16 @@ impl MessageProcessor {
             }
         };
 
+        if upload.purpose == "app"
+            && let Some(owner) = self
+                .skill_upload_owners
+                .lock()
+                .await
+                .get_mut(&upload.upload_id)
+        {
+            owner.archive_space.take();
+        }
+
         let payload = SkillsUploadFinishResponse {
             upload_id: updated.upload_id,
             status: updated.status,
@@ -592,15 +649,23 @@ impl MessageProcessor {
             );
             return;
         };
-        if !self
-            .skill_upload_owner_matches(upload.upload_id.as_str(), &authenticated_owner)
-            .await
-        {
-            warn!(
-                connection_id,
-                upload_id = header.upload_id.as_str(),
-                "upload chunk referenced a foreign authenticated context"
-            );
+        let archive_space = {
+            let owners = self.skill_upload_owners.lock().await;
+            let Some(owner) = owners
+                .get(&upload.upload_id)
+                .filter(|owner| owner.owner == authenticated_owner)
+            else {
+                warn!(
+                    connection_id,
+                    upload_id = header.upload_id.as_str(),
+                    "upload chunk referenced a foreign authenticated context"
+                );
+                return;
+            };
+            owner.archive_space.clone()
+        };
+        if upload.purpose == "app" && archive_space.is_none() {
+            warn!(connection_id, "App upload has no disk reservation");
             return;
         }
 
@@ -690,6 +755,7 @@ impl MessageProcessor {
         let worker_hold = hold.clone();
         let written = super::prepare(move || {
             let _hold = worker_hold;
+            let _archive_space = archive_space;
             if let Some(parent) = payload_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -752,6 +818,7 @@ impl MessageProcessor {
                 &self.package_delivery_context(),
                 request_id,
                 "skill",
+                None,
             )
             .await?;
         match validate_single_skill_root(materialized.source_dir.clone()).and_then(|source_dir| {
@@ -786,6 +853,7 @@ impl MessageProcessor {
                 &self.package_delivery_context(),
                 request_id,
                 "skill",
+                None,
             )
             .await?;
         match validate_skill_pack_root(materialized.source_dir.clone()).and_then(|validated| {
@@ -811,6 +879,7 @@ impl MessageProcessor {
         context: &crate::message::package_delivery::PackageDeliveryContext,
         request_id: &RequestId,
         purpose: &str,
+        app_publication: Option<&Path>,
     ) -> Result<MaterializedSkillSource, JsonRpcErrorResponse> {
         let upload = {
             let _guard = self.acquire_skill_upload_lock(upload_id).await;
@@ -844,6 +913,31 @@ impl MessageProcessor {
         } else {
             limits.plugin_limits()
         };
+        let (app_install, extraction_space, publication_space) = if purpose == "app" {
+            let publication = app_publication
+                .context("missing App publication path")
+                .map_err(|error| invalid_materialized_archive_error(request_id, error))?;
+            let writes = self
+                .app_storage
+                .admit_install(
+                    Some((Path::new(&upload.payload_path), &cleanup_root)),
+                    publication,
+                )
+                .await
+                .map_err(|error| {
+                    crate::message::packages::plugin_error(
+                        request_id,
+                        crate::message::apps::storage::AppStorage::error_code(&error),
+                    )
+                })?;
+            (
+                Some(writes.admission),
+                Some(writes.extraction),
+                Some(writes.publication),
+            )
+        } else {
+            (None, None, None)
+        };
         let cleanup = super::TemporaryDirectory::new()
             .map_err(|error| invalid_materialized_archive_error(request_id, error))?;
         let prepared = crate::message::package_delivery::prepare_cancellable(move |cancellation| {
@@ -852,13 +946,17 @@ impl MessageProcessor {
                 cleanup_root,
                 upload,
                 package_limits,
-                _cleanup: cleanup,
+                cleanup: Arc::new(cleanup),
+                publication_space,
+                app_install,
             };
             let result = fs::create_dir_all(source.cleanup_root.parent().expect("scratch parent"))
                 .and_then(|()| fs::create_dir(&source.cleanup_root))
                 .map_err(anyhow::Error::from)
                 .and_then(|()| {
-                    source._cleanup.remove_on_drop(source.cleanup_root.clone());
+                    Arc::get_mut(&mut source.cleanup)
+                        .expect("unpublished materialized directory")
+                        .remove_on_drop(source.cleanup_root.clone());
                     let archive = PathBuf::from(&source.upload.payload_path);
                     extract_archive_with_purpose_cancellable(
                         &archive,
@@ -867,9 +965,11 @@ impl MessageProcessor {
                         limits.max_upload_archive_entries,
                         limits.max_file_bytes,
                         matches!(source.upload.purpose.as_str(), "plugin" | "app"),
+                        (source.upload.purpose == "app").then_some(package_limits.depth),
                         cancellation,
                     )
                 });
+            drop(extraction_space);
             match result {
                 Ok(path) => {
                     source.source_dir = path;
@@ -1352,7 +1452,7 @@ impl MessageProcessor {
             .lock()
             .await
             .get(upload_id)
-            .is_some_and(|expected| expected == owner)
+            .is_some_and(|expected| &expected.owner == owner)
     }
 
     async fn send_upload_not_found(&self, connection_id: ConnectionId, request_id: RequestId) {
@@ -1702,16 +1802,18 @@ fn extract_archive_with_purpose(
         max_entries,
         max_file_bytes,
         plugin,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
 }
 // A hard decoded-stream limit includes hidden GNU/PAX extension bodies,
 // padding and skips performed by tar before it returns logical entries.
-struct DecodedBudget<R> {
+struct DecodedBudget<'a, R> {
     inner: R,
     remaining: usize,
+    header: &'a std::cell::Cell<Option<usize>>,
 }
-impl<R: io::Read> io::Read for DecodedBudget<R> {
+impl<R: io::Read> io::Read for DecodedBudget<'_, R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
@@ -1725,9 +1827,19 @@ impl<R: io::Read> io::Read for DecodedBudget<R> {
                 )),
             };
         }
-        let length = bytes.len().min(self.remaining);
+        let header = self.header.get();
+        if header == Some(0) {
+            return Err(io::Error::other(
+                "App archive header exceeds the metadata limit",
+            ));
+        }
+        let length = bytes
+            .len()
+            .min(self.remaining)
+            .min(header.unwrap_or(usize::MAX));
         let read = self.inner.read(&mut bytes[..length])?;
         self.remaining -= read;
+        self.header.set(header.map(|remaining| remaining - read));
         Ok(read)
     }
 }
@@ -1738,6 +1850,7 @@ fn extract_archive_with_purpose_cancellable(
     max_entries: usize,
     max_file_bytes: usize,
     plugin: bool,
+    app_depth: Option<usize>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<PathBuf> {
     super::check_preparation(cancellation)?;
@@ -1753,15 +1866,20 @@ fn extract_archive_with_purpose_cancellable(
         .and_then(|overhead| max_uncompressed_bytes.checked_add(overhead))
         .and_then(|bytes| bytes.checked_add(1024 * 1024))
         .context("archive decoded budget overflow")?;
+    // tar reads and buffers GNU/PAX extension bodies while advancing its
+    // iterator. Bound that read separately from the streamed file payloads.
+    let header_budget = std::cell::Cell::new(None);
     let mut archive = Archive::new(super::preparation_reader(
         DecodedBudget {
             inner: decoder,
             remaining: decoded_budget,
+            header: &header_budget,
         },
         cancellation,
     ));
     let mut root_name: Option<std::ffi::OsString> = None;
     let mut seen_paths = HashSet::new();
+    let mut app_paths = HashSet::new();
     let mut total_uncompressed = 0usize;
     let mut entry_count = 0usize;
     let cleanup_root = fs::canonicalize(cleanup_root).with_context(|| {
@@ -1771,8 +1889,15 @@ fn extract_archive_with_purpose_cancellable(
         )
     })?;
 
-    for entry in archive.entries().context("failed to read skill archive")? {
+    let mut entries = archive.entries().context("failed to read skill archive")?;
+    loop {
         super::check_preparation(cancellation)?;
+        header_budget.set(app_depth.map(|_| 1024 * 1024));
+        let next = entries.next();
+        header_budget.set(None);
+        let Some(entry) = next else {
+            break;
+        };
         let mut entry = entry.context("failed to read archive entry")?;
         entry_count = entry_count.saturating_add(1);
         if entry_count > max_entries {
@@ -1782,11 +1907,39 @@ fn extract_archive_with_purpose_cancellable(
         let raw_path = entry.path().context("failed to read archive entry path")?;
         let normalized = normalize_archive_path(raw_path.as_ref())?;
         if normalized.as_os_str().is_empty() {
+            if app_depth.is_some() {
+                io::copy(&mut entry, &mut io::sink())?;
+            }
             continue;
         }
         let Some(first_component) = normalized.components().next() else {
             continue;
         };
+        if let Some(depth) = app_depth {
+            anyhow::ensure!(
+                normalized.components().count() <= depth + 1
+                    && normalized
+                        .strip_prefix(Path::new(first_component.as_os_str()))?
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        <= 4096,
+                "App archive path exceeds the package limit"
+            );
+            for path in normalized
+                .ancestors()
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                if !app_paths.insert(path.to_owned()) {
+                    break;
+                }
+                // The wrapper directory is not one of the package entries.
+                anyhow::ensure!(
+                    app_paths.len() <= max_entries + 1,
+                    "App archive path count exceeds the package limit"
+                );
+            }
+        }
         let root_component = first_component.as_os_str().to_os_string();
         match root_name.as_ref() {
             Some(existing) if existing != &root_component => {
@@ -1807,6 +1960,9 @@ fn extract_archive_with_purpose_cancellable(
         }
 
         if entry_type.is_dir() {
+            if app_depth.is_some() {
+                io::copy(&mut entry, &mut io::sink())?;
+            }
             if plugin {
                 directory_modes.push((
                     target_path.clone(),
@@ -1873,6 +2029,7 @@ fn extract_archive_with_purpose_cancellable(
         ensure_materialized_path_contained(cleanup_root.as_path(), target_path.as_path())?;
     }
 
+    drop(entries);
     // TAR's zero terminator is not a successful artificial EOF at the budget.
     // Drain decoded padding/trailer through the same hard bound and checkpoint.
     io::copy(&mut archive.into_inner(), &mut io::sink())?;

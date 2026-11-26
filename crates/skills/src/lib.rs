@@ -57,9 +57,11 @@ pub use installer::{
     ReversibleSkillRemovalBatch, ReversibleSkillRemovalTarget, SkillInstallerPolicy,
     StageReversibleSkillRemovalsRequest, StagedSkillFolder, UninstallSkillRequest,
     UninstallSkillResult, UpdateSkillRequest, canonical_skill_install_path, commit_prepared_skill,
-    finalize_prepared_skill_commit, finalize_reversible_skill_removals, install_skill,
-    prepare_materialized_skill, rollback_prepared_skill_commit, rollback_reversible_skill_removals,
-    stage_reversible_skill_removals, stage_skill_folder, uninstall_skill, update_skill,
+    commit_prepared_skill_admitted, finalize_prepared_skill_commit,
+    finalize_reversible_skill_removals, install_skill, prepare_materialized_skill,
+    rollback_prepared_skill_commit, rollback_reversible_skill_removals, stage_app_skill_folder,
+    stage_reversible_skill_removals, stage_skill_folder, uninstall_skill, uninstall_skill_admitted,
+    uninstall_skill_reclaiming, update_skill,
 };
 pub use pioneer_protocol::SkillId;
 pub use policy::{
@@ -72,8 +74,8 @@ pub use prompt::{
 };
 pub use provenance::{
     SkillLockConversionCandidate, SkillLockEntry, SkillsLock, ensure_skills_lock_v2,
-    find_lock_entry, read_skills_lock, remove_lock_entry, upsert_lock_entry,
-    write_skills_lock_atomic, write_skills_lock_atomic_tracked,
+    ensure_skills_lock_v2_admitted, find_lock_entry, read_skills_lock, remove_lock_entry,
+    upsert_lock_entry, write_skills_lock_atomic, write_skills_lock_atomic_tracked,
 };
 pub use resolver::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillResolutionInput,

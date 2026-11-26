@@ -15,9 +15,70 @@ pub struct LoadedAppPackage {
     /// Validated references keyed by canonical package path, covering both themes.
     pub images: BTreeMap<String, pioneer_protocol::ImageReference>,
 }
+/// Index release payloads for streaming; retain only documents the App
+/// loaders interpret. The second manifest read must match the first.
+pub fn capture_release(
+    root: &std::path::Path,
+    limits: pioneer_packages::Limits,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Snapshot> {
+    let mut manifest_limits = limits;
+    manifest_limits.entry_bytes = manifest_limits.entry_bytes.min(1024 * 1024);
+    let manifest_entry =
+        BTreeMap::from([("app.json".to_owned(), pioneer_packages::SelectionKind::File)]);
+    let first = Snapshot::capture_selected(root, manifest_limits, &manifest_entry, &cancelled)?;
+    let manifest_bytes = first
+        .file("app.json")
+        .ok_or_else(|| ManifestError::new("missing_manifest", "app.json"))?;
+    let manifest = AppManifest::parse(manifest_bytes)?;
+    let document = manifest.document();
+    let mut retain = std::collections::BTreeSet::from(["app.json".to_owned()]);
+    retain.extend(manifest.locales().values().cloned());
+    for reference in [
+        document.get("icon"),
+        document.get("composerIcon"),
+        document["developer"].get("logo"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for theme in ["light", "dark"] {
+            retain.insert(path(
+                reference[theme].as_str().expect("validated path"),
+                "image",
+            )?);
+        }
+    }
+    if let Some(config) = document["mcp"]["config"].as_str() {
+        retain.insert(path(config, "app.json/mcp/config")?);
+    }
+    let skills = document["skills"]
+        .as_str()
+        .map(|directory| path(directory, "app.json/skills").map(|key| format!("{key}/")))
+        .transpose()?;
+    let snapshot = Snapshot::capture_file_backed(
+        root,
+        limits,
+        |key| {
+            retain.contains(key)
+                || skills.as_ref().is_some_and(|prefix| {
+                    key.strip_prefix(prefix)
+                        .and_then(|relative| relative.split_once('/'))
+                        .is_some_and(|(_, file)| file == "SKILL.md")
+                })
+        },
+        cancelled,
+    )?;
+    anyhow::ensure!(
+        snapshot.file("app.json") == Some(manifest_bytes),
+        "source_changed"
+    );
+    Ok(snapshot)
+}
+
 pub fn load(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestError> {
     let manifest = SelectionPlan::validate_package(snapshot)?;
-    load_validated(snapshot, manifest)
+    load_validated(snapshot, manifest, || false)
 }
 /// Prepare an authoring snapshot without applying release executable/checksum rules.
 /// Component and presentation validation is shared with ordinary installation.
@@ -29,7 +90,7 @@ pub fn load_source(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestErro
             .ok_or_else(|| ManifestError::new("missing_manifest", "app.json"))?,
     )?;
     SelectionPlan::for_source(&manifest)?.validate_snapshot(snapshot)?;
-    let loaded = load_validated(snapshot, manifest)?;
+    let loaded = load_validated(snapshot, manifest, || false)?;
     if let Some(diagnostic) = loaded.diagnostics.first() {
         return Err(ManifestError::new(
             "invalid_source_component",
@@ -43,12 +104,34 @@ pub fn load_for_architecture(
     snapshot: &Snapshot,
     architecture: &str,
 ) -> Result<LoadedAppPackage, ManifestError> {
-    let manifest = SelectionPlan::validate_package_for_architecture(snapshot, architecture)?;
-    load_validated(snapshot, manifest)
+    load_for_architecture_cancellable(snapshot, architecture, || false)
 }
+
+pub fn load_for_architecture_cancellable(
+    snapshot: &Snapshot,
+    architecture: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<LoadedAppPackage, ManifestError> {
+    let manifest =
+        SelectionPlan::validate_for_architecture_cancellable(snapshot, architecture, &cancelled)?;
+    load_validated(snapshot, manifest, cancelled)
+}
+
+/// Select and validate the published tree in one operation.
+pub fn select_release(
+    snapshot: &Snapshot,
+    architecture: &str,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<(Snapshot, LoadedAppPackage)> {
+    let selected = SelectionPlan::prune_other_architectures(snapshot, architecture)?;
+    let plan = load_for_architecture_cancellable(&selected, architecture, cancelled)?;
+    Ok((selected, plan))
+}
+
 fn load_validated(
     snapshot: &Snapshot,
     manifest: AppManifest,
+    cancelled: impl Fn() -> bool,
 ) -> Result<LoadedAppPackage, ManifestError> {
     let localizations = manifest.load_localizations(|p| snapshot.file(p))?;
     let mut components = Vec::new();
@@ -109,7 +192,9 @@ fn load_validated(
                 components.push(ComponentPlan::Skill {
                     member_key: name.into(),
                     member_path: key.clone(),
-                    tree_digest: snapshot.member_digest(key),
+                    tree_digest: snapshot
+                        .checked_member_digest_cancellable(key, &cancelled)
+                        .map_err(|_| ManifestError::new("source_changed", key))?,
                 });
             } else {
                 diagnostics.push(Diagnostic::new(
@@ -165,7 +250,9 @@ fn load_validated(
             }
         }
     }
-    let tree_digest = snapshot.tree_digest();
+    let tree_digest = snapshot
+        .checked_tree_digest_cancellable(cancelled)
+        .map_err(|_| ManifestError::new("source_changed", "app.json"))?;
     Ok(LoadedAppPackage {
         manifest,
         localizations,

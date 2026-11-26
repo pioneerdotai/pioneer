@@ -324,13 +324,19 @@ impl MessageProcessor {
             }
         }
         if let Err(error) = self
-            .ensure_skills_lock_v2_locked(
+            .ensure_skills_lock_for_write(
                 location.lock_path.as_path(),
                 source_kind,
                 workspace_id.as_str(),
+                materialized
+                    .is_app_member()
+                    .then_some(AppSkillLockWrite::Budgeted),
             )
             .await
         {
+            if let Some(response) = super::source::app_skill_capacity_error(&request_id, &error) {
+                return Err(response);
+            }
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -417,7 +423,8 @@ impl MessageProcessor {
             return Ok((payload, None));
         }
 
-        let update_result = match pioneer_skills::commit_prepared_skill(
+        let (committed, _lock_space) = materialized.commit(
+            &self.app_storage,
             pioneer_skills::CommitPreparedSkillRequest {
                 operation: pioneer_skills::InstallOperation::Update,
                 prepared,
@@ -431,9 +438,14 @@ impl MessageProcessor {
                 now_unix: now,
                 policy: installer_policy(&context),
             },
-        ) {
+        );
+        let update_result = match committed {
             Ok(result) => result,
             Err(error) => {
+                if let Some(response) = super::source::app_skill_capacity_error(&request_id, &error)
+                {
+                    return Err(response);
+                }
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_UPDATE);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);

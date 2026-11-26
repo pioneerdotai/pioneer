@@ -146,14 +146,18 @@ pub(super) async fn remove(
     .await
 }
 
-pub(super) async fn recover(backend: Arc<LocalBackend>) -> Result<()> {
-    // Startup cancellation does not abandon resources recovered from the last
-    // Gateway process. Its worker joins this bounded-per-operation SDK cleanup.
-    let cancel = tokio_util::sync::CancellationToken::new();
+pub(super) async fn recover(
+    backend: Arc<LocalBackend>,
+    storage: &super::storage::AppStorage,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    use microsandbox::sandbox::VolumeMount;
     let scoped: Arc<dyn microsandbox::Backend> = backend.clone();
     microsandbox::with_backend(scoped, async {
         let mut cursor = None;
+        let mut survivors = Vec::new();
         loop {
+            anyhow::ensure!(!shutdown.is_cancelled(), "apps.cancelled");
             let page = cleanup_before(tokio::time::Instant::now() + CLEANUP_BUDGET, async {
                 Ok(microsandbox::Sandbox::list_with(|query| {
                     let query = query.limit(64);
@@ -166,29 +170,92 @@ pub(super) async fn recover(backend: Arc<LocalBackend>) -> Result<()> {
             })
             .await?;
             cursor = page.next_cursor;
-            for handle in page.sandboxes {
-                if !owned_name(handle.name()) {
-                    continue;
-                }
-                prepare(&backend, &cancel).await?;
-                cleanup_before(tokio::time::Instant::now() + CLEANUP_BUDGET, async {
-                    handle
-                        .destroy_with(microsandbox::sandbox::DestroyOptions {
-                            force: true,
-                            timeout: CLEANUP_BUDGET,
-                        })
-                        .await?;
-                    Ok(())
-                })
-                .await?;
-            }
+            survivors.extend(
+                page.sandboxes
+                    .into_iter()
+                    .filter(|handle| owned_name(handle.name())),
+            );
             if cursor.is_none() {
                 break;
             }
         }
+        if survivors.is_empty() {
+            return Ok(());
+        }
+
+        // Only narrow the fence after a complete catalog pass. A legacy VM
+        // can still own a writable bind outside the current App home.
+        let paths = (|| -> Result<Vec<std::path::PathBuf>> {
+            let mut paths = storage_paths(&backend);
+            for handle in &survivors {
+                let stored = handle.config()?;
+                let active = handle.active_config()?;
+                for config in std::iter::once(stored).chain(active) {
+                    for mount in config.spec.mounts {
+                        match mount {
+                            VolumeMount::Bind { host, options, .. } => {
+                                if !options.readonly {
+                                    paths.push(host.canonicalize()?);
+                                }
+                            }
+                            _ => bail!("apps.runtime_recovery_mount_unknown"),
+                        }
+                    }
+                }
+            }
+            Ok(paths)
+        })();
+        if let Err(error) = paths.and_then(|paths| storage.fence_recovery_paths(&paths)) {
+            storage.set_recovering(true);
+            tracing::debug!(%error, "App recovery could not determine all writable volumes");
+        }
+
+        prepare(&backend, shutdown).await?;
+        for handle in survivors {
+            anyhow::ensure!(!shutdown.is_cancelled(), "apps.cancelled");
+            // An in-progress destroy must settle even when shutdown is requested.
+            cleanup_before(tokio::time::Instant::now() + CLEANUP_BUDGET, async {
+                handle
+                    .destroy_with(microsandbox::sandbox::DestroyOptions {
+                        force: true,
+                        timeout: CLEANUP_BUDGET,
+                    })
+                    .await?;
+                Ok(())
+            })
+            .await?;
+        }
         Ok(())
     })
     .await
+}
+
+pub(super) fn storage_paths(backend: &LocalBackend) -> Vec<std::path::PathBuf> {
+    let config = backend.config();
+    let home = config.home();
+    let mut paths = vec![
+        backend.sandboxes_dir(),
+        backend.cache_dir(),
+        backend.logs_dir(),
+        backend.volumes_dir(),
+        backend.snapshots_dir(),
+        backend.secrets_dir(),
+        config.run_dir(),
+        home.join("bin"),
+        home.join("lib"),
+        home.join("db"),
+        home,
+    ];
+    paths.extend(
+        [
+            &config.paths.msb,
+            &config.paths.libkrunfw,
+            &config.paths.agentd,
+        ]
+        .into_iter()
+        .filter_map(|path| path.as_ref()?.parent().map(Path::to_owned)),
+    );
+    paths
 }
 
 #[cfg(test)]

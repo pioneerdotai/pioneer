@@ -107,8 +107,32 @@ pub fn ensure_skills_lock_v2(
     path: &Path,
     candidates: &[SkillLockConversionCandidate],
 ) -> Result<SkillsLock> {
+    ensure_skills_lock_v2_admitted(path, candidates, |_, _| Ok(()))
+}
+
+/// Admit a legacy lockfile rewrite after its exact payload has been produced.
+pub fn ensure_skills_lock_v2_admitted<T>(
+    path: &Path,
+    candidates: &[SkillLockConversionCandidate],
+    reserve: impl FnOnce(&Path, usize) -> Result<T>,
+) -> Result<SkillsLock> {
+    let (lock, needs_conversion) = read_skills_lock_for_write(path, candidates)?;
+    if needs_conversion {
+        let payload = encode_skills_lock(&lock)?;
+        let _space = reserve(path, payload.len())?;
+        write_encoded_skills_lock_atomic(path, &payload, |_| {})?;
+    }
+    Ok(lock)
+}
+
+/// Decode legacy provenance without writing it. The caller can publish the
+/// converted lock together with its own edit in a single atomic replacement.
+pub(crate) fn read_skills_lock_for_write(
+    path: &Path,
+    candidates: &[SkillLockConversionCandidate],
+) -> Result<(SkillsLock, bool)> {
     if !path.exists() {
-        return Ok(SkillsLock::default());
+        return Ok((SkillsLock::default(), false));
     }
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read skills lock file `{}`", path.display()))?;
@@ -119,7 +143,7 @@ pub fn ensure_skills_lock_v2(
         )
     })?;
     if version.version == LOCK_VERSION {
-        return read_skills_lock(path);
+        return Ok((read_skills_lock(path)?, false));
     }
     if version.version != 1 {
         bail!(
@@ -173,8 +197,7 @@ pub fn ensure_skills_lock_v2(
             },
         );
     }
-    write_skills_lock_atomic(path, &converted)?;
-    Ok(converted)
+    Ok((converted, true))
 }
 
 fn decode_legacy_skills_lock_v1(content: &str, path: &Path) -> Result<LegacySkillsLockV1> {
@@ -204,6 +227,11 @@ pub fn write_skills_lock_atomic_tracked(
     lock: &SkillsLock,
     claim: impl Fn(&Path),
 ) -> Result<()> {
+    let payload = encode_skills_lock(lock)?;
+    write_encoded_skills_lock_atomic(path, &payload, claim)
+}
+
+pub(crate) fn encode_skills_lock(lock: &SkillsLock) -> Result<String> {
     if lock.version != LOCK_VERSION {
         bail!(
             "skills lock version must be `{LOCK_VERSION}` (got `{}`)",
@@ -211,6 +239,14 @@ pub fn write_skills_lock_atomic_tracked(
         );
     }
 
+    toml::to_string_pretty(&normalize_lock(lock.clone())).context("failed to serialize skills lock")
+}
+
+pub(crate) fn write_encoded_skills_lock_atomic(
+    path: &Path,
+    payload: &str,
+    claim: impl Fn(&Path),
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -221,8 +257,6 @@ pub fn write_skills_lock_atomic_tracked(
     }
 
     claim(path);
-    let normalized = normalize_lock(lock.clone());
-    let payload = toml::to_string_pretty(&normalized).context("failed to serialize skills lock")?;
     let tmp = path.with_extension(format!(
         "tmp.{}",
         std::time::SystemTime::now()
