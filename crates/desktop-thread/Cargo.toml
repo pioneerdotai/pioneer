@@ -31,15 +31,8 @@ url.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-nokhwa = { version = "=0.10.11", features = ["input-native"] }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
 livekit = { version = "=0.12.1", features = ["rustls-tls-native-roots"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# Pin the SDK and its matching native archive together. This release uses the
-# system libstdc++ ABI supported by the Ubuntu 24.04 build environment.
-livekit-linux = { package = "livekit", git = "https://github.com/livekit/rust-sdks", rev = "1a477bc422c6890537b3bcdb017f0ac094d49661", features = ["rustls-tls-native-roots"] }
+nokhwa = { version = "=0.10.11", features = ["input-native"] }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
