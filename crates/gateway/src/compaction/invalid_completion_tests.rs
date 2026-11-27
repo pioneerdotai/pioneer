@@ -53,13 +53,22 @@ fn assert_same_request(f: &Fixture, start: usize, end: usize) {
 async fn two_invalid_completions_then_success_survive_runner_restart() {
     let f = fixture(
         "small",
-        vec![Reply::Invalid, Reply::Invalid, Reply::Success],
+        vec![
+            Reply::Invalid,
+            Reply::MissingSummarySections,
+            Reply::Success,
+        ],
         true,
         false,
     )
     .await;
     let mut task = start(&f);
-    for calls in 1..=2 {
+    let expected_explanations = [
+        "Nonempty content appeared before the first recognized summary heading",
+        "Summary ended before required section 2 was recognized",
+    ];
+    for (index, explanation) in expected_explanations.iter().enumerate() {
+        let calls = index + 1;
         let retry_at = retry_time(&f, calls).await;
         let before = saved(&f).await;
         assert_eq!(before.portion_attempts as usize, calls);
@@ -75,10 +84,7 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
             .unwrap();
         assert_eq!(diagnostic.stage, "summary_validation");
         assert_eq!(diagnostic.code, "invalid_completion");
-        assert_eq!(
-            diagnostic.explanation,
-            "Summary sections are missing, duplicated or out of order"
-        );
+        assert_eq!(diagnostic.explanation.as_str(), *explanation);
         assert_eq!(
             before.observation.as_ref().unwrap().failure,
             Some(FailureKind::InvalidCompletion)
@@ -97,17 +103,19 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
     assert_eq!(state.retries, 0);
     assert_eq!(state.attempts, 3);
     assert_eq!(state.deadline_ms, f.runner.snapshot.admission.deadline_ms);
-    let observations = f.store.database_connection().query_all_raw(Statement::from_string(
-        DbBackend::Postgres,
-        "SELECT observation::text AS observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
-    )).await.unwrap();
+    let observations = attempt_history(&f).await;
     assert_eq!(observations.len(), 3);
-    for observation in &observations[..2] {
-        let encoded: String = observation.try_get("", "observation").unwrap();
+    for (index, (encoded, explanation)) in
+        observations.iter().zip(expected_explanations).enumerate()
+    {
         let observation: pioneer_compaction::runner::AttemptObservation =
-            serde_json::from_str(&encoded).unwrap();
+            serde_json::from_str(encoded).unwrap();
+        assert_eq!(observation.number, (index + 1) as u64);
         assert_eq!(observation.failure, Some(FailureKind::InvalidCompletion));
-        assert_eq!(observation.diagnostic.unwrap().code, "invalid_completion");
+        let diagnostic = observation.diagnostic.unwrap();
+        assert_eq!(diagnostic.stage, "summary_validation");
+        assert_eq!(diagnostic.code, "invalid_completion");
+        assert_eq!(diagnostic.explanation, explanation);
         assert!(!encoded.contains("private invalid model response"));
     }
 }

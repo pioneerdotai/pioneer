@@ -1973,6 +1973,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
 enum Reply {
     Overflow,
     Invalid,
+    MissingSummarySections,
     Success,
     Transient,
     Hang,
@@ -2051,20 +2052,19 @@ impl Provider for ProviderFixture {
             .unwrap()
             .pop_front()
             .unwrap_or(Reply::Success);
-        let invalid = matches!(reply, Reply::Invalid);
-        match reply {
+        let text = match reply {
             Reply::Overflow => return Err(anyhow::Error::new(ConfirmedInputOverflow)),
             Reply::Transient => anyhow::bail!("synthetic rate limit"),
-            Reply::Hang => std::future::pending::<()>().await,
-            Reply::Success | Reply::Invalid => {}
-        }
+            Reply::Hang => std::future::pending().await,
+            Reply::Invalid => "private invalid model response".into(),
+            Reply::MissingSummarySections => {
+                format!("{}\nprivate invalid model response", HEADINGS[0])
+            }
+            Reply::Success => HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect(),
+        };
         Ok(ChatResponse {
             messages: Vec::new(),
-            text: if invalid {
-                "private invalid model response".into()
-            } else {
-                HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect()
-            },
+            text,
             usage: None,
             termination: ProviderTermination::Complete,
             reasoning_content: None,

@@ -109,19 +109,57 @@ pub enum SummaryValidationError {
     IncompleteResponse,
     EmptyText,
     OutputCapExceeded,
-    InvalidSections,
+    InvalidSections(InvalidSummarySections),
     EmptySection,
     IncompleteMarkdown,
 }
+
+/// Section positions are one-based. An absent expected section means all required headings were seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidSummarySections {
+    ContentBeforeFirstHeading,
+    UnexpectedHeading {
+        expected: Option<usize>,
+        found: usize,
+    },
+    MissingHeadingAtEnd {
+        expected: usize,
+    },
+}
+
 impl SummaryValidationError {
     pub fn explanation(self) -> &'static str {
         match self {
             Self::IncompleteResponse => "Summary response did not complete",
             Self::EmptyText => "Summary text is empty",
             Self::OutputCapExceeded => "Summary exceeds the estimated output cap",
-            Self::InvalidSections => "Summary sections are missing, duplicated or out of order",
+            Self::InvalidSections(_) => "Summary sections are missing, duplicated or out of order",
             Self::EmptySection => "Summary section is empty",
             Self::IncompleteMarkdown => "Summary Markdown fence is not closed",
+        }
+    }
+
+    pub fn diagnostic_explanation(self) -> String {
+        match self {
+            Self::InvalidSections(InvalidSummarySections::ContentBeforeFirstHeading) => {
+                "Nonempty content appeared before the first recognized summary heading".into()
+            }
+            Self::InvalidSections(InvalidSummarySections::UnexpectedHeading {
+                expected: Some(expected),
+                found,
+            }) => format!(
+                "Expected heading for summary section {expected}, found heading for section {found}"
+            ),
+            Self::InvalidSections(InvalidSummarySections::UnexpectedHeading {
+                expected: None,
+                found,
+            }) => {
+                format!("Heading for summary section {found} appeared after all required headings")
+            }
+            Self::InvalidSections(InvalidSummarySections::MissingHeadingAtEnd { expected }) => {
+                format!("Summary ended before required section {expected} was recognized")
+            }
+            _ => self.explanation().into(),
         }
     }
 }
@@ -188,9 +226,16 @@ pub fn validate_summary_classified(
                 continue;
             }
         }
-        if fence.is_none() && HEADINGS.contains(&line) {
-            if section >= HEADINGS.len() || HEADINGS[section] != line {
-                return Err(SummaryValidationError::InvalidSections);
+        if fence.is_none()
+            && let Some(heading) = HEADINGS.iter().position(|&heading| heading == line)
+        {
+            if heading != section {
+                return Err(SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::UnexpectedHeading {
+                        expected: (section < HEADINGS.len()).then_some(section + 1),
+                        found: heading + 1,
+                    },
+                ));
             }
             if section > 0 && !has_body {
                 return Err(SummaryValidationError::EmptySection);
@@ -199,7 +244,9 @@ pub fn validate_summary_classified(
             has_body = false;
         } else if !line.is_empty() {
             if section == 0 {
-                return Err(SummaryValidationError::InvalidSections);
+                return Err(SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::ContentBeforeFirstHeading,
+                ));
             }
             has_body = true;
         }
@@ -208,7 +255,11 @@ pub fn validate_summary_classified(
         return Err(SummaryValidationError::IncompleteMarkdown);
     }
     if section != HEADINGS.len() {
-        return Err(SummaryValidationError::InvalidSections);
+        return Err(SummaryValidationError::InvalidSections(
+            InvalidSummarySections::MissingHeadingAtEnd {
+                expected: section + 1,
+            },
+        ));
     }
     if !has_body {
         return Err(SummaryValidationError::EmptySection);
@@ -321,22 +372,46 @@ mod tests {
                     .map(|h| format!("{h}\nBody.\n"))
                     .collect(),
                 1000,
-                SummaryValidationError::InvalidSections,
+                SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::MissingHeadingAtEnd { expected: 6 },
+                ),
             ),
             (
                 valid().replace(HEADINGS[2], HEADINGS[3]),
                 1000,
-                SummaryValidationError::InvalidSections,
+                SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::UnexpectedHeading {
+                        expected: Some(3),
+                        found: 4,
+                    },
+                ),
             ),
             (
                 valid().replace(HEADINGS[2], HEADINGS[1]),
                 1000,
-                SummaryValidationError::InvalidSections,
+                SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::UnexpectedHeading {
+                        expected: Some(3),
+                        found: 2,
+                    },
+                ),
+            ),
+            (
+                format!("{}{}\nprivate response text", valid(), HEADINGS[1]),
+                1000,
+                SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::UnexpectedHeading {
+                        expected: None,
+                        found: 2,
+                    },
+                ),
             ),
             (
                 format!("private response text\n{}", valid()),
                 1000,
-                SummaryValidationError::InvalidSections,
+                SummaryValidationError::InvalidSections(
+                    InvalidSummarySections::ContentBeforeFirstHeading,
+                ),
             ),
             (
                 HEADINGS.join("\n"),
@@ -366,6 +441,11 @@ mod tests {
             let error = validate_summary_classified(&completion, cap).unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(error.to_string(), expected.explanation());
+            assert!(
+                !error
+                    .diagnostic_explanation()
+                    .contains("private response text")
+            );
         }
         for kind in [
             CompletionKind::Limit,

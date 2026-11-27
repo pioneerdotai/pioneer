@@ -960,7 +960,7 @@ impl CompactionRunner {
                                                 FailureDiagnostic::new(
                                                     "summary_validation",
                                                     "invalid_completion",
-                                                    reason.explanation(),
+                                                    &reason.diagnostic_explanation(),
                                                 ),
                                             ),
                                             None,
