@@ -143,7 +143,7 @@ impl SelectionPlan {
             runtime.validate_executable(snapshot, None)?;
             for artifact in runtime.artifacts.values() {
                 let key = path(&artifact.path, "app.json/runtime/artifacts/path")?;
-                if snapshot.member_digest(&key) != artifact.sha256 {
+                if snapshot.checked_member_digest(&key).as_ref().ok() != Some(&artifact.sha256) {
                     return Err(ManifestError::new("artifact_checksum_mismatch", &key));
                 }
             }
@@ -155,6 +155,14 @@ impl SelectionPlan {
     pub fn validate_package_for_architecture(
         snapshot: &Snapshot,
         architecture: &str,
+    ) -> Result<AppManifest, ManifestError> {
+        Self::validate_for_architecture_cancellable(snapshot, architecture, || false)
+    }
+
+    pub(crate) fn validate_for_architecture_cancellable(
+        snapshot: &Snapshot,
+        architecture: &str,
+        cancelled: impl Fn() -> bool,
     ) -> Result<AppManifest, ManifestError> {
         let manifest = AppManifest::parse(
             snapshot
@@ -169,7 +177,12 @@ impl SelectionPlan {
                 let key = path(&artifact.path, "app.json/runtime/artifacts/path")?;
                 if arch != architecture {
                     plan.entries.remove(&key);
-                } else if snapshot.member_digest(&key) != artifact.sha256 {
+                } else if snapshot
+                    .checked_member_digest_cancellable(&key, &cancelled)
+                    .as_ref()
+                    .ok()
+                    != Some(&artifact.sha256)
+                {
                     return Err(ManifestError::new("artifact_checksum_mismatch", &key));
                 }
             }
@@ -180,6 +193,15 @@ impl SelectionPlan {
     }
     /// Select only the Gateway guest architecture before publishing a package.
     pub fn select_architecture(
+        snapshot: &Snapshot,
+        architecture: &str,
+    ) -> anyhow::Result<Snapshot> {
+        let selected = Self::prune_other_architectures(snapshot, architecture)?;
+        Self::validate_package_for_architecture(&selected, architecture)?;
+        Ok(selected)
+    }
+
+    pub(crate) fn prune_other_architectures(
         snapshot: &Snapshot,
         architecture: &str,
     ) -> anyhow::Result<Snapshot> {
@@ -197,9 +219,7 @@ impl SelectionPlan {
                 }
             }
         }
-        let selected = snapshot.excluding_subtrees(&excluded)?;
-        Self::validate_package_for_architecture(&selected, architecture)?;
-        Ok(selected)
+        snapshot.excluding_subtrees(&excluded)
     }
     /// Only selected paths and their ancestors are visited. Excluded siblings are never scanned.
     pub fn capture(

@@ -1,9 +1,13 @@
 //! Autonomous App executions. Desired state is the existing package enabled/state/revision.
 use super::super::*;
+use super::host_capacity::{
+    HostCapacity, MEMORY_HIERARCHY_UNAVAILABLE, MemoryCharge, SandboxLimits,
+};
 use super::provision;
+use super::storage::{AppInstallAdmission, DiskReservation, MIB, ROOT_DISK_MIB};
 use anyhow::{Context, Result, bail};
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default, serde::Serialize)]
@@ -12,9 +16,12 @@ pub(crate) struct RuntimeStatus {
     pub failure: Option<String>,
     pub execution_id: Option<String>,
 }
-type SdkCreation = JoinHandle<microsandbox::MicrosandboxResult<microsandbox::Sandbox>>;
+type SdkCreation = (
+    JoinHandle<microsandbox::MicrosandboxResult<microsandbox::Sandbox>>,
+    Arc<AppInstallAdmission>,
+);
 struct Execution {
-    active: Arc<AtomicBool>,
+    reservation: Arc<Mutex<Option<VmReservation>>>,
     vm_pending: Arc<AtomicBool>,
     sandbox: Arc<RwLock<Option<Arc<microsandbox::Sandbox>>>>,
     creation: Arc<Mutex<Option<SdkCreation>>>,
@@ -25,12 +32,26 @@ struct Execution {
     status: Arc<RwLock<RuntimeStatus>>,
     upstream: Arc<RwLock<Option<(std::net::SocketAddr, pioneer_protocol::AuthSecretString)>>>,
 }
+struct VmReservation {
+    bytes: u64,
+    _disk: DiskReservation,
+}
+
+struct LaunchAdmission {
+    sdk_writes: Arc<AppInstallAdmission>,
+    limits: SandboxLimits,
+    data_quota_mib: u32,
+    reservation: VmReservation,
+}
+
 #[derive(Default)]
 pub(crate) struct AppRuntime {
     executions: Mutex<BTreeMap<String, Execution>>,
     failures: Mutex<BTreeMap<String, RuntimeStatus>>,
     worker: Mutex<Option<(CancellationToken, JoinHandle<()>)>>,
-    preparation: Mutex<()>,
+    launch: Mutex<()>,
+    package_preparation: Arc<Mutex<()>>,
+    host: Arc<std::sync::Mutex<HostCapacity>>,
     backend: tokio::sync::OnceCell<Arc<microsandbox::LocalBackend>>,
     bootstrap_failure: RwLock<Option<String>>,
 }
@@ -152,67 +173,90 @@ impl MessageProcessor {
         if worker.is_some() {
             return;
         }
+        if let Err(error) = super::architecture() {
+            *self.app_runtime.bootstrap_failure.write().await = Some(error.to_string());
+            return;
+        }
+        self.app_storage.set_recovering(true);
         let cancel = CancellationToken::new();
         let child = cancel.clone();
         let owner = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         let task = tokio::spawn(async move {
-            let recovery = async {
-                let backend = owner
-                    .app_runtime
-                    .backend
-                    .get_or_try_init(|| async {
-                        provision::backend(&owner.artifact_runtime_home.join("apps-runtime"))
-                    })
-                    .await?
-                    .clone();
-                provision::recover(backend).await
-            }
-            .await;
-            if recovery.is_err() {
-                tracing::error!("App SDK recovery cleanup was not confirmed");
+            loop {
+                if child.is_cancelled() {
+                    return;
+                }
+                let recovery = async {
+                    let backend = owner
+                        .app_runtime
+                        .backend
+                        .get_or_try_init(|| async {
+                            provision::backend(&owner.artifact_runtime_home.join("apps-runtime"))
+                        })
+                        .await?
+                        .clone();
+                    provision::recover(backend, &owner.app_storage, &child).await
+                }
+                .await;
+                if recovery.is_ok() {
+                    break;
+                }
+                tracing::warn!("App SDK recovery cleanup was not confirmed; retrying");
                 *owner.app_runtime.bootstrap_failure.write().await =
                     Some("apps.runtime_cleanup_not_confirmed".into());
-                return;
+                tokio::select! {
+                    _ = child.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                }
             }
+            *owner.app_runtime.bootstrap_failure.write().await = None;
+            owner.app_storage.set_recovering(false);
             // No execution survives the private-home VM fence above. Stale
             // bootstrap directories contain only revoked execution credentials.
-            let stale_root = owner.artifact_runtime_home.join("app-executions");
-            let cleanup = super::super::package_delivery::prepare_cancellable(move |cancel| {
-                if !stale_root.exists() {
-                    return Ok(());
-                }
-                let metadata = std::fs::symlink_metadata(&stale_root)?;
-                anyhow::ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "apps.invalid_execution_root"
-                );
-                for entry in std::fs::read_dir(&stale_root)? {
-                    super::super::package_delivery::check_preparation(&cancel)?;
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str().filter(|name| {
-                        name.len() == 21
-                            && name
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                    }) else {
-                        continue;
-                    };
-                    let path = stale_root.join(name);
-                    if entry.file_type()?.is_dir() {
-                        std::fs::remove_dir_all(path)?;
+            loop {
+                let stale_root = owner.artifact_runtime_home.join("app-executions");
+                let cleanup = super::super::package_delivery::prepare_cancellable(move |cancel| {
+                    if !stale_root.exists() {
+                        return Ok(());
                     }
+                    let metadata = std::fs::symlink_metadata(&stale_root)?;
+                    anyhow::ensure!(
+                        metadata.is_dir() && !metadata.file_type().is_symlink(),
+                        "apps.invalid_execution_root"
+                    );
+                    for entry in std::fs::read_dir(&stale_root)? {
+                        super::super::package_delivery::check_preparation(&cancel)?;
+                        let entry = entry?;
+                        let name = entry.file_name();
+                        let Some(name) = name.to_str().filter(|name| {
+                            name.len() == 21
+                                && name
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                        }) else {
+                            continue;
+                        };
+                        let path = stale_root.join(name);
+                        if entry.file_type()?.is_dir() {
+                            std::fs::remove_dir_all(path)?;
+                        }
+                    }
+                    Ok(())
+                });
+                if tokio::select! { _ = child.cancelled() => return, result = cleanup => result }
+                    .is_ok()
+                {
+                    break;
                 }
-                Ok(())
-            });
-            if tokio::select! { _ = child.cancelled() => return, result = cleanup => result }
-                .is_err()
-            {
                 *owner.app_runtime.bootstrap_failure.write().await =
                     Some("apps.execution_bootstrap_recovery_failed".into());
-                tracing::error!("App execution bootstrap recovery failed");
-                return;
+                tracing::warn!("App execution bootstrap recovery failed; retrying");
+                tokio::select! {
+                    _ = child.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                }
             }
+            *owner.app_runtime.bootstrap_failure.write().await = None;
             let database = owner.crud_store.database_connection();
             let mut changes = database.work_signal("apps.lifecycle").subscribe();
             loop {
@@ -279,7 +323,20 @@ impl MessageProcessor {
                 for id in absent {
                     let _ = owner.stop_app_runtime(&id).await;
                 }
-                tokio::select! { _ = child.cancelled() => break, _ = changes.changed() => {} }
+                let has_pending_stop = owner
+                    .app_runtime
+                    .executions
+                    .lock()
+                    .await
+                    .values()
+                    .any(|e| e.cancel.is_cancelled() && e.vm_pending.load(Ordering::Acquire));
+                tokio::select! {
+                    _ = child.cancelled() => break,
+                    _ = changes.changed() => {},
+                    // A stop with an uncertain SDK outcome still owns its
+                    // reservation. Retry reconciliation only while it exists.
+                    _ = tokio::time::sleep(Duration::from_secs(10)), if has_pending_stop => {}
+                }
             }
         });
         *worker = Some((cancel, task));
@@ -366,27 +423,7 @@ impl MessageProcessor {
         if !active {
             return Ok(());
         }
-        if self
-            .app_runtime
-            .executions
-            .lock()
-            .await
-            .values()
-            .filter(|e| e.active.load(Ordering::Acquire) || e.vm_pending.load(Ordering::Acquire))
-            .count()
-            >= 8
-        {
-            self.app_runtime.failures.lock().await.insert(
-                parent.id,
-                RuntimeStatus {
-                    state: "failed".into(),
-                    failure: Some("apps.runtime_capacity".into()),
-                    ..Default::default()
-                },
-            );
-            return Ok(());
-        }
-        let active = Arc::new(AtomicBool::new(true));
+        let reservation = Arc::new(Mutex::new(None));
         let vm_pending = Arc::new(AtomicBool::new(false));
         let sandbox = Arc::new(RwLock::new(None));
         let creation = Arc::new(Mutex::new(None));
@@ -402,22 +439,26 @@ impl MessageProcessor {
         let token = cancel.clone();
         let progress = status.clone();
         let endpoint = upstream.clone();
-        let running = active.clone();
+        let vm_reservation = reservation.clone();
         let pending = vm_pending.clone();
         let sandbox_handle = sandbox.clone();
         let creation_handle = creation.clone();
         let output = logs.clone();
+        // Publish the execution before its spawned owner can inspect the
+        // catalog or run cleanup after a failed creation.
+        let mut executions = self.app_runtime.executions.lock().await;
         let task = tokio::spawn(async move {
             let app_id = record.id.clone();
             let workspace_id = record.workspace_id.clone();
             let result = std::panic::AssertUnwindSafe(owner.run_app(
-                record,
+                record.clone(),
                 &token,
                 &progress,
                 &endpoint,
                 &pending,
                 &sandbox_handle,
                 &creation_handle,
+                &vm_reservation,
                 &output,
             ))
             .catch_unwind()
@@ -428,6 +469,7 @@ impl MessageProcessor {
                 Ok(())
             };
             if cleanup.is_ok() {
+                vm_reservation.lock().await.take();
                 pending.store(false, Ordering::Release);
             }
             *endpoint.write().await = None;
@@ -450,6 +492,8 @@ impl MessageProcessor {
                             "apps.unsupported_host_platform" => "apps.unsupported_host_platform",
                             "apps.virtualization_unavailable" => "apps.virtualization_unavailable",
                             "apps.crash_budget_exhausted" => "apps.crash_budget_exhausted",
+                            "apps.startup_timeout" => "apps.startup_timeout",
+                            MEMORY_HIERARCHY_UNAVAILABLE => MEMORY_HIERARCHY_UNAVAILABLE,
                             _ => "apps.execution_failed",
                         },
                         _ => "apps.execution_failed",
@@ -457,18 +501,34 @@ impl MessageProcessor {
                     .into(),
                 );
             }
-            running.store(false, Ordering::Release);
+            let hierarchy_unavailable =
+                state.failure.as_deref() == Some(MEMORY_HIERARCHY_UNAVAILABLE);
             drop(state);
+            if hierarchy_unavailable {
+                owner.publish_app_runtime_changed(&record, None).await;
+            }
+            // A failed SDK stop does not prove the VM is gone. Keep its
+            // charge and retry cleanup without respawning the application.
+            while pending.load(Ordering::Acquire) {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                }
+                if owner.cleanup_app_vm(&app_id).await.is_ok() {
+                    pending.store(false, Ordering::Release);
+                }
+            }
             owner
                 .crud_store
                 .database_connection()
                 .work_signal("apps.lifecycle")
                 .notify();
         });
-        self.app_runtime.executions.lock().await.insert(
+        executions.insert(
             parent.id,
             Execution {
-                active,
+                reservation,
                 vm_pending,
                 sandbox,
                 creation,
@@ -483,23 +543,20 @@ impl MessageProcessor {
         Ok(())
     }
     async fn cleanup_app_vm(&self, app: &str) -> Result<()> {
-        let slot = self
+        let execution = self
             .app_runtime
             .executions
             .lock()
             .await
             .get(app)
-            .map(|e| e.sandbox.clone());
-        let creation = self
-            .app_runtime
-            .executions
-            .lock()
-            .await
-            .get(app)
-            .map(|e| e.creation.clone());
+            .map(|e| (e.sandbox.clone(), e.creation.clone(), e.reservation.clone()));
+        let (slot, creation, reservation) = match execution {
+            Some((slot, creation, reservation)) => (Some(slot), Some(creation), Some(reservation)),
+            None => (None, None, None),
+        };
         if let Some(creation) = creation {
             let mut creating = creation.lock().await;
-            if let Some(task) = creating.as_mut() {
+            if let Some((task, _)) = creating.as_mut() {
                 task.abort();
                 if let Ok(Ok(sandbox)) = task.await {
                     if let Some(slot) = &slot {
@@ -543,8 +600,149 @@ impl MessageProcessor {
         if let Some(slot) = slot {
             slot.write().await.take();
         }
+        if let Some(reservation) = reservation {
+            reservation.lock().await.take();
+        }
         Ok(())
     }
+
+    async fn wait_for_launch(
+        &self,
+        parent: &pioneer_crud::PackageRecord,
+        backend: &microsandbox::LocalBackend,
+        data: &Path,
+        cancel: &CancellationToken,
+        status: &RwLock<RuntimeStatus>,
+    ) -> Result<(tokio::sync::MutexGuard<'_, ()>, LaunchAdmission)> {
+        let mut reason = "apps.waiting_for_launch";
+        loop {
+            let changed = {
+                let mut status = status.write().await;
+                let changed =
+                    status.state != "waiting" || status.failure.as_deref() != Some(reason);
+                if changed {
+                    *status = RuntimeStatus {
+                        state: "waiting".into(),
+                        failure: Some(reason.into()),
+                        execution_id: None,
+                    };
+                }
+                changed
+            };
+            if changed {
+                self.publish_app_runtime_changed(parent, None).await;
+            }
+            let launch = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("apps.cancelled"),
+                lock = self.app_runtime.launch.lock() => lock,
+            };
+            let check = self.check_launch(parent, backend, data);
+            let admission = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("apps.cancelled"),
+                result = check => result?,
+            };
+            match admission {
+                Ok(admission) => return Ok((launch, admission)),
+                Err(MEMORY_HIERARCHY_UNAVAILABLE) => bail!(MEMORY_HIERARCHY_UNAVAILABLE),
+                Err(waiting) => reason = waiting,
+            }
+            drop(launch);
+            // Keep retries local to the Apps that are waiting on capacity.
+            // No package discovery or crash attempt is involved.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("apps.cancelled"),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
+    }
+
+    async fn check_launch(
+        &self,
+        parent: &pioneer_crud::PackageRecord,
+        backend: &microsandbox::LocalBackend,
+        data: &Path,
+    ) -> Result<Result<LaunchAdmission, &'static str>> {
+        let executions: Vec<_> = self
+            .app_runtime
+            .executions
+            .lock()
+            .await
+            .iter()
+            .filter(|(id, _)| *id != &parent.id)
+            .map(|(_, e)| (e.reservation.clone(), e.sandbox.clone(), e.status.clone()))
+            .collect();
+        let mut charges = Vec::new();
+        for (reservation, sandbox, status) in executions {
+            let Some(bytes) = reservation.lock().await.as_ref().map(|r| r.bytes) else {
+                continue;
+            };
+            let ready = match status.read().await.state.as_str() {
+                "starting" => return Ok(Err("apps.waiting_for_launch")),
+                "ready" => sandbox.read().await.as_ref().and_then(|sandbox| {
+                    let id = sandbox.id().as_str().strip_prefix("local:")?.parse().ok()?;
+                    Some((sandbox.name().to_string(), id))
+                }),
+                _ => None,
+            };
+            charges.push(MemoryCharge { bytes, ready });
+        }
+        let host = self.app_runtime.host.clone();
+        let storage = self.app_storage.clone();
+        let registry = backend.config().metrics_registry_shm_name();
+        let sandboxes = backend.sandboxes_dir();
+        let infrastructure = provision::storage_paths(backend);
+        let bootstrap = self.artifact_runtime_home.join("app-executions");
+        let data = data.to_owned();
+        super::super::package_delivery::prepare(move || {
+            let limits = host
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .admit(&registry, &charges)?;
+            // Serialize cold SDK setup and image pulls with App package
+            // writes. A running VM retains its own allowances separately.
+            let sdk_writes = storage
+                .admit_continuation()
+                .map_err(|_| "apps.waiting_for_install")?;
+            let data_quota_mib = super::storage::data_write_allowance(&data)
+                .map_err(|_| "apps.waiting_for_disk_capacity")?;
+            // Charge planned guest growth only. Host stdio MCP bypasses the
+            // guest mount, and file lengths omit allocation and metadata costs.
+            let mut writes = vec![
+                (data.as_path(), u64::from(data_quota_mib) * MIB),
+                (sandboxes.as_path(), u64::from(ROOT_DISK_MIB) * MIB),
+                (bootstrap.as_path(), MIB),
+            ];
+            // The SDK has no growth limits for these paths. Check the
+            // reserve before startup; only bounded writes can be reserved.
+            writes.extend(
+                infrastructure
+                    .iter()
+                    .filter(|path| *path != &sandboxes)
+                    .map(|path| (path.as_path(), 0)),
+            );
+            let disk = storage.reserve(&writes).map_err(|error| {
+                if error.to_string() == "apps.disk_capacity" {
+                    "apps.waiting_for_disk"
+                } else {
+                    "apps.waiting_for_disk_capacity"
+                }
+            })?;
+            Ok(LaunchAdmission {
+                sdk_writes,
+                reservation: VmReservation {
+                    bytes: limits.launch_memory(),
+                    _disk: disk,
+                },
+                limits,
+                data_quota_mib,
+            })
+        })
+        .await
+    }
+
     async fn run_app(
         &self,
         parent: pioneer_crud::PackageRecord,
@@ -554,6 +752,7 @@ impl MessageProcessor {
         pending: &Arc<AtomicBool>,
         sandbox_slot: &Arc<RwLock<Option<Arc<microsandbox::Sandbox>>>>,
         creation_slot: &Arc<Mutex<Option<SdkCreation>>>,
+        reservation: &Mutex<Option<VmReservation>>,
         logs: &Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     ) -> Result<()> {
         let root = PathBuf::from(&parent.package_path);
@@ -561,17 +760,29 @@ impl MessageProcessor {
         let limits = self
             .package_delivery_context()
             .limits_for_package(parent.kind);
-        let preparing = super::super::package_delivery::prepare_cancellable(move |cancellation| {
-            let snapshot =
-                pioneer_packages::Snapshot::capture(&root, limits, || cancellation.is_cancelled())?;
-            anyhow::ensure!(snapshot.tree_digest() == expected, "apps.package_changed");
-            Ok(pioneer_apps::load_for_architecture(
-                &snapshot,
-                super::architecture()?,
-            )?)
-        });
+        let preparing = async {
+            let preparation = self
+                .app_runtime
+                .package_preparation
+                .clone()
+                .lock_owned()
+                .await;
+            super::super::package_delivery::prepare_cancellable(move |cancellation| {
+                let _preparation = preparation;
+                let snapshot =
+                    pioneer_apps::capture_release(&root, limits, || cancellation.is_cancelled())?;
+                let package = pioneer_apps::load_for_architecture_cancellable(
+                    &snapshot,
+                    super::architecture()?,
+                    || cancellation.is_cancelled(),
+                )?;
+                anyhow::ensure!(package.tree_digest == expected, "apps.package_changed");
+                Ok(package.manifest)
+            })
+            .await
+        };
         let package = tokio::select! { _ = cancel.cancelled() => bail!("apps.cancelled"), result = preparing => result? };
-        let runtime = package.manifest.runtime().context("apps.runtime_missing")?;
+        let runtime = package.runtime().context("apps.runtime_missing")?;
         let architecture = super::architecture()?;
         let artifact = runtime.artifact(architecture)?;
         let image = provision::image(runtime.environment)?;
@@ -581,10 +792,6 @@ impl MessageProcessor {
             .get()
             .context("apps.runtime_unavailable")?
             .clone();
-        let (_, preparation_failures) = prepare_with_recovery(cancel, status, || async {
-            let _preparation = tokio::select! { _ = cancel.cancelled() => bail!("apps.cancelled"), lock = self.app_runtime.preparation.lock() => lock };
-            provision::prepare(&backend, cancel).await
-        }).await?;
         let name = format!(
             "pioneer-app-{}",
             hex::encode(sha2::Sha256::digest(parent.id.as_bytes()))
@@ -592,17 +799,40 @@ impl MessageProcessor {
         let package_root = tokio::fs::canonicalize(&parent.package_path).await?;
         let data_root = tokio::fs::canonicalize(&parent.data_path).await?;
         let cwd = pioneer_apps::canonical_package_path(&runtime.cwd, "runtime/cwd")?;
-        for attempt in preparation_failures..5u32 {
-            if cancel.is_cancelled() {
-                break;
+        let mut attempts = 0u32;
+        while attempts < 5 && !cancel.is_cancelled() {
+            let (mut launch, mut admission) = self
+                .wait_for_launch(&parent, &backend, &data_root, cancel, status)
+                .await?;
+            if attempts == 0 {
+                let (_, preparation_failures) =
+                    prepare_with_recovery(cancel, status, || provision::prepare(&backend, cancel))
+                        .await?;
+                attempts += preparation_failures;
+                // Setup can download runtime components. Reassess current load
+                // and capacity immediately before attempting VM creation.
+                drop(admission);
+                drop(launch);
+                (launch, admission) = self
+                    .wait_for_launch(&parent, &backend, &data_root, cancel, status)
+                    .await?;
             }
-            self.publish_app_runtime_changed(&parent, None).await;
+            let LaunchAdmission {
+                sdk_writes,
+                reservation: vm,
+                limits,
+                data_quota_mib,
+            } = admission;
+            *reservation.lock().await = Some(vm);
+            let attempt = attempts;
+            attempts += 1;
             let execution_id = pioneer_protocol::generate_id(21);
             *status.write().await = RuntimeStatus {
                 state: "starting".into(),
                 failure: None,
                 execution_id: Some(execution_id.clone()),
             };
+            self.publish_app_runtime_changed(&parent, None).await;
             let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
             let address = listener.local_addr()?;
             drop(listener);
@@ -665,9 +895,11 @@ impl MessageProcessor {
             let mut builder = microsandbox::Sandbox::builder(&name)
                 .image(image.as_str())
                 .pull_policy(microsandbox::sandbox::PullPolicy::IfMissing)
-                .memory(512u32)
-                .cpus(1)
-                .root_disk(1024u32)
+                .memory(limits.memory_mib)
+                .cpus(limits.cpus)
+                .max_cpus(limits.cpus)
+                .root_disk(ROOT_DISK_MIB)
+                .metrics_sample_interval(Duration::from_secs(1))
                 .user("65532:65532")
                 .label("pioneer.apps", "true")
                 .workdir(format!("/app/{cwd}"))
@@ -677,7 +909,7 @@ impl MessageProcessor {
                     m.bind(&package_root).readonly().owner(65532, 65532)
                 })
                 .volume("/data", |m| {
-                    m.bind(&data_root).quota(1024u32).owner(65532, 65532)
+                    m.bind(&data_root).quota(data_quota_mib).owner(65532, 65532)
                 })
                 .volume("/pioneer", |m| {
                     m.bind(&bootstrap_root).readonly().owner(65532, 65532)
@@ -709,8 +941,8 @@ impl MessageProcessor {
                 microsandbox::with_backend(scoped, async { builder.create_with_progress() })
                     .await?;
             drop(progress);
-            *creating = Some(task);
-            let task = creating.as_mut().expect("owned SDK creation job");
+            *creating = Some((task, sdk_writes));
+            let (task, _) = creating.as_mut().expect("owned SDK creation job");
             let (settled, interrupted) = tokio::select! {
                 biased;
                 result = &mut *task => (result, None),
@@ -731,6 +963,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.cleanup_app_vm(&parent.id).await?;
                     pending.store(false, Ordering::Release);
+                    drop(launch);
                     if cancel.is_cancelled() {
                         return Ok(());
                     }
@@ -755,9 +988,19 @@ impl MessageProcessor {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(2))
                 .build()?;
-            let mut process = sandbox
-                .exec_default_stream_with(|options| options.stdin_null().tty(false))
-                .await?;
+            // Opening the stream includes sending ExecRequest, which can
+            // stall after connection. Share the readiness deadline with it.
+            // The execution owns the VM until the outer cleanup confirms stop.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            let opening =
+                sandbox.exec_default_stream_with(|options| options.stdin_null().tty(false));
+            let mut process = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                result = tokio::time::timeout_at(deadline, opening) => {
+                    result.context("apps.startup_timeout")??
+                }
+            };
             let secrets = vec![secret, proxy_credential.expose_secret().to_owned()];
             let output_logs = logs.clone();
             let (exited_tx, mut exited) = tokio::sync::oneshot::channel();
@@ -780,7 +1023,6 @@ impl MessageProcessor {
                 let _ = exited_tx.send(());
             });
             let ready = async {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                 loop {
                     if client
                         .get(format!("http://{address}{}", runtime.readiness.path))
@@ -805,16 +1047,22 @@ impl MessageProcessor {
                         );
                         return Ok::<_, anyhow::Error>(());
                     }
-                    if tokio::time::Instant::now() >= deadline {
-                        bail!("apps.readiness_timeout");
-                    }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             };
-            let ready = tokio::select! { _ = cancel.cancelled() => false, _ = &mut exited => false, result = ready => result.is_ok() };
+            let ready = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => false,
+                _ = &mut exited => false,
+                result = tokio::time::timeout_at(deadline, ready) => {
+                    result.is_ok_and(|result| result.is_ok())
+                }
+            };
+            let mut launch = Some(launch);
             if ready {
                 *upstream.write().await = Some((address, proxy_credential.clone()));
                 status.write().await.state = "ready".into();
+                drop(launch.take());
                 self.publish_app_runtime_changed(&parent, Some(execution_id.clone()))
                     .await;
                 tokio::select! { _ = cancel.cancelled() => {}, _ = &mut exited => {}, _ = sandbox.wait() => {} }
@@ -829,6 +1077,7 @@ impl MessageProcessor {
             let _ = output.await;
             cleanup?;
             pending.store(false, Ordering::Release);
+            drop(launch);
             self.publish_app_runtime_changed(&parent, None).await;
             if cancel.is_cancelled() {
                 return Ok(());
@@ -851,7 +1100,10 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     for attempt in 0..5u32 {
-        status.write().await.state = "preparing".into();
+        *status.write().await = RuntimeStatus {
+            state: "preparing".into(),
+            ..Default::default()
+        };
         if cancel.is_cancelled() {
             bail!("apps.cancelled");
         }
@@ -1127,7 +1379,7 @@ mod backend_execution_access_tests {
         processor.app_runtime.executions.lock().await.insert(
             id.clone(),
             Execution {
-                active: Arc::new(AtomicBool::new(true)),
+                reservation: Arc::new(Mutex::new(None)),
                 vm_pending: Arc::new(AtomicBool::new(false)),
                 sandbox: Arc::new(RwLock::new(None)),
                 creation: Arc::new(Mutex::new(None)),

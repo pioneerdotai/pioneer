@@ -1,4 +1,5 @@
 use super::*;
+use crate::message::apps::storage::{AppInstallAdmission, AppStorage};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct PackageAction {
@@ -48,48 +49,76 @@ fn key(component: &ComponentPlan) -> PluginComponentKey {
 fn matches_key(component: &PluginComponentKey, kind: &str, member: &str) -> bool {
     component.kind == kind && component.member_key == member
 }
-fn package_snapshot(
-    root: &Path,
-    limits: pioneer_packages::Limits,
-    kind: PackageKind,
-) -> anyhow::Result<(Snapshot, PackagePlan)> {
-    package_snapshot_cancellable(
-        root,
-        &tokio_util::sync::CancellationToken::new(),
-        limits,
-        kind,
-    )
-}
-fn package_snapshot_cancellable(
-    root: &Path,
-    cancellation: &tokio_util::sync::CancellationToken,
-    limits: pioneer_packages::Limits,
-    kind: PackageKind,
-) -> anyhow::Result<(Snapshot, PackagePlan)> {
-    let snapshot = Snapshot::capture(root, limits, || cancellation.is_cancelled())
-        .map_err(|_| anyhow::anyhow!("plugins.package_unavailable"))?;
-    let snapshot = select_package_snapshot(snapshot, kind)?;
-    let plan = load_package(&snapshot, kind)?;
-    Ok((snapshot, plan))
+fn installed_app_plan(
+    snapshot: &Snapshot,
+    architecture: &str,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<PackagePlan> {
+    // Release staging prunes unused payloads. An installed tree is already
+    // selected and its entire contents must match the persisted fingerprint.
+    let app = pioneer_apps::load_for_architecture_cancellable(snapshot, architecture, cancelled)
+        .map_err(|error| {
+            if error.code == "unselected_entry" {
+                anyhow::anyhow!("plugins.package_changed")
+            } else {
+                error.into()
+            }
+        })?;
+    super::package_plan::source_app_plan(app)
 }
 pub(super) fn verified_package(
     parent: &pioneer_crud::PackageRecord,
     cancellation: &tokio_util::sync::CancellationToken,
     limits: pioneer_packages::Limits,
 ) -> anyhow::Result<(Snapshot, PackagePlan)> {
+    installed_package(parent, cancellation, limits, &parent.package_fingerprint)
+}
+
+fn installed_package(
+    parent: &pioneer_crud::PackageRecord,
+    cancellation: &tokio_util::sync::CancellationToken,
+    limits: pioneer_packages::Limits,
+    expected: &str,
+) -> anyhow::Result<(Snapshot, PackagePlan)> {
     let package = Path::new(&parent.package_path);
+    let cancelled = || cancellation.is_cancelled();
     let (snapshot, plan) = if super::super::apps::dev::is_dev(parent) {
-        let snapshot = Snapshot::capture(package, limits, || cancellation.is_cancelled())?;
+        let snapshot = Snapshot::capture(package, pioneer_apps::SOURCE_LIMITS, cancelled)?;
         let plan = super::package_plan::source_app_plan(pioneer_apps::load_source(&snapshot)?)?;
         (snapshot, plan)
     } else {
-        package_snapshot_cancellable(package, cancellation, limits, parent.kind)?
+        let snapshot = capture_package(package, limits, parent.kind, cancelled)
+            .map_err(|_| anyhow::anyhow!("plugins.package_unavailable"))?;
+        let plan = if parent.kind == PackageKind::App {
+            installed_app_plan(
+                &snapshot,
+                super::super::apps::architecture().unwrap_or("unsupported"),
+                cancelled,
+            )?
+        } else {
+            pioneer_plugins::load(&snapshot)
+                .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?
+                .into()
+        };
+        (snapshot, plan)
     };
-    anyhow::ensure!(
-        snapshot.tree_digest() == parent.package_fingerprint,
-        "plugins.package_changed"
-    );
+    verify_package_digest(&plan.tree_digest, expected)?;
     Ok((snapshot, plan))
+}
+
+pub(in crate::message) fn dev_update_wait_reason(
+    parent: &pioneer_crud::PackageRecord,
+) -> Option<&str> {
+    let code = parent.last_error.as_deref()?;
+    if !super::super::apps::dev::is_dev(parent)
+        || !parent.enabled
+        || parent.state != "interrupted"
+        || !AppStorage::install_should_retry(code)
+    {
+        return None;
+    }
+    let action: PackageAction = serde_json::from_str(parent.pending_json.as_deref()?).ok()?;
+    (action.kind == "update" && action.source_upload_id.is_none()).then_some(code)
 }
 
 impl MessageProcessor {
@@ -137,8 +166,14 @@ impl MessageProcessor {
             ..Default::default()
         };
         let next = Path::new(&parent.package_path).with_file_name("package-next");
+        let writes = self.app_storage.admit_install(None, &next).await?;
+        let admission = writes.admission;
+        let publication_space = writes.publication;
+        let stage_admission = admission.clone();
         guard
             .fs(move |_| {
+                let _admission = stage_admission;
+                let _publication_space = publication_space;
                 if next.exists() {
                     std::fs::remove_dir_all(&next)?;
                 }
@@ -158,19 +193,41 @@ impl MessageProcessor {
             )
             .await?;
         drop(guard);
+        self.continue_dev_update(context, &updated, Some(admission))
+            .await
+    }
+
+    pub(in crate::message) async fn continue_dev_update(
+        &self,
+        context: &RequestContext,
+        parent: &pioneer_crud::PackageRecord,
+        admission: Option<Arc<AppInstallAdmission>>,
+    ) -> anyhow::Result<()> {
         let request = RequestId::new(pioneer_protocol::generate_id(21))?;
-        self.mutate_plugin(
-            context,
-            &request,
-            PluginsMutateParams {
-                workspace_id: parent.workspace_id.clone(),
-                plugin_id: parent.id.clone(),
-                expected_revision: updated.revision,
-                intent: PluginManagementIntent::Continue,
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e.error.message))?;
+        let response = self
+            .mutate_plugin_admitted(
+                context,
+                &request,
+                PluginsMutateParams {
+                    workspace_id: parent.workspace_id.clone(),
+                    plugin_id: parent.id.clone(),
+                    expected_revision: parent.revision,
+                    intent: PluginManagementIntent::Continue,
+                },
+                admission,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.error.message))?;
+        let item = response.plugin.context("apps.dev_removed")?;
+        if item.state == "interrupted"
+            && let Some(code) = item
+                .diagnostics
+                .iter()
+                .find_map(|diagnostic| AppStorage::capacity_error(&diagnostic.code))
+        {
+            anyhow::bail!(code);
+        }
+        anyhow::ensure!(item.state == "installed", "apps.dev_mutation_pending");
         Ok(())
     }
 
@@ -212,6 +269,7 @@ impl MessageProcessor {
                 &runtime,
                 request,
                 guard.parent.kind.as_str(),
+                Some(&Path::new(&guard.parent.package_path).with_file_name("package-next")),
             )
             .await?;
         let (_source, candidate, plan) = load_uploaded_plugin(guard.parent.kind, source)
@@ -391,6 +449,17 @@ impl MessageProcessor {
         request: &RequestId,
         params: PluginsMutateParams,
     ) -> Result<PluginsMutationResponse, JsonRpcErrorResponse> {
+        self.mutate_plugin_admitted(context, request, params, None)
+            .await
+    }
+
+    async fn mutate_plugin_admitted(
+        &self,
+        context: &RequestContext,
+        request: &RequestId,
+        params: PluginsMutateParams,
+        mut app_install: Option<Arc<AppInstallAdmission>>,
+    ) -> Result<PluginsMutationResponse, JsonRpcErrorResponse> {
         let current = self
             .crud_store
             .find_package_installation(&params.plugin_id)
@@ -460,6 +529,19 @@ impl MessageProcessor {
             )
             .await
             .map_err(|error| plugin_error(request, native_plugin_error_code(&error)))?;
+        if guard.parent.kind == PackageKind::App
+            && app_install.is_none()
+            && matches!(
+                &params.intent,
+                PluginManagementIntent::Continue | PluginManagementIntent::Retry { .. }
+            )
+        {
+            app_install = Some(
+                self.app_storage
+                    .admit_continuation()
+                    .map_err(|error| plugin_error(request, AppStorage::error_code(&error)))?,
+            );
+        }
         let before = guard.parent.pending_json.clone();
         let action = match params.intent {
             PluginManagementIntent::Update {
@@ -494,9 +576,10 @@ impl MessageProcessor {
                         &runtime,
                         request,
                         guard.parent.kind.as_str(),
+                        Some(&Path::new(&guard.parent.package_path).with_file_name("package-next")),
                     )
                     .await?;
-                let (source, snapshot, plan) = load_uploaded_plugin(guard.parent.kind, source)
+                let (mut source, snapshot, plan) = load_uploaded_plugin(guard.parent.kind, source)
                     .await
                     .map_err(|error| package_parse_error(request, error))?;
                 if plan.tree_digest != expected_fingerprint {
@@ -552,16 +635,26 @@ impl MessageProcessor {
                 let staged = next.clone();
                 let limits = snapshot.limits();
                 let expected = plan.tree_digest.clone();
+                let kind = guard.parent.kind;
+                app_install = source.app_install.clone();
+                let stage_admission = app_install.clone();
+                let publication_space = source.publication_space.take();
+                let source_cleanup = source.cleanup.clone();
                 guard
                     .fs(move |_| {
+                        let _app_install = stage_admission;
+                        let _publication_space = publication_space;
+                        let _source_cleanup = source_cleanup;
                         if staged.exists() {
                             std::fs::remove_dir_all(&staged)?;
                         }
                         publish_package(&snapshot, &staged)?;
-                        anyhow::ensure!(
-                            Snapshot::capture(&staged, limits, || false)?.tree_digest() == expected,
-                            "plugins.package_changed"
-                        );
+                        let copy = if kind == PackageKind::App {
+                            Snapshot::capture_file_backed(&staged, limits, |_| false, || false)?
+                        } else {
+                            Snapshot::capture(&staged, limits, || false)?
+                        };
+                        verify_package_digest(&copy.checked_tree_digest()?, &expected)?;
                         Ok(())
                     })
                     .await
@@ -910,24 +1003,20 @@ impl MessageProcessor {
             }
             let fs_action = action.clone();
             let limits = guard.limits;
+            let fs_admission = app_install.clone();
             let plan = guard
                 .fs(move |parent| {
+                    let _app_install = fs_admission;
                     let package = Path::new(&parent.package_path);
                     if fs_action.kind == "update" {
-                        swap_package_after_stop(package, &fs_action.target_fingerprint, limits)?;
+                        swap_package_after_stop(package)?;
                     }
-                    let (snapshot, plan) = if super::super::apps::dev::is_dev(parent) {
-                        let snapshot = Snapshot::capture(package, limits, || false)?;
-                        let plan = super::package_plan::source_app_plan(
-                            pioneer_apps::load_source(&snapshot)?,
-                        )?;
-                        (snapshot, plan)
-                    } else {
-                        package_snapshot(package, limits, parent.kind)?
-                    };
-                    let digest = snapshot.tree_digest();
-                    let expected = &fs_action.target_fingerprint;
-                    anyhow::ensure!(&digest == expected, "plugins.package_changed");
+                    let (_, plan) = installed_package(
+                        parent,
+                        &tokio_util::sync::CancellationToken::new(),
+                        limits,
+                        &fs_action.target_fingerprint,
+                    )?;
                     Ok(plan)
                 })
                 .await?;
@@ -978,10 +1067,12 @@ impl MessageProcessor {
                         .await?;
                 }
             }
-            self.apply_plugin_components(context, request, &guard, &action, &plan)
+            self.apply_plugin_components(context, request, &guard, &action, &plan, &app_install)
                 .await?;
+            let cleanup_admission = app_install.clone();
             guard
                 .fs(move |parent| {
+                    let _app_install = cleanup_admission;
                     let next = Path::new(&parent.package_path).with_file_name("package-next");
                     if next.exists() {
                         std::fs::remove_dir_all(next)?;
@@ -1035,7 +1126,8 @@ impl MessageProcessor {
                                         "plugins.package_repair_required" => {
                                             "plugins.package_repair_required"
                                         }
-                                        _ => "plugins.repair_required",
+                                        code => AppStorage::capacity_error(code)
+                                            .unwrap_or("plugins.repair_required"),
                                     },
                                     _ => "plugins.stop_or_reload_unconfirmed",
                                 }
@@ -1116,9 +1208,15 @@ impl MessageProcessor {
                     skill_id: SkillId::new(id.clone())?,
                 },
                 Some(&write),
+                guard.parent.state == "removing",
             )
             .await
-            .map_err(|_| anyhow::anyhow!("plugins.component_remove_failed"))?;
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    AppStorage::capacity_error(&error.error.message)
+                        .unwrap_or("plugins.component_remove_failed")
+                )
+            })?;
         } else {
             let installation = self
                 .crud_store
@@ -1153,6 +1251,7 @@ impl MessageProcessor {
         guard: &PluginMutationGuard,
         action: &PackageAction,
         plan: &PackagePlan,
+        app_install: &Option<Arc<AppInstallAdmission>>,
     ) -> anyhow::Result<()> {
         for reserved in &action.children {
             let component = plan
@@ -1244,11 +1343,11 @@ impl MessageProcessor {
                             skills::SkillInstallSource::PackageMember(
                                 ownership.clone(),
                                 guard._lock.clone(),
+                                app_install.clone(),
                             ),
                         )
                         .await
                         .map(|_| ())
-                        .map_err(|_| ())
                     } else {
                         self.install_skill_source(
                             context,
@@ -1258,11 +1357,11 @@ impl MessageProcessor {
                             skills::SkillInstallSource::PackageMember(
                                 ownership.clone(),
                                 guard._lock.clone(),
+                                app_install.clone(),
                             ),
                         )
                         .await
                         .map(|_| ())
-                        .map_err(|_| ())
                     }
                 }
                 ComponentPlan::Mcp { server, .. } => {
@@ -1299,9 +1398,13 @@ impl MessageProcessor {
                             Err(plugin_error(request, "plugins.component_install_failed"))
                         }
                     })
-                    .map_err(|_| ())
                 }
             };
+            if let Err(error) = &result
+                && let Some(code) = AppStorage::capacity_error(&error.error.message)
+            {
+                anyhow::bail!(code);
+            }
             if result.is_err() {
                 self.crud_store
                     .record_plugin_component_failure(
@@ -1521,11 +1624,7 @@ impl MessageProcessor {
 /// Caller has a confirmed execution stop and owns the parent mutex. The three
 /// fixed host paths plus target digest identify crash boundaries; no file in the
 /// used package is replaced before that ACK, including assets-only updates.
-fn swap_package_after_stop(
-    package: &Path,
-    target: &str,
-    limits: pioneer_packages::Limits,
-) -> anyhow::Result<()> {
+fn swap_package_after_stop(package: &Path) -> anyhow::Result<()> {
     let next = package.with_file_name("package-next");
     let backup = package.with_file_name("package-backup");
     match (package.exists(), next.exists(), backup.exists()) {
@@ -1539,8 +1638,11 @@ fn swap_package_after_stop(
         (true, false, true) | (true, false, false) => {}
         _ => anyhow::bail!("plugins.package_repair_required"),
     }
-    let snapshot = Snapshot::capture(package, limits, || false)?;
-    anyhow::ensure!(snapshot.tree_digest() == target, "plugins.package_changed");
+    Ok(())
+}
+
+fn verify_package_digest(actual: &str, expected: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(actual == expected, "plugins.package_changed");
     Ok(())
 }
 
@@ -1581,7 +1683,7 @@ fn package_content_changes(
     fn supporting<'a>(
         snapshot: &'a Snapshot,
         plan: &PackagePlan,
-    ) -> std::collections::BTreeMap<&'a str, &'a pioneer_packages::Entry> {
+    ) -> std::collections::BTreeMap<&'a str, (Option<u32>, Option<[u8; 32]>)> {
         snapshot
             .entries()
             .iter()
@@ -1594,7 +1696,14 @@ fn package_content_changes(
                         _ => false,
                     })
             })
-            .map(|(path, entry)| (path.as_str(), entry))
+            .map(|(path, entry)| {
+                let signature = match entry {
+                    Entry::Directory { mode } => (Some(*mode), None),
+                    Entry::File { mode, .. } => (Some(*mode), snapshot.file_digest(path)),
+                    Entry::Denied => (None, None),
+                };
+                (path.as_str(), signature)
+            })
             .collect()
     }
     let mcp_document_modes = |snapshot: &Snapshot| {
@@ -1674,7 +1783,7 @@ mod tests {
             .unwrap()
             .tree_digest();
         std::fs::rename(&package, root.path().join("package-backup")).unwrap();
-        swap_package_after_stop(&package, &target, snapshot_limits()).unwrap();
+        swap_package_after_stop(&package).unwrap();
         assert_eq!(
             std::fs::read_to_string(package.join("SKILL.md")).unwrap(),
             "unchanged markdown"
@@ -1687,9 +1796,68 @@ mod tests {
             std::fs::read_to_string(root.path().join("package-backup/asset")).unwrap(),
             "before"
         );
-        swap_package_after_stop(&package, &target, snapshot_limits()).unwrap(); // Already swapped, no second rename.
-        assert!(swap_package_after_stop(&package, "wrong-target", snapshot_limits()).is_err());
+        swap_package_after_stop(&package).unwrap(); // Already swapped, no second rename.
+        let recovered = Snapshot::capture(&package, snapshot_limits(), || false)
+            .unwrap()
+            .tree_digest();
+        verify_package_digest(&recovered, &target).unwrap();
+        assert!(verify_package_digest(&recovered, "wrong-target").is_err());
     }
+
+    #[test]
+    fn installed_app_update_rejects_an_added_excluded_architecture_after_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        let next = root.path().join("package-next");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir_all(next.join("payloads/arm64")).unwrap();
+        std::fs::create_dir(next.join("src")).unwrap();
+        std::fs::write(next.join("payloads/arm64/payload"), b"data").unwrap();
+        let limits = pioneer_apps::PACKAGE_LIMITS;
+        let digest = Snapshot::capture(&next, limits, || false)
+            .unwrap()
+            .checked_member_digest("payloads/arm64")
+            .unwrap();
+        let manifest = json!({
+            "slug": "example-app", "name": "Example", "version": "1.2.3",
+            "shortDescription": "Example App", "developer": {"name": "Author"},
+            "icon": {"light": "icon.png", "dark": "icon.png"},
+            "runtime": {
+                "environment": "node", "cwd": "src", "command": ["node", "server.js"],
+                "port": 8000, "readiness": {"path": "/ready"},
+                "artifacts": {
+                    "linux/arm64": {"path": "payloads/arm64", "sha256": digest},
+                    "linux/amd64": {"path": "payloads/amd64", "sha256": "0".repeat(64)}
+                }
+            }
+        });
+        std::fs::write(next.join("app.json"), manifest.to_string()).unwrap();
+        let mut icon = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut icon, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(next.join("icon.png"), icon.into_inner()).unwrap();
+        let staged = pioneer_apps::capture_release(&next, limits, || false).unwrap();
+        let target = staged.checked_tree_digest().unwrap();
+        swap_package_after_stop(&package).unwrap();
+        let published = pioneer_apps::capture_release(&package, limits, || false).unwrap();
+        let plan = installed_app_plan(&published, "linux/arm64", || false).unwrap();
+        verify_package_digest(&plan.tree_digest, &target).unwrap();
+
+        std::fs::create_dir(package.join("payloads/amd64")).unwrap();
+        std::fs::write(package.join("payloads/amd64/extra"), b"added after swap").unwrap();
+        swap_package_after_stop(&package).unwrap(); // Continue after the earlier swap.
+        let changed = pioneer_apps::capture_release(&package, limits, || false).unwrap();
+        assert_ne!(changed.checked_tree_digest().unwrap(), target);
+        let (_, selected) =
+            pioneer_apps::select_release(&changed, "linux/arm64", || false).unwrap();
+        assert_eq!(selected.tree_digest, target);
+        let error = installed_app_plan(&changed, "linux/arm64", || false)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "plugins.package_changed");
+    }
+
     #[test]
     fn update_preview_does_not_disclose_hidden_old_members_or_diagnostic_pointers() {
         let hidden = PluginComponentKey {
@@ -1767,7 +1935,9 @@ mod tests {
                 entries.insert(path.into(), Entry::File { bytes, mode: 0o644 });
             }
             let snapshot = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
-            let plan = load_package(&snapshot, PackageKind::Plugin).unwrap();
+            let plan = prepare_package_plan(snapshot.clone(), PackageKind::Plugin, || false)
+                .unwrap()
+                .1;
             assert_eq!(plan.components.len(), 2);
             (snapshot, plan)
         };
@@ -1865,7 +2035,9 @@ mod tests {
             }
             let capture = || {
                 let snapshot = Snapshot::capture(root, snapshot_limits(), || false).unwrap();
-                let plan = load_package(&snapshot, PackageKind::Plugin).unwrap();
+                let plan = prepare_package_plan(snapshot.clone(), PackageKind::Plugin, || false)
+                    .unwrap()
+                    .1;
                 assert_eq!(plan.components.len(), 2);
                 (snapshot, plan)
             };

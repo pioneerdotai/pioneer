@@ -111,32 +111,22 @@ pub(super) fn app_metadata(
         ..Default::default()
     }
 }
-pub(super) fn load_package(snapshot: &Snapshot, kind: PackageKind) -> anyhow::Result<PackagePlan> {
-    match kind {
-        PackageKind::Plugin => Ok(pioneer_plugins::load(snapshot)
-            .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?
-            .into()),
-        PackageKind::App => {
-            let app = pioneer_apps::load_for_architecture(
-                snapshot,
-                super::super::apps::architecture().unwrap_or("unsupported"),
-            )?;
-            source_app_plan(app)
-        }
-    }
-}
-
-pub(super) fn select_package_snapshot(
+pub(super) fn prepare_package_plan(
     snapshot: Snapshot,
     kind: PackageKind,
-) -> anyhow::Result<Snapshot> {
-    if kind != PackageKind::App {
-        return Ok(snapshot);
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<(Snapshot, PackagePlan)> {
+    if kind == PackageKind::App {
+        let (snapshot, app) = pioneer_apps::select_release(
+            &snapshot,
+            super::super::apps::architecture().unwrap_or("unsupported"),
+            cancelled,
+        )?;
+        return Ok((snapshot, source_app_plan(app)?));
     }
-    pioneer_apps::SelectionPlan::select_architecture(
-        &snapshot,
-        super::super::apps::architecture().unwrap_or("unsupported"),
-    )
+    let plan = pioneer_plugins::load(&snapshot)
+        .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
+    Ok((snapshot, plan.into()))
 }
 
 pub(in crate::message) fn source_app_plan(

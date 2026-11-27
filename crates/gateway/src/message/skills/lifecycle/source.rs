@@ -1,5 +1,6 @@
 use super::super::upload::MaterializedSkillSource;
 use super::*;
+use crate::message::apps::storage::{AppInstallAdmission, AppStorage, DiskReservation};
 use pioneer_crud::PluginOwnershipWrite;
 
 /// Internal source contract. Package members are host-owned, already staged
@@ -14,6 +15,7 @@ pub(crate) enum SkillInstallSource {
     PackageMember(
         PluginOwnershipWrite,
         std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
+        Option<std::sync::Arc<AppInstallAdmission>>,
     ),
     OwnedUpload(SkillLifecycleSource, pioneer_crud::PluginNativeWrite),
 }
@@ -25,6 +27,7 @@ pub(super) enum PreparedInstallSource {
         _cleanup: crate::message::package_delivery::TemporaryDirectory,
         ownership: PluginOwnershipWrite,
         _admission: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
+        _app_install: Option<std::sync::Arc<AppInstallAdmission>>,
     },
 }
 impl PreparedInstallSource {
@@ -39,6 +42,36 @@ impl PreparedInstallSource {
         })
         .await
     }
+    pub(super) fn is_app_member(&self) -> bool {
+        matches!(
+            self,
+            Self::Package {
+                _app_install: Some(_),
+                ..
+            }
+        )
+    }
+
+    pub(super) fn commit(
+        &self,
+        storage: &AppStorage,
+        request: pioneer_skills::CommitPreparedSkillRequest,
+    ) -> (
+        Result<pioneer_skills::InstallSkillResult>,
+        Option<DiskReservation>,
+    ) {
+        let mut lock_space = None;
+        let result = if self.is_app_member() {
+            pioneer_skills::commit_prepared_skill_admitted(request, |path, bytes| {
+                lock_space = Some(AppSkillLockWrite::Budgeted.reserve(storage, path, bytes)?);
+                Ok(())
+            })
+        } else {
+            pioneer_skills::commit_prepared_skill(request)
+        };
+        (result, lock_space)
+    }
+
     pub fn uploaded(&self) -> Option<&MaterializedSkillSource> {
         match self {
             Self::Uploaded(upload) | Self::OwnedUpload(upload, _) => Some(upload),
@@ -136,7 +169,7 @@ impl MessageProcessor {
                     .await?;
                 Ok(PreparedInstallSource::OwnedUpload(upload, native))
             }
-            SkillInstallSource::PackageMember(ownership, admission) => {
+            SkillInstallSource::PackageMember(ownership, admission, app_install) => {
                 let parent = self
                     .crud_store
                     .find_package_installation(&ownership.plugin_id)
@@ -194,6 +227,8 @@ impl MessageProcessor {
                 let package_limits = self
                     .package_delivery_context()
                     .limits_for_package(parent.kind);
+                let storage = self.app_storage.clone();
+                let app = parent.kind == pioneer_protocol::PackageKind::App;
                 crate::message::package_delivery::prepare_cancellable(
                     move |cancellation| -> Result<PreparedInstallSource> {
                         let mut cleanup =
@@ -204,36 +239,89 @@ impl MessageProcessor {
                             &package.join(path),
                         )?;
                         crate::message::package_delivery::check_preparation(cancellation)?;
-                        let staged = pioneer_skills::stage_skill_folder(
-                            &source_dir,
-                            &location.install_root,
-                            &policy,
-                            true,
-                        )?;
+                        let disk = if app {
+                            anyhow::ensure!(
+                                app_install.is_some(),
+                                "apps.install_admission_missing"
+                            );
+                            Some(storage.reserve_skill_stage(
+                                &location.install_root.join(".staging"),
+                                policy.security.max_install_archive_bytes.max(1),
+                                package_limits,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let staged = if app {
+                            pioneer_skills::stage_app_skill_folder(
+                                &source_dir,
+                                &location.install_root,
+                                &policy,
+                                package_limits.expanded_bytes,
+                                package_limits.entries,
+                                || cancellation.is_cancelled(),
+                            )?
+                        } else {
+                            pioneer_skills::stage_skill_folder(
+                                &source_dir,
+                                &location.install_root,
+                                &policy,
+                                true,
+                            )?
+                        };
                         cleanup.remove_on_drop(staged.cleanup_root);
+                        // The staged files now count in filesystem free space.
+                        // Native commit renames them and reserves its lockfile separately.
+                        drop(disk);
                         let prepared = PreparedInstallSource::Package {
                             source_dir: staged.source_dir,
                             _cleanup: cleanup,
                             ownership,
                             _admission: admission,
+                            _app_install: app_install,
                         };
                         let expected = prepared
                             .ownership()
                             .expect("package source")
                             .package_fingerprint
                             .as_str();
-                        let copy = pioneer_packages::Snapshot::capture(
-                            prepared.source_dir(),
-                            package_limits,
-                            || cancellation.is_cancelled(),
-                        )?;
-                        anyhow::ensure!(copy.tree_digest() == expected, "plugins.package_changed");
+                        let digest = if app {
+                            pioneer_packages::Snapshot::capture_file_backed(
+                                prepared.source_dir(),
+                                package_limits,
+                                |_| false,
+                                || cancellation.is_cancelled(),
+                            )?
+                            .checked_tree_digest_cancellable(|| cancellation.is_cancelled())?
+                        } else {
+                            pioneer_packages::Snapshot::capture(
+                                prepared.source_dir(),
+                                package_limits,
+                                || cancellation.is_cancelled(),
+                            )?
+                            .tree_digest()
+                        };
+                        anyhow::ensure!(digest == expected, "plugins.package_changed");
                         Ok(prepared)
                     },
                 )
                 .await
-                .map_err(|_| invalid())
+                .map_err(|error| {
+                    app_skill_capacity_error(request_id, &error).unwrap_or_else(invalid)
+                })
             }
         }
     }
+}
+
+pub(super) fn app_skill_capacity_error(
+    request: &RequestId,
+    error: &anyhow::Error,
+) -> Option<JsonRpcErrorResponse> {
+    let diagnostic = AppStorage::capacity_error(&error.to_string())?;
+    Some(JsonRpcErrorResponse::new(
+        Some(request.clone()),
+        INVALID_REQUEST_CODE,
+        diagnostic,
+    ))
 }

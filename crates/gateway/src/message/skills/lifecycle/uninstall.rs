@@ -78,6 +78,7 @@ impl MessageProcessor {
             request_id.clone(),
             params,
             native.as_ref().map(|change| &change.write),
+            false,
         );
         let result = work.await;
         match (result, native) {
@@ -117,6 +118,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsUninstallParams,
         native: Option<&pioneer_crud::PluginNativeWrite>,
+        removing_package: bool,
     ) -> std::result::Result<SkillsUninstallResponse, JsonRpcErrorResponse> {
         let (response, publication) = self
             .uninstall_skill_deferred_with_plugin_change(
@@ -124,6 +126,7 @@ impl MessageProcessor {
                 request_id,
                 params,
                 native,
+                removing_package,
             )
             .await?;
         self.publish_skill_change(publication).await;
@@ -136,6 +139,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsUninstallParams,
         native: Option<&pioneer_crud::PluginNativeWrite>,
+        removing_package: bool,
     ) -> std::result::Result<(SkillsUninstallResponse, SkillChangePublication), JsonRpcErrorResponse>
     {
         let connection_id = request_context.connection_id();
@@ -240,50 +244,112 @@ impl MessageProcessor {
         } else {
             None
         };
-        if let Err(error) = self
-            .ensure_skills_lock_v2_locked(
+        let app_write = native
+            .filter(|write| write.kind == pioneer_protocol::PackageKind::App)
+            .map(|_| {
+                if removing_package {
+                    AppSkillLockWrite::RemovePackage
+                } else {
+                    AppSkillLockWrite::Budgeted
+                }
+            });
+        let lock_preparation = async {
+            if let Some(write) =
+                native.filter(|_| matches!(app_write, Some(AppSkillLockWrite::RemovePackage)))
+            {
+                // Both the parent mutation lock and the Skill write lock are
+                // held. Validate the current owner before any early deletion.
+                let owner = self
+                    .crud_store
+                    .find_skill_plugin_owner(&existing.skill_id)
+                    .await?;
+                anyhow::ensure!(
+                    existing.pack_id.is_none()
+                        && write.child_id == existing.skill_id.as_str()
+                        && owner.is_some_and(|link| {
+                            link.package_id == write.plugin_id
+                                && link.member_key == write.member_key
+                        }),
+                    "plugins.component_owner_changed"
+                );
+                return self
+                    .skill_lock_conversion_candidates(source_kind, workspace_id.as_str())
+                    .await
+                    .map(Some);
+            }
+            self.ensure_skills_lock_for_write(
                 location.lock_path.as_path(),
                 source_kind,
                 workspace_id.as_str(),
+                app_write,
             )
-            .await
-        {
-            return Err(skills_error(
-                Some(request_id),
-                INVALID_REQUEST_CODE,
-                SKILLS_ERROR_INTERNAL,
-                "failed to convert skills lock",
-                json!({"error": format!("{error:#}")}),
-            ));
+            .await?;
+            Ok(None)
         }
+        .await;
+        let reclaim_candidates = match lock_preparation {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                if let Some(response) = super::source::app_skill_capacity_error(&request_id, &error)
+                {
+                    return Err(response);
+                }
+                return Err(skills_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INTERNAL,
+                    "failed to prepare skills lock",
+                    json!({"error": format!("{error:#}")}),
+                ));
+            }
+        };
         let now = now_timestamp_secs();
         let remove_install_path =
             pioneer_owned_install_path(&location, existing.install_path.as_str()).is_some();
-        let uninstall_result =
-            match pioneer_skills::uninstall_skill(pioneer_skills::UninstallSkillRequest {
-                skill_id: params.skill_id.clone(),
-                owner: existing.owner.clone(),
-                slug: existing.slug.clone(),
-                source_kind: existing.source_kind.clone(),
-                install_path: PathBuf::from(existing.install_path.as_str()),
-                remove_install_path,
-                install_root: location.install_root.clone(),
-                lock_path: location.lock_path.clone(),
-                now_unix: now,
-                policy: installer_policy(&context),
-            }) {
-                Ok(result) => result,
-                Err(error) => {
-                    let mapped = map_lifecycle_error(&error, methods::SKILLS_UNINSTALL);
-                    return Err(skills_error(
-                        Some(request_id),
-                        mapped.jsonrpc_code,
-                        mapped.code,
-                        mapped.message,
-                        json!({"error": format!("{error:#}")}),
-                    ));
+        let uninstall_request = pioneer_skills::UninstallSkillRequest {
+            skill_id: params.skill_id.clone(),
+            owner: existing.owner.clone(),
+            slug: existing.slug.clone(),
+            source_kind: existing.source_kind.clone(),
+            install_path: PathBuf::from(existing.install_path.as_str()),
+            remove_install_path,
+            install_root: location.install_root.clone(),
+            lock_path: location.lock_path.clone(),
+            now_unix: now,
+            policy: installer_policy(&context),
+        };
+        let removed = if let Some(candidates) = reclaim_candidates {
+            pioneer_skills::uninstall_skill_reclaiming(
+                uninstall_request,
+                &candidates,
+                |path, bytes| {
+                    AppSkillLockWrite::RemovePackage.reserve(&self.app_storage, path, bytes)
+                },
+            )
+        } else if let Some(write) = app_write {
+            pioneer_skills::uninstall_skill_admitted(uninstall_request, |path, bytes| {
+                write.reserve(&self.app_storage, path, bytes)
+            })
+        } else {
+            pioneer_skills::uninstall_skill(uninstall_request)
+        };
+        let uninstall_result = match removed {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(response) = super::source::app_skill_capacity_error(&request_id, &error)
+                {
+                    return Err(response);
                 }
-            };
+                let mapped = map_lifecycle_error(&error, methods::SKILLS_UNINSTALL);
+                return Err(skills_error(
+                    Some(request_id),
+                    mapped.jsonrpc_code,
+                    mapped.code,
+                    mapped.message,
+                    json!({"error": format!("{error:#}")}),
+                ));
+            }
+        };
 
         let audit_records = skill_audit_records(uninstall_result.audit_events.as_slice());
         let packed_child = parent.is_some();

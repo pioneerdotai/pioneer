@@ -658,7 +658,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
         .skill_upload_owners
         .lock()
         .await
-        .insert(upload_id.clone(), owner.clone());
+        .insert(upload_id.clone(), owner.clone().into());
     let source = harness
         .processor
         .materialize_uploaded_archive_source(
@@ -668,6 +668,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
             &runtime,
             &RequestId::new(generate_test_request_id("transfer", "archive-control")).unwrap(),
             "plugin",
+            None,
         )
         .await
         .unwrap();
@@ -679,7 +680,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
         .skill_upload_owners
         .lock()
         .await
-        .insert(upload_id.clone(), owner.clone());
+        .insert(upload_id.clone(), owner.clone().into());
     let preview_id = generate_test_request_id("transfer", "owned-preview");
     let request = json!({"jsonrpc":"2.0","id":preview_id,"method":methods::PLUGINS_PREVIEW,
         "params":{"workspace_id":harness.workspace_id,"upload_id":upload_id}});
@@ -705,7 +706,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
                 .skill_upload_owners
                 .lock()
                 .await
-                .insert(upload_id.clone(), foreign_owner);
+                .insert(upload_id.clone(), foreign_owner.into());
         }
         for (suffix, method, params) in [
             (
@@ -802,7 +803,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
         .skill_upload_owners
         .lock()
         .await
-        .insert(bad_id.clone(), owner.clone());
+        .insert(bad_id.clone(), owner.clone().into());
     assert!(
         harness
             .processor
@@ -836,7 +837,8 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
                 &bad_id,
                 &runtime,
                 &request_id,
-                "plugin"
+                "plugin",
+                None,
             )
             .await
             .is_err()

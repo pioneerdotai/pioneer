@@ -12,7 +12,7 @@ pgconfig = { git = "https://github.com/momoi-labs/pgconfig.git", rev = "de1c43a5
 pioneer-migration.workspace = true
 process-wrap = { workspace = true, features = ["tokio1"] }
 sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
-sysinfo = { version = "0.31.4", default-features = false, features = ["disk", "system"] }
+sysinfo.workspace = true
 tempfile.workspace = true
 thiserror = "2"
 tokio.workspace = true

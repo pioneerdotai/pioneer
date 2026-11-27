@@ -401,6 +401,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # App disk admission needs a visible backing filesystem. Keep test
+          # staging off the container root's OverlayFS.
+          export TMPDIR="$RUNNER_TEMP/t"
+          mkdir -p "$TMPDIR"
           # Keep target/ at its original path for compile-time paths in tests.
           # Build options, including --locked --workspace, are stored in the archive.
           chmod +x "$RUNNER_TEMP/nextest/pioneer-postgres-test"

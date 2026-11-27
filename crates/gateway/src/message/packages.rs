@@ -1,11 +1,13 @@
 //! Bounded package delivery and sequential calls to the native installers.
+use super::apps::storage::AppStorage;
 use super::*;
 use anyhow::Context;
 mod lifecycle;
+pub(super) use lifecycle::dev_update_wait_reason;
 use pioneer_crud::PluginOwnershipWrite;
 use pioneer_packages::{ComponentPlan, Entry, Snapshot};
 pub(super) mod package_plan;
-use package_plan::{PackagePlan, load_package, select_package_snapshot};
+use package_plan::{PackagePlan, prepare_package_plan};
 use pioneer_protocol::constants::methods;
 use pioneer_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -275,6 +277,19 @@ fn component_preview(component: &ComponentPlan) -> PluginComponentItem {
     }
 }
 
+fn capture_package(
+    root: &Path,
+    limits: pioneer_packages::Limits,
+    kind: PackageKind,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Snapshot> {
+    if kind == PackageKind::App {
+        pioneer_apps::capture_release(root, limits, cancelled)
+    } else {
+        Snapshot::capture(root, limits, cancelled)
+    }
+}
+
 async fn load_uploaded_plugin(
     kind: PackageKind,
     source: super::package_delivery::upload::MaterializedSkillSource,
@@ -288,7 +303,7 @@ async fn load_uploaded_plugin(
             source.upload.purpose == kind.as_str(),
             "plugins.upload_purpose_mismatch"
         );
-        let snapshot = Snapshot::capture(&source.source_dir, source.package_limits, || {
+        let snapshot = capture_package(&source.source_dir, source.package_limits, kind, || {
             cancellation.is_cancelled()
         })?;
         super::package_delivery::check_preparation(cancellation)?;
@@ -299,8 +314,8 @@ async fn load_uploaded_plugin(
                 .any(|entry| matches!(entry, Entry::Denied)),
             "plugins.package_rejected"
         );
-        let snapshot = select_package_snapshot(snapshot, kind)?;
-        let plan = load_package(&snapshot, kind)?;
+        let (snapshot, plan) =
+            prepare_package_plan(snapshot, kind, || cancellation.is_cancelled())?;
         Ok((source, snapshot, plan))
     })
     .await
@@ -330,13 +345,10 @@ fn publish_package_cancellable(
             let path = root.join(key);
             match entry {
                 Entry::Directory { .. } => std::fs::create_dir_all(&path)?,
-                Entry::File { bytes, .. } => {
-                    use std::io::Write;
-                    let mut file = std::fs::File::create(&path)?;
-                    for chunk in bytes.chunks(64 * 1024) {
-                        super::package_delivery::check_preparation(cancellation)?;
-                        file.write_all(chunk)?;
-                    }
+                Entry::File { .. } => {
+                    snapshot.write_file(key, std::fs::File::create(&path)?, || {
+                        cancellation.is_cancelled()
+                    })?
                 }
                 Entry::Denied => unreachable!("validated package"),
             }
@@ -674,6 +686,7 @@ impl MessageProcessor {
                         .await?;
                 }
                 let runtime = self.package_delivery_context();
+                let storage_root = self.package_storage_root(&workspace, kind);
                 let source = self
                     .materialize_uploaded_archive_source(
                         &owner,
@@ -682,16 +695,25 @@ impl MessageProcessor {
                         &runtime,
                         id,
                         kind.as_str(),
+                        Some(&storage_root),
                     )
                     .await
                     .map_err(|error| {
                         if error.error.message == "package_delivery.busy" {
                             plugin_error(id, "plugins.busy")
+                        } else if matches!(
+                            error.error.message.as_str(),
+                            "apps.disk_capacity"
+                                | "apps.disk_capacity_unavailable"
+                                | "apps.storage_recovering"
+                                | "apps.install_busy"
+                        ) {
+                            error
                         } else {
                             plugin_error(id, "plugins.upload_unavailable_or_invalid_archive")
                         }
                     })?;
-                let (source, snapshot, plan) = load_uploaded_plugin(kind, source)
+                let (mut source, snapshot, plan) = load_uploaded_plugin(kind, source)
                     .await
                     .map_err(|error| package_parse_error(id, error))?;
                 if let Some(expected) = expected {
@@ -720,9 +742,9 @@ impl MessageProcessor {
                             context,
                             id,
                             &workspace,
-                            Some(&source.upload),
+                            Some(&mut source),
                             None,
-                            &self.package_storage_root(&workspace, kind),
+                            &storage_root,
                             snapshot,
                             plan,
                         )
@@ -774,12 +796,21 @@ impl MessageProcessor {
         context: &RequestContext,
         request_id: &RequestId,
         workspace: &str,
-        upload: Option<&pioneer_crud::SkillUploadSessionRecord>,
+        uploaded: Option<&mut super::package_delivery::upload::MaterializedSkillSource>,
         dev: Option<super::apps::dev::DevSource>,
         runtime_root: &Path,
         snapshot: Snapshot,
         plan: PackagePlan,
     ) -> Result<PluginItem, JsonRpcErrorResponse> {
+        let (upload, source_cleanup, uploaded_admission, uploaded_publication) = match uploaded {
+            Some(source) => (
+                Some(&source.upload),
+                Some(source.cleanup.clone()),
+                source.app_install.clone(),
+                source.publication_space.take(),
+            ),
+            None => (None, None, None, None),
+        };
         let error = || plugin_error(request_id, "plugins.install_failed");
         let plugin_id = pioneer_protocol::generate_id(21);
         let root = runtime_root.join(&plugin_id);
@@ -791,8 +822,27 @@ impl MessageProcessor {
             (None, Some(source)) if plan.kind == PackageKind::App => source.identity(workspace),
             _ => return Err(plugin_error(request_id, "plugins.invalid_prepared_source")),
         };
+        let (app_install, publication_space) = if dev.is_some() {
+            let writes = self
+                .app_storage
+                .admit_install(None, runtime_root)
+                .await
+                .map_err(|error| {
+                    plugin_error(
+                        request_id,
+                        super::apps::storage::AppStorage::error_code(&error),
+                    )
+                })?;
+            (Some(writes.admission), Some(writes.publication))
+        } else {
+            (uploaded_admission, uploaded_publication)
+        };
+        let stage_admission = app_install.clone();
         let (mut staging, plan, pending) = super::package_delivery::prepare_cancellable(
             move |cancellation| -> anyhow::Result<_> {
+                let _app_install = stage_admission;
+                let _publication_space = publication_space;
+                let _source_cleanup = source_cleanup;
                 let mut staging = super::package_delivery::TemporaryDirectory::new()?;
                 std::fs::create_dir_all(new_root.parent().context("plugins.root_invalid")?)?;
                 std::fs::create_dir(&new_root)?;
@@ -980,6 +1030,7 @@ impl MessageProcessor {
                         skills::SkillInstallSource::PackageMember(
                             ownership.clone(),
                             parent_guard._lock.clone(),
+                            app_install.clone(),
                         ),
                     )
                     .await
@@ -1023,6 +1074,17 @@ impl MessageProcessor {
                     }
                 }
             };
+            if let Err(error) = &result
+                && let Some(code) =
+                    super::apps::storage::AppStorage::capacity_error(&error.error.message)
+            {
+                self.crud_store
+                    .finish_plugin_mutation(&plugin_id, 1, "interrupted", Some(code.into()))
+                    .await
+                    .map_err(|_| plugin_error(request_id, "plugins.interrupted"))?;
+                self.publish_plugin_changed(&parent_guard.parent).await;
+                return Err(plugin_error(request_id, code));
+            }
             if result.is_err() {
                 // An operation can fail after its native commit (for example a
                 // reload error). Retain that real link and mark the component failed.
@@ -1239,12 +1301,33 @@ impl MessageProcessor {
                 runtime_status,
             });
         }
+        let storage_error = if parent.kind == PackageKind::App && parent.state == "interrupted" {
+            parent
+                .last_error
+                .as_deref()
+                .and_then(AppStorage::capacity_error)
+        } else {
+            None
+        };
         let mut diagnostics: Vec<PluginDiagnostic> = parent
             .last_error
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| {
-                if parent.state == "interrupted" {
+                if let Some(code) = storage_error {
+                    let message = match code {
+                        "apps.disk_capacity" => {
+                            "Insufficient disk space to continue the App operation"
+                        }
+                        "apps.storage_recovering" => "App storage recovery is still in progress",
+                        _ => "App disk capacity could not be determined",
+                    };
+                    vec![PluginDiagnostic {
+                        code: code.into(),
+                        path: String::new(),
+                        message: message.into(),
+                    }]
+                } else if parent.state == "interrupted" {
                     vec![PluginDiagnostic {
                         code: match parent.last_error.as_deref() {
                             Some("plugins.reapply_native_change") => "reapply_native_change",
@@ -1267,8 +1350,9 @@ impl MessageProcessor {
             });
         // Package pointers can name a hidden child even when its ID is removed.
         // Members receive only a neutral parent notice; management retains the
-        // complete authored inventory and package diagnostics.
-        if member {
+        // complete authored inventory and package diagnostics. Storage
+        // errors describe the whole operation and contain no child details.
+        if member && storage_error.is_none() {
             let unavailable = hidden || diagnostics.iter().any(diagnostic_affects_status);
             diagnostics.clear();
             if unavailable {

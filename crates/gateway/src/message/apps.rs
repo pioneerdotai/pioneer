@@ -2,12 +2,15 @@
 mod authority;
 pub(super) mod dev;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod host_capacity;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub(super) mod provision;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub(crate) mod runtime;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[path = "apps/unsupported.rs"]
 pub(crate) mod runtime;
+pub(super) mod storage;
 mod ui;
 use super::packages::plugin_error;
 use super::*;

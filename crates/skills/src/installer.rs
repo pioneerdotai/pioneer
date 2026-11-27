@@ -4,8 +4,9 @@ use crate::dependencies::{
     DependencyCheckInput, DependencyCheckResult, evaluate_skill_dependencies,
 };
 use crate::provenance::{
-    SkillLockEntry, SkillsLock, find_lock_entry, read_skills_lock, remove_lock_entry,
-    upsert_lock_entry, write_skills_lock_atomic,
+    SkillLockConversionCandidate, SkillLockEntry, SkillsLock, encode_skills_lock, find_lock_entry,
+    read_skills_lock, read_skills_lock_for_write, remove_lock_entry, upsert_lock_entry,
+    write_encoded_skills_lock_atomic, write_skills_lock_atomic,
 };
 use crate::security::{SkillSecurityPolicy, ensure_install_path_contained};
 use anyhow::{Context, Result, bail};
@@ -228,26 +229,89 @@ pub fn update_skill(request: UpdateSkillRequest) -> Result<InstallSkillResult> {
 }
 
 pub fn uninstall_skill(request: UninstallSkillRequest) -> Result<UninstallSkillResult> {
-    cleanup_staging(request.install_root.as_path());
+    uninstall_skill_inner(request, None::<fn(&Path, usize) -> Result<()>>, None)
+}
 
-    let mut lock = read_skills_lock(request.lock_path.as_path())?;
+/// Keep the App's lockfile reservation through native publication.
+pub fn uninstall_skill_admitted<T>(
+    request: UninstallSkillRequest,
+    reserve: impl FnOnce(&Path, usize) -> Result<T>,
+) -> Result<UninstallSkillResult> {
+    uninstall_skill_inner(request, Some(reserve), None)
+}
 
-    let removed_path = if request.remove_install_path {
-        let containment = ensure_install_path_contained(
-            request.install_root.as_path(),
-            request.install_path.as_path(),
+/// Finish a durable App removal. The caller holds the package and Skill
+/// write admissions and has verified that the package still owns this Skill.
+pub fn uninstall_skill_reclaiming<T>(
+    request: UninstallSkillRequest,
+    candidates: &[SkillLockConversionCandidate],
+    reserve: impl FnOnce(&Path, usize) -> Result<T>,
+) -> Result<UninstallSkillResult> {
+    uninstall_skill_inner(request, Some(reserve), Some(candidates))
+}
+
+fn uninstall_skill_inner<T>(
+    request: UninstallSkillRequest,
+    reserve: Option<impl FnOnce(&Path, usize) -> Result<T>>,
+    reclaim_candidates: Option<&[SkillLockConversionCandidate]>,
+) -> Result<UninstallSkillResult> {
+    if reclaim_candidates.is_none() {
+        cleanup_staging(request.install_root.as_path());
+    }
+
+    let mut lock = match reclaim_candidates {
+        Some(candidates) => read_skills_lock_for_write(&request.lock_path, candidates)?.0,
+        None => read_skills_lock(&request.lock_path)?,
+    };
+    let removed_lock = remove_lock_entry(&mut lock, &request.skill_id);
+
+    // A full volume may need the bytes from this Skill before the temporary
+    // lockfile fits. Only the canonical SkillId slot can be removed early.
+    let reclaim_first = reclaim_candidates.is_some()
+        && request.remove_install_path
+        && request.install_path
+            == canonical_skill_install_path(
+                &request.install_root,
+                &request.skill_id,
+                &request.slug,
+            )?;
+    let removed_path = if reclaim_first {
+        let slot = request
+            .install_path
+            .parent()
+            .context("missing Skill install parent")?;
+        anyhow::ensure!(
+            slot.canonicalize()?
+                == request
+                    .install_root
+                    .canonicalize()?
+                    .join(request.skill_id.as_str()),
+            "uninstall blocked by managed Skill slot policy"
         );
-        if containment.has_blocking_findings() {
-            bail!("uninstall blocked by containment policy");
-        }
-        remove_path_if_present(request.install_path.as_path())?
-            .then(|| request.install_path.clone())
+        remove_skill_install_path(&request)?
+    } else {
+        None
+    };
+    let admitted = if let Some(reserve) = reserve {
+        let payload = encode_skills_lock(&lock)?;
+        let space = reserve(&request.lock_path, payload.len())?;
+        Some((payload, space))
     } else {
         None
     };
 
-    let removed_lock = remove_lock_entry(&mut lock, &request.skill_id);
-    write_skills_lock_atomic(request.lock_path.as_path(), &lock)?;
+    let removed_path = if reclaim_first {
+        removed_path
+    } else {
+        remove_skill_install_path(&request)?
+    };
+
+    match admitted {
+        Some((payload, _space)) => {
+            write_encoded_skills_lock_atomic(&request.lock_path, &payload, |_| {})?;
+        }
+        None => write_skills_lock_atomic(&request.lock_path, &lock)?,
+    }
 
     let audit_event = SkillAuditEvent::uninstall(
         request.skill_id,
@@ -268,6 +332,18 @@ pub fn uninstall_skill(request: UninstallSkillRequest) -> Result<UninstallSkillR
         removed_lock_entry: removed_lock,
         audit_events: vec![audit_event],
     })
+}
+
+fn remove_skill_install_path(request: &UninstallSkillRequest) -> Result<Option<PathBuf>> {
+    if !request.remove_install_path {
+        return Ok(None);
+    }
+    let containment = ensure_install_path_contained(&request.install_root, &request.install_path);
+    anyhow::ensure!(
+        !containment.has_blocking_findings(),
+        "uninstall blocked by containment policy"
+    );
+    Ok(remove_path_if_present(&request.install_path)?.then(|| request.install_path.clone()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -837,6 +913,22 @@ impl MaterializedSkillFacts {
 }
 
 pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<InstallSkillResult> {
+    commit_prepared_skill_inner(request, None::<fn(&Path, usize) -> Result<()>>)
+}
+
+/// Let a package owner account for the atomic lockfile replacement and its
+/// rollback before the native installation moves any files.
+pub fn commit_prepared_skill_admitted(
+    request: CommitPreparedSkillRequest,
+    reserve_lock_write: impl FnOnce(&Path, usize) -> Result<()>,
+) -> Result<InstallSkillResult> {
+    commit_prepared_skill_inner(request, Some(reserve_lock_write))
+}
+
+fn commit_prepared_skill_inner(
+    request: CommitPreparedSkillRequest,
+    reserve_lock_write: Option<impl FnOnce(&Path, usize) -> Result<()>>,
+) -> Result<InstallSkillResult> {
     let prepared = request.prepared;
     let definition = prepared.definition.clone();
     let target_path = canonical_skill_install_path(
@@ -903,6 +995,35 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
             );
         }
     }
+
+    let previous_lock_bytes = if reserve_lock_write.is_some() {
+        encode_skills_lock(&lock)?.len()
+    } else {
+        0
+    };
+    let lock_entry = SkillLockEntry {
+        skill_id: definition.identity.skill_id.clone(),
+        owner: definition.identity.owner.clone(),
+        slug: definition.identity.slug.clone(),
+        source_kind: source_kind.clone(),
+        source_ref: prepared.source_ref.clone(),
+        install_path: target_path.display().to_string(),
+        version: definition.identity.version_hint.clone(),
+        trust_level: definition.runtime.trust_level.clone(),
+        fingerprint: definition.identity.fingerprint.clone(),
+        installed_at: previous_lock_entry
+            .as_ref()
+            .map(|entry| entry.installed_at)
+            .unwrap_or(request.now_unix),
+    };
+    upsert_lock_entry(&mut lock, lock_entry.clone());
+    let admitted_payload = if let Some(reserve_lock_write) = reserve_lock_write {
+        let payload = encode_skills_lock(&lock)?;
+        reserve_lock_write(&request.lock_path, payload.len().max(previous_lock_bytes))?;
+        Some(payload)
+    } else {
+        None
+    };
 
     let mut update_backup = None;
     match request.operation {
@@ -1001,23 +1122,11 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
         }
     }
 
-    let lock_entry = SkillLockEntry {
-        skill_id: definition.identity.skill_id.clone(),
-        owner: definition.identity.owner.clone(),
-        slug: definition.identity.slug.clone(),
-        source_kind: source_kind.clone(),
-        source_ref: prepared.source_ref.clone(),
-        install_path: target_path.display().to_string(),
-        version: definition.identity.version_hint.clone(),
-        trust_level: definition.runtime.trust_level.clone(),
-        fingerprint: definition.identity.fingerprint.clone(),
-        installed_at: previous_lock_entry
-            .as_ref()
-            .map(|entry| entry.installed_at)
-            .unwrap_or(request.now_unix),
+    let written = match admitted_payload {
+        Some(payload) => write_encoded_skills_lock_atomic(&request.lock_path, &payload, |_| {}),
+        None => write_skills_lock_atomic(&request.lock_path, &lock),
     };
-    upsert_lock_entry(&mut lock, lock_entry.clone());
-    if let Err(error) = write_skills_lock_atomic(request.lock_path.as_path(), &lock) {
+    if let Err(error) = written {
         let _ = remove_path_if_present(target_path.as_path());
         if let Some((backup_path, previous_path)) = &update_backup {
             let _ = fs::rename(backup_path.as_path(), previous_path.as_path());
@@ -1153,6 +1262,41 @@ pub fn stage_skill_folder(
     policy: &SkillInstallerPolicy,
     preserve_directory_modes: bool,
 ) -> Result<StagedSkillFolder> {
+    stage_skill_folder_inner(
+        source_path,
+        install_root,
+        policy,
+        preserve_directory_modes,
+        None,
+    )
+}
+
+/// Stage an existing App member with the same native Skill byte limits and
+/// the caller's independently reserved package entry limit.
+pub fn stage_app_skill_folder(
+    source_path: &Path,
+    install_root: &Path,
+    policy: &SkillInstallerPolicy,
+    max_bytes: usize,
+    max_entries: usize,
+    cancelled: impl Fn() -> bool,
+) -> Result<StagedSkillFolder> {
+    stage_skill_folder_inner(
+        source_path,
+        install_root,
+        policy,
+        true,
+        Some((max_bytes, max_entries, &cancelled)),
+    )
+}
+
+fn stage_skill_folder_inner(
+    source_path: &Path,
+    install_root: &Path,
+    policy: &SkillInstallerPolicy,
+    preserve_directory_modes: bool,
+    app_limit: Option<(usize, usize, &dyn Fn() -> bool)>,
+) -> Result<StagedSkillFolder> {
     let source_root = fs::canonicalize(source_path).with_context(|| {
         format!(
             "failed to canonicalize source path `{}`",
@@ -1193,8 +1337,13 @@ pub fn stage_skill_folder(
         source_root.as_path(),
         staged_skill_dir.as_path(),
         policy.security.max_install_file_bytes.max(1),
-        policy.security.max_install_archive_bytes.max(1),
+        policy
+            .security
+            .max_install_archive_bytes
+            .max(1)
+            .min(app_limit.map_or(usize::MAX, |(bytes, _, _)| bytes)),
         preserve_directory_modes,
+        app_limit,
     ) {
         let _ = fs::remove_dir_all(&staging_session_dir);
         return Err(error);
@@ -1222,10 +1371,12 @@ fn copy_tree_secure(
     max_file_bytes: usize,
     max_total_bytes: usize,
     preserve_directory_modes: bool,
+    app_limit: Option<(usize, usize, &dyn Fn() -> bool)>,
 ) -> Result<()> {
     let mut queue = VecDeque::new();
     queue.push_back(PathBuf::new());
     let mut total_copied = 0usize;
+    let mut entries_copied = 0usize;
     let mut directory_modes = Vec::new();
 
     while let Some(relative) = queue.pop_front() {
@@ -1235,6 +1386,11 @@ fn copy_tree_secure(
         })?;
 
         for entry in entries.flatten() {
+            if let Some((_, limit, cancelled)) = app_limit {
+                entries_copied += 1;
+                anyhow::ensure!(!cancelled(), "cancelled");
+                anyhow::ensure!(entries_copied <= limit, "entry_limit");
+            }
             let source_path = entry.path();
             let metadata = fs::symlink_metadata(source_path.as_path()).with_context(|| {
                 format!("failed to read metadata for `{}`", source_path.display())
@@ -1289,7 +1445,14 @@ fn copy_tree_secure(
                         format!("failed to create parent directory `{}`", parent.display())
                     })?;
                 }
-                fs::copy(source_path.as_path(), target_path.as_path()).with_context(|| {
+                let copied = if let Some((_, _, cancelled)) = app_limit {
+                    copy_app_skill_file(&source_path, &target_path, file_size, cancelled)
+                } else {
+                    fs::copy(&source_path, &target_path)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                };
+                copied.with_context(|| {
                     format!(
                         "failed to copy `{}` to `{}`",
                         source_path.display(),
@@ -1305,6 +1468,35 @@ fn copy_tree_secure(
     for (path, mode) in directory_modes.into_iter().rev() {
         fs::set_permissions(path, mode)?;
     }
+    Ok(())
+}
+
+fn copy_app_skill_file(
+    source: &Path,
+    target: &Path,
+    size: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let mut remaining = size;
+    let mut chunk = [0; 64 * 1024];
+    while remaining != 0 {
+        anyhow::ensure!(!cancelled(), "cancelled");
+        let wanted = remaining.min(chunk.len());
+        let read = input.read(&mut chunk[..wanted])?;
+        anyhow::ensure!(read != 0, "source_changed");
+        output.write_all(&chunk[..read])?;
+        remaining -= read;
+    }
+    anyhow::ensure!(!cancelled(), "cancelled");
+    anyhow::ensure!(input.read(&mut chunk[..1])? == 0, "source_changed");
+    output.set_permissions(input.metadata()?.permissions())?;
     Ok(())
 }
 
@@ -1578,6 +1770,75 @@ mod tests {
         assert!(uninstall.removed_path.is_some());
         assert!(!update.install_path.exists());
         assert_eq!(uninstall.audit_events.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_removal_reclaims_the_owned_slot_before_replacing_a_legacy_lock() {
+        let root = temp_case("app-reclaim-legacy-lock");
+        let install_root = root.join("managed");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("AAAAAAAAAAAAAAAAAAAAA");
+        let install_path =
+            super::canonical_skill_install_path(&install_root, &skill_id, "owned").unwrap();
+        let sibling = install_root.join("other-skill");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("payload"), b"reclaimable bytes").unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let legacy = "version=1
+[[entries]]
+owner='registry'
+slug='owned'
+source_kind='registry'
+source_ref='old'
+install_path='/old/owned'
+trust_level='verified'
+fingerprint='old-fp'
+installed_at=1
+";
+        fs::write(&lock_path, legacy).unwrap();
+        let candidates = [crate::SkillLockConversionCandidate {
+            skill_id: skill_id.clone(),
+            owner: Some("registry".into()),
+            slug: "owned".into(),
+            source_kind: "registry".into(),
+            source_ref: "upload:owned".into(),
+            install_path: install_path.to_string_lossy().into_owned(),
+            version: None,
+            trust_level: crate::SkillTrustLevel::Verified,
+            fingerprint: "fp".into(),
+        }];
+        let request = UninstallSkillRequest {
+            skill_id,
+            owner: Some("registry".into()),
+            slug: "owned".into(),
+            source_kind: "registry".into(),
+            install_path: install_path.clone(),
+            remove_install_path: true,
+            install_root,
+            lock_path: lock_path.clone(),
+            now_unix: 2,
+            policy: Default::default(),
+        };
+
+        let first = super::uninstall_skill_reclaiming(
+            request.clone(),
+            &candidates,
+            |path, _| -> anyhow::Result<()> {
+                assert_eq!(path, lock_path.as_path());
+                assert!(!install_path.exists());
+                assert_eq!(fs::read_to_string(path)?, legacy);
+                anyhow::bail!("apps.disk_capacity");
+            },
+        );
+        assert_eq!(first.err().unwrap().to_string(), "apps.disk_capacity");
+        let resumed =
+            super::uninstall_skill_reclaiming(request, &candidates, |_, _| Ok(())).unwrap();
+        assert!(resumed.removed_path.is_none());
+        assert!(resumed.removed_lock_entry.is_some());
+        assert!(read_skills_lock(&lock_path).unwrap().entries.is_empty());
+        assert!(sibling.is_dir());
 
         let _ = fs::remove_dir_all(root);
     }

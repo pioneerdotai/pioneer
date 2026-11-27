@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -33,6 +33,67 @@ pub struct Snapshot {
     entries: BTreeMap<String, Entry>,
     limits: Limits,
     root_mode: u32,
+    file_backing: BTreeMap<String, CapturedFile>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedFile {
+    path: PathBuf,
+    metadata: fs::Metadata,
+    sha256: [u8; 32],
+}
+
+impl CapturedFile {
+    fn stream(
+        &self,
+        cancelled: &impl Fn() -> bool,
+        mut write: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(!cancelled(), "cancelled");
+        let mut file = open_backing_file(&self.path)?;
+        let opened = file.metadata()?;
+        anyhow::ensure!(
+            opened.is_file() && same_file(&self.metadata, &opened),
+            "source_changed"
+        );
+        let mut limited = (&mut file).take(self.metadata.len());
+        let mut hash = Sha256::new();
+        let mut chunk = [0; 64 * 1024];
+        loop {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            let count = limited.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            let bytes = &chunk[..count];
+            hash.update(bytes);
+            write(bytes)?;
+        }
+        anyhow::ensure!(
+            limited.limit() == 0
+                && <[u8; 32]>::from(hash.finalize()) == self.sha256
+                && same_file(&self.metadata, &file.metadata()?),
+            "source_changed"
+        );
+        Ok(())
+    }
+}
+
+fn open_backing_file(path: &Path) -> std::io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+struct FileBacking<'a> {
+    retain: &'a dyn Fn(&str) -> bool,
+    files: BTreeMap<String, CapturedFile>,
+    retained_bytes: usize,
 }
 
 impl Snapshot {
@@ -43,7 +104,26 @@ impl Snapshot {
         if !root.is_dir() {
             bail!("source_kind");
         }
-        capture_once(&root, limits, &cancelled)
+        capture_once(&root, limits, &cancelled, None)
+    }
+    /// Keep interpreted documents in memory and fingerprint other regular files
+    /// for checked streaming. Callers own the lifetime of the source directory.
+    pub fn capture_file_backed(
+        root: &Path,
+        limits: Limits,
+        retain: impl Fn(&str) -> bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self> {
+        let root = root.canonicalize().context("source_unavailable")?;
+        anyhow::ensure!(root.is_dir(), "source_kind");
+        let mut backing = FileBacking {
+            retain: &retain,
+            files: BTreeMap::new(),
+            retained_bytes: 0,
+        };
+        let mut snapshot = capture_once(&root, limits, &cancelled, Some(&mut backing))?;
+        snapshot.file_backing = backing.files;
+        Ok(snapshot)
     }
     pub fn from_entries(entries: BTreeMap<String, Entry>, limits: Limits) -> Result<Self> {
         if entries.len() > limits.entries {
@@ -77,6 +157,7 @@ impl Snapshot {
             entries,
             limits,
             root_mode: 0o755,
+            file_backing: BTreeMap::new(),
         })
     }
     /// Remove unneeded payload subtrees without changing captured bytes, modes or limits.
@@ -112,6 +193,12 @@ impl Snapshot {
         }
         let mut selected = Self::from_entries(entries, self.limits)?;
         selected.root_mode = self.root_mode;
+        selected.file_backing = self
+            .file_backing
+            .iter()
+            .filter(|(key, _)| selected.entries.contains_key(*key))
+            .map(|(key, file)| (key.clone(), file.clone()))
+            .collect();
         Ok(selected)
     }
     pub fn root_mode(&self) -> u32 {
@@ -125,28 +212,136 @@ impl Snapshot {
     }
     pub fn file(&self, key: &str) -> Option<&[u8]> {
         match self.entries.get(key) {
-            Some(Entry::File { bytes, .. }) => Some(bytes),
+            Some(Entry::File { bytes, .. }) if !self.file_backing.contains_key(key) => Some(bytes),
             _ => None,
         }
     }
+    pub fn file_digest(&self, key: &str) -> Option<[u8; 32]> {
+        self.file_backing
+            .get(key)
+            .map(|file| file.sha256)
+            .or_else(|| self.file(key).map(|bytes| Sha256::digest(bytes).into()))
+    }
+
+    pub fn write_file(
+        &self,
+        key: &str,
+        mut output: impl Write,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.stream_file(key, &cancelled, |chunk| {
+            output.write_all(chunk)?;
+            Ok(())
+        })
+    }
+
+    fn stream_file(
+        &self,
+        key: &str,
+        cancelled: &impl Fn() -> bool,
+        mut write: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(file) = self.file_backing.get(key) {
+            return file.stream(cancelled, write);
+        }
+        for chunk in self.file(key).context("missing_file")?.chunks(64 * 1024) {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            write(chunk)?;
+        }
+        Ok(())
+    }
+
     pub fn tree_digest(&self) -> String {
+        assert!(
+            self.file_backing.is_empty(),
+            "use checked digest for file-backed capture"
+        );
+        self.checked_tree_digest().expect("in-memory package")
+    }
+
+    pub fn checked_tree_digest(&self) -> Result<String> {
+        self.checked_tree_digest_cancellable(|| false)
+    }
+
+    pub fn checked_tree_digest_cancellable(&self, cancelled: impl Fn() -> bool) -> Result<String> {
         let root = Entry::Directory {
             mode: self.root_mode,
         };
-        digest_entries(
-            std::iter::once(("", &root)).chain(self.entries.iter().map(|(k, v)| (k.as_str(), v))),
-        )
-    }
-    pub fn member_digest(&self, prefix: &str) -> String {
-        let root = self.entries.get(prefix);
-        let prefix = format!("{prefix}/");
-        digest_entries(
-            root.into_iter().map(|root| ("", root)).chain(
+        self.digest_entries(
+            std::iter::once(("", "", &root)).chain(
                 self.entries
                     .iter()
-                    .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|k| (k, v))),
+                    .map(|(key, entry)| (key.as_str(), key.as_str(), entry)),
             ),
+            &cancelled,
         )
+    }
+
+    pub fn member_digest(&self, prefix: &str) -> String {
+        assert!(
+            self.file_backing.is_empty(),
+            "use checked digest for file-backed capture"
+        );
+        self.checked_member_digest(prefix)
+            .expect("in-memory package")
+    }
+
+    pub fn checked_member_digest(&self, member: &str) -> Result<String> {
+        self.checked_member_digest_cancellable(member, || false)
+    }
+
+    pub fn checked_member_digest_cancellable(
+        &self,
+        member: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<String> {
+        let prefix = format!("{member}/");
+        self.digest_entries(
+            self.entries
+                .get(member)
+                .into_iter()
+                .map(|root| ("", member, root))
+                .chain(self.entries.iter().filter_map(|(key, entry)| {
+                    key.strip_prefix(&prefix)
+                        .map(|relative| (relative, key.as_str(), entry))
+                })),
+            &cancelled,
+        )
+    }
+
+    fn digest_entries<'a>(
+        &self,
+        entries: impl Iterator<Item = (&'a str, &'a str, &'a Entry)>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<String> {
+        let mut hash = Sha256::new();
+        hash.update(b"pioneer-plugin-tree-v1\0");
+        for (name, key, entry) in entries {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            match entry {
+                Entry::Directory { mode } => {
+                    hash.update(b"d");
+                    hash.update(mode.to_le_bytes());
+                }
+                Entry::File { bytes, mode } => {
+                    hash.update(b"f");
+                    hash.update(mode.to_le_bytes());
+                    let len = self
+                        .file_backing
+                        .get(key)
+                        .map_or(bytes.len() as u64, |file| file.metadata.len());
+                    hash.update(len.to_le_bytes());
+                    self.stream_file(key, cancelled, |chunk| {
+                        hash.update(chunk);
+                        Ok(())
+                    })?;
+                }
+                Entry::Denied => hash.update(b"x"),
+            }
+        }
+        Ok(hex::encode(hash.finalize()))
     }
 }
 
@@ -170,7 +365,12 @@ fn validate_key(key: &str, max_depth: usize) -> Result<()> {
     }
     Ok(())
 }
-fn capture_once(root: &Path, limits: Limits, cancelled: &impl Fn() -> bool) -> Result<Snapshot> {
+fn capture_once(
+    root: &Path,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+    backing: Option<&mut FileBacking<'_>>,
+) -> Result<Snapshot> {
     let mut entries = BTreeMap::new();
     let mut active = BTreeSet::new();
     let mut total = 0;
@@ -183,6 +383,7 @@ fn capture_once(root: &Path, limits: Limits, cancelled: &impl Fn() -> bool) -> R
         &mut entries,
         &mut active,
         &mut total,
+        backing,
     )?;
     let mut snapshot = Snapshot::from_entries(entries, limits)?;
     snapshot.root_mode = mode(&fs::metadata(root)?);
@@ -198,6 +399,7 @@ fn visit(
     entries: &mut BTreeMap<String, Entry>,
     active: &mut BTreeSet<PathBuf>,
     total: &mut usize,
+    mut backing: Option<&mut FileBacking<'_>>,
 ) -> Result<()> {
     if cancelled() {
         bail!("cancelled");
@@ -257,6 +459,7 @@ fn visit(
                 entries,
                 active,
                 total,
+                backing.as_deref_mut(),
             ) {
                 if error
                     .downcast_ref::<std::io::Error>()
@@ -266,6 +469,11 @@ fn visit(
                     // so discovery can apply the narrow normative boundary.
                     let prefix = format!("{child_key}/");
                     entries.retain(|key, _| key != &child_key && !key.starts_with(&prefix));
+                    if let Some(backing) = backing.as_deref_mut() {
+                        backing
+                            .files
+                            .retain(|key, _| key != &child_key && !key.starts_with(&prefix));
+                    }
                     entries.insert(child_key, Entry::Denied);
                     if let Ok(resolved) = child.path().canonicalize() {
                         active.retain(|path| !path.starts_with(&resolved));
@@ -283,12 +491,19 @@ fn visit(
         if metadata.len() > limits.entry_bytes as u64 {
             bail!("entry_size_limit");
         }
-        let mut file = File::open(&resolved)?;
+        let mut file = if backing.is_some() {
+            open_backing_file(&resolved)?
+        } else {
+            File::open(&resolved)?
+        };
         let before = file.metadata()?;
         if !same_file(&metadata, &before) {
             bail!("source_changed");
         }
+        let retain = backing.as_ref().is_none_or(|backing| (backing.retain)(key));
         let mut bytes = Vec::new();
+        let mut hash = Sha256::new();
+        let mut size = 0usize;
         let mut chunk = [0u8; 64 * 1024];
         loop {
             if cancelled() {
@@ -298,27 +513,50 @@ fn visit(
             if read == 0 {
                 break;
             }
-            if bytes
-                .len()
-                .checked_add(read)
-                .is_none_or(|size| size > limits.entry_bytes)
-            {
-                bail!("entry_size_limit");
+            size = size.checked_add(read).context("entry_size_limit")?;
+            anyhow::ensure!(size <= limits.entry_bytes, "entry_size_limit");
+            anyhow::ensure!(
+                total
+                    .checked_add(size)
+                    .is_some_and(|n| n <= limits.expanded_bytes),
+                "expanded_limit"
+            );
+            if retain {
+                if let Some(backing) = &backing {
+                    // Preserve the previous App metadata envelope while allowing
+                    // substantially larger uninterpreted payloads.
+                    anyhow::ensure!(
+                        size <= 64 * 1024 * 1024
+                            && backing.retained_bytes.saturating_add(size) <= 256 * 1024 * 1024,
+                        "package_metadata_limit"
+                    );
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            } else {
+                hash.update(&chunk[..read]);
             }
-            bytes.extend_from_slice(&chunk[..read]);
         }
-        if bytes.len() > limits.entry_bytes {
-            bail!("entry_size_limit");
-        }
-        if !same_file(&before, &file.metadata()?)
+        if size as u64 != before.len()
+            || !same_file(&before, &file.metadata()?)
             || path.canonicalize()? != resolved
             || !same_file(&before, &fs::metadata(&resolved)?)
         {
             bail!("source_changed");
         }
-        *total = total.checked_add(bytes.len()).context("expanded_limit")?;
-        if *total > limits.expanded_bytes {
-            bail!("expanded_limit");
+        *total += size;
+        if let Some(backing) = backing {
+            if retain {
+                backing.retained_bytes += size;
+            } else {
+                backing.files.insert(
+                    key.into(),
+                    CapturedFile {
+                        path: resolved,
+                        metadata: before.clone(),
+                        sha256: hash.finalize().into(),
+                    },
+                );
+            }
         }
         entries.insert(
             key.into(),
@@ -331,28 +569,6 @@ fn visit(
         entries.insert(key.into(), Entry::Denied);
     }
     Ok(())
-}
-fn digest_entries<'a>(entries: impl Iterator<Item = (&'a str, &'a Entry)>) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"pioneer-plugin-tree-v1\0");
-    for (key, entry) in entries {
-        hash.update((key.len() as u64).to_le_bytes());
-        hash.update(key.as_bytes());
-        match entry {
-            Entry::Directory { mode } => {
-                hash.update(b"d");
-                hash.update(mode.to_le_bytes());
-            }
-            Entry::File { bytes, mode } => {
-                hash.update(b"f");
-                hash.update(mode.to_le_bytes());
-                hash.update((bytes.len() as u64).to_le_bytes());
-                hash.update(bytes);
-            }
-            Entry::Denied => hash.update(b"x"),
-        }
-    }
-    hex::encode(hash.finalize())
 }
 fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     let common = a.len() == b.len() && a.modified().ok() == b.modified().ok() && mode(a) == mode(b);
@@ -848,5 +1064,63 @@ fn selected_link(metadata: &fs::Metadata) -> bool {
     #[cfg(not(windows))]
     {
         metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(test)]
+mod file_backing_tests {
+    use super::*;
+
+    #[test]
+    fn package_and_member_digests_match_in_memory_capture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir(temp.path().join("payload"))?;
+        fs::write(temp.path().join("app.json"), b"manifest")?;
+        let payload = temp.path().join("payload/lib");
+        let bytes = vec![42; 64 * 1024 + 7];
+        fs::write(&payload, &bytes)?;
+        let limits = Limits {
+            expanded_bytes: 128 * 1024,
+            entry_bytes: 128 * 1024,
+            entries: 10,
+            depth: 10,
+            components: 10,
+        };
+        let buffered = Snapshot::capture(temp.path(), limits, || false)?;
+        let streamed =
+            Snapshot::capture_file_backed(temp.path(), limits, |key| key == "app.json", || false)?;
+
+        assert_eq!(streamed.checked_tree_digest()?, buffered.tree_digest());
+        assert_eq!(
+            streamed.checked_member_digest("payload")?,
+            buffered.member_digest("payload")
+        );
+        assert_eq!(
+            streamed.file_digest("payload/lib"),
+            buffered.file_digest("payload/lib")
+        );
+        assert_eq!(streamed.file("app.json"), buffered.file("app.json"));
+        assert!(streamed.file("payload/lib").is_none());
+        let checkpoints = std::cell::Cell::new(0);
+        let error = streamed
+            .checked_member_digest_cancellable("payload/lib", || {
+                let current = checkpoints.get() + 1;
+                checkpoints.set(current);
+                current == 4
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+        let mut copy = Vec::new();
+        streamed.write_file("payload/lib", &mut copy, || false)?;
+        assert_eq!(copy, bytes);
+
+        fs::write(payload, vec![11; bytes.len()])?;
+        assert!(
+            streamed
+                .write_file("payload/lib", Vec::new(), || false)
+                .is_err()
+        );
+        assert!(streamed.checked_tree_digest().is_err());
+        Ok(())
     }
 }

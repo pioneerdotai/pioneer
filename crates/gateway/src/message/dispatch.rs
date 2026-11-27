@@ -8547,7 +8547,7 @@ impl MessageProcessor {
         self.skill_upload_owners
             .lock()
             .await
-            .retain(|_, owner| owner.connection_id != connection_id);
+            .retain(|_, owner| owner.owner.connection_id != connection_id);
 
         let removed_threads = self
             .thread_manager
