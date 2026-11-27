@@ -1723,6 +1723,38 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(super) async fn send_retryable_thread_notification<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        candidates: Vec<ConnectionId>,
+    ) -> anyhow::Result<()> {
+        let (candidates, unavailable) = self
+            .thread_connection_checks(thread_id, candidates, true)
+            .await;
+        anyhow::ensure!(
+            !unavailable,
+            "thread notification authorization unavailable"
+        );
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let serialized = self
+            .serialize_notification(method, payload)
+            .ok_or_else(|| anyhow::anyhow!("thread notification serialization failed"))?;
+        let (recipients, unavailable) = self
+            .thread_connection_checks(thread_id, candidates, true)
+            .await;
+        anyhow::ensure!(
+            !unavailable,
+            "final thread notification authorization unavailable"
+        );
+        self.send_serialized_notification_to_connections(method, &serialized, recipients)
+            .await;
+        Ok(())
+    }
+
     pub(super) async fn authorized_thread_notification_recipients(
         &self,
         thread_id: &str,
@@ -1741,11 +1773,22 @@ impl MessageProcessor {
         thread_id: &str,
         connection_ids: Vec<ConnectionId>,
     ) -> Vec<ConnectionId> {
+        self.thread_connection_checks(thread_id, connection_ids, false)
+            .await
+            .0
+    }
+
+    async fn thread_connection_checks(
+        &self,
+        thread_id: &str,
+        connection_ids: Vec<ConnectionId>,
+        retryable: bool,
+    ) -> (Vec<ConnectionId>, bool) {
         let candidates = connection_ids
             .into_iter()
             .map(|connection_id| (connection_id, None))
             .collect();
-        self.authorized_thread_notification_candidates(thread_id, candidates)
+        self.check_thread_notification_candidates(thread_id, candidates, retryable)
             .await
     }
 
@@ -1757,6 +1800,20 @@ impl MessageProcessor {
             Option<crate::thread::ThreadSubscriptionIdentity>,
         )>,
     ) -> Vec<ConnectionId> {
+        self.check_thread_notification_candidates(thread_id, candidates, false)
+            .await
+            .0
+    }
+
+    async fn check_thread_notification_candidates(
+        &self,
+        thread_id: &str,
+        candidates: Vec<(
+            ConnectionId,
+            Option<crate::thread::ThreadSubscriptionIdentity>,
+        )>,
+        retryable: bool,
+    ) -> (Vec<ConnectionId>, bool) {
         use crate::authorization::{
             ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
             DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
@@ -1765,12 +1822,13 @@ impl MessageProcessor {
 
         let thread_id = thread_id.trim();
         if thread_id.is_empty() || candidates.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let service = AuthorizationService::new();
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
         let mut recipients = Vec::with_capacity(candidates.len());
+        let mut unavailable = false;
 
         for (connection_id, expected_identity) in candidates {
             let Ok(principal) = self
@@ -1792,21 +1850,36 @@ impl MessageProcessor {
                 continue;
             }
 
-            if let Some(auth_service) = self.auth_service.as_ref()
-                && auth_service
-                    .validate_session_lease_with_database(
-                        principal.as_ref(),
-                        &self.crud_store.database_connection(),
-                    )
-                    .await
-                    .is_err()
-            {
-                let decision = AuthorizationDecision::Deny {
-                    reason: DenyReason::InactivePrincipal,
-                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+            if let Some(auth_service) = self.auth_service.as_ref() {
+                let db = self.crud_store.database_connection();
+                let lease = if retryable {
+                    auth_service
+                        .validate_retryable_notification_lease(principal.as_ref(), &db)
+                        .await
+                } else {
+                    auth_service
+                        .validate_session_lease_with_database(principal.as_ref(), &db)
+                        .await
                 };
-                record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
-                continue;
+                if let Err(error) = lease {
+                    if retryable
+                        && error.code() == crate::auth::AuthErrorCode::TemporarilyUnavailable
+                    {
+                        unavailable = true;
+                        record_authorization_unavailable(
+                            ResourceAction::ThreadRead.safe_name(),
+                            "thread",
+                            "notification",
+                        );
+                    } else {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::InactivePrincipal,
+                            disclosure: DisclosurePolicy::AuthenticationTerminal,
+                        };
+                        record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                    }
+                    continue;
+                }
             }
 
             let action_gate = service.authorize_action(
@@ -1847,6 +1920,7 @@ impl MessageProcessor {
                         record_thread_notification_decision(action, &decision);
                     }
                     Err(error) => {
+                        unavailable = true;
                         record_authorization_unavailable(
                             action.safe_name(),
                             "runtime_draft",
@@ -1874,6 +1948,7 @@ impl MessageProcessor {
             {
                 Ok(resolution) => resolution,
                 Err(error) => {
+                    unavailable = true;
                     record_authorization_unavailable(
                         ResourceAction::ThreadRead.safe_name(),
                         "thread",
@@ -1908,6 +1983,7 @@ impl MessageProcessor {
                 {
                     Ok(resolution) => resolution,
                     Err(error) => {
+                        unavailable = true;
                         record_authorization_unavailable(
                             ResourceAction::ThreadRead.safe_name(),
                             "thread_lineage",
@@ -1938,7 +2014,7 @@ impl MessageProcessor {
             }
         }
 
-        recipients
+        (recipients, unavailable)
     }
 
     pub(crate) async fn send_notification_to_task_workspace_connections<T: Serialize>(

@@ -249,7 +249,7 @@ impl ClientFfiRuntime {
 
         Ok(ClientFfiInitializeResult {
             initialized: true,
-            boundary_version: 2,
+            boundary_version: 3,
         })
     }
 
@@ -888,6 +888,51 @@ impl ClientFfiRuntime {
             .prepare_composer_voice_capture(identity)
             .map_err(|error| format!("{error:#}"))
     }
+    fn thread_call(&self, input_json: &str) -> Result<serde_json::Value, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Request {
+            Call {
+                connection_id: u64,
+                params: pioneer_client::calls::ThreadCallParams,
+            },
+            Names {
+                connection_id: u64,
+                names_for_workspace: String,
+            },
+        }
+        let request: Request = serde_json::from_str(input_json)
+            .map_err(|_| "invalid thread call request".to_owned())?;
+        match request {
+            Request::Call {
+                connection_id,
+                params,
+            } => self
+                .core
+                .request_thread_call(connection_id, &params)
+                .and_then(|response| Ok(serde_json::to_value(response)?)),
+            Request::Names {
+                connection_id,
+                names_for_workspace,
+            } => self
+                .core
+                .thread_call_names(connection_id, &names_for_workspace)
+                .and_then(|names| Ok(serde_json::to_value(names)?)),
+        }
+        .map_err(|_| "thread call request failed".to_owned())
+    }
+
+    fn thread_call_updates(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::calls::CallUpdates, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let after_sequence = serde_json::from_str(input_json)
+            .map_err(|_| "invalid call update cursor".to_owned())?;
+        Ok(self.core.wait_for_thread_call_updates(after_sequence))
+    }
+
     fn voice_session_start(&self, input_json: &str) -> Result<VoiceSessionStartResponse, String> {
         let request = serde_json::from_str::<
             pioneer_client::composer::voice::ComposerVoiceStartRequest,
@@ -1533,6 +1578,8 @@ ffi_client_json_method!(pioneer_client_ffi_workspace_bootstrap, workspace_bootst
 ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
 ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
 ffi_client_json_method!(pioneer_client_ffi_workspace_rename, workspace_rename);
+ffi_client_json_method!(pioneer_client_ffi_thread_call, thread_call);
+ffi_client_json_method!(pioneer_client_ffi_thread_call_updates, thread_call_updates);
 ffi_client_json_method!(pioneer_client_ffi_voice_session_start, voice_session_start);
 ffi_client_json_method!(
     pioneer_client_ffi_composer_voice_capture_plan,
@@ -1963,6 +2010,7 @@ mod tests {
             .expect("initialize");
 
         assert!(result.initialized);
+        assert_eq!(result.boundary_version, 3);
     }
 
     #[test]

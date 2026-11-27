@@ -1985,6 +1985,7 @@ impl MessageProcessor {
                     request.method.as_str(),
                     methods::THREAD_OPEN
                         | methods::THREAD_GET
+                        | methods::THREAD_CALL
                         | methods::THREADS_TOOLS_RESULT_READ
                         | methods::THREAD_EXECUTION_RECONCILE
                         | methods::THREAD_EXECUTION_OBSERVABILITY
@@ -4887,6 +4888,17 @@ impl MessageProcessor {
                         }
                         Err(error) => self.send_error(connection_id, JsonRpcErrorResponse::new(
                             Some(request.id), INVALID_PARAMS_CODE, format!("invalid thread/open params: {error}"))).await,
+                    }
+                }
+                methods::THREAD_CALL => {
+                    match serde_json::from_value::<pioneer_protocol::ThreadCallParams>(
+                        request.params.unwrap_or_else(empty_object_value),
+                    ) {
+                        Ok(params) => self.thread_call(&context, request.id, params).await,
+                        Err(_) => self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, "invalid call parameters"),
+                        ).await,
                     }
                 }
                 methods::THREAD_GET => {

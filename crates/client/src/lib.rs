@@ -73,6 +73,7 @@ pub mod artifacts;
 pub mod authorization;
 pub mod avatars;
 pub mod cache;
+pub mod calls;
 pub mod cli_runtime;
 pub mod composer;
 pub mod contracts;

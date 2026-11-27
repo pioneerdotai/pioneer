@@ -87,17 +87,20 @@ class MacosNotaryTests(unittest.TestCase):
         identity = "Developer ID Application: Fixture"
         expected_code = {
             "pioneer", "libonnxruntime.dylib", "runtime/postgres/lib/vector.so",
+            "runtime/livekit/livekit-server",
             *(f"runtime/postgres/bin/{name}" for name in ("postgres", "initdb", "pg_ctl", "psql")),
         }
         extension = "runtime/postgres/share/extension/vector.control"
+        livekit_license = "runtime/livekit/LICENSE"
         signature = b"fixture Developer ID signature"
         transport = NotaryTransport()
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = SimpleNamespace(target="x86_64-apple-darwin", inputs=root/"inputs",
-                                   postgres=root/"inputs/runtime/postgres", notary_log_dir=root/"notary")
-            for entry in expected_code | {extension}:
+                                   postgres=root/"inputs/runtime/postgres", livekit=root/"inputs/runtime/livekit",
+                                   notary_log_dir=root/"notary")
+            for entry in expected_code | {extension, livekit_license}:
                 path = args.inputs / entry
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"\xcf\xfa\xed\xfe" if entry in expected_code else b"extension")
@@ -119,7 +122,7 @@ class MacosNotaryTests(unittest.TestCase):
                 if arguments[1:3] == ["notarytool", "submit"]:
                     archive = Path(arguments[3])
                     with zipfile.ZipFile(archive) as payload:
-                        self.assertEqual(set(payload.namelist()), expected_code | {extension})
+                        self.assertEqual(set(payload.namelist()), expected_code | {extension, livekit_license})
                         for entry in expected_code:
                             self.assertTrue(payload.read(entry).endswith(signature), entry)
                         self.assertEqual(payload.read(extension), b"extension")

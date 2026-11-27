@@ -3,6 +3,10 @@ mod build_support;
 
 fn main() {
     build_support::manifest();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // WebRTC uses Objective-C categories from static archives.
+        println!("cargo:rustc-link-arg-bin=pioneer-app=-Wl,-ObjC");
+    }
     #[cfg(target_os = "windows")]
     {
         let manifest_dir = std::path::PathBuf::from(

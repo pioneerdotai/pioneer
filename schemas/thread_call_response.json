@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadCallResponse",
+  "type": "object",
+  "properties": {
+    "call": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadCallSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "credentials": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadCallCredentials"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "history": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadCallHistory"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "ThreadCallCredentials": {
+      "type": "object",
+      "properties": {
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "token": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "token",
+        "expires_at_unix"
+      ]
+    },
+    "ThreadCallEndReason": {
+      "type": "string",
+      "enum": [
+        "left",
+        "declined",
+        "missed",
+        "gateway_restarted"
+      ]
+    },
+    "ThreadCallHistory": {
+      "type": "object",
+      "properties": {
+        "calls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadCallSnapshot"
+          }
+        },
+        "next_before_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "calls"
+      ]
+    },
+    "ThreadCallParticipant": {
+      "type": "object",
+      "properties": {
+        "held": {
+          "type": "boolean"
+        },
+        "media_identity": {
+          "type": "string"
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "principal_id",
+        "media_identity",
+        "held"
+      ]
+    },
+    "ThreadCallPhase": {
+      "type": "string",
+      "enum": [
+        "ringing",
+        "active",
+        "ended"
+      ]
+    },
+    "ThreadCallSnapshot": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "type": "string"
+        },
+        "created_at_unix": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "end_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadCallEndReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "initiator_id": {
+          "type": "string"
+        },
+        "invitee_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "participants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadCallParticipant"
+          }
+        },
+        "phase": {
+          "$ref": "#/$defs/ThreadCallPhase"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ring_until_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "call_id",
+        "revision",
+        "created_at_unix",
+        "phase",
+        "initiator_id",
+        "participants"
+      ]
+    }
+  }
+}

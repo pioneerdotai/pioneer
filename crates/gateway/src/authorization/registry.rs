@@ -398,6 +398,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Read,
     ),
     method_entry(THREAD_OPEN, ThreadRead, Thread, NotFound, Mutation),
+    method_entry(THREAD_CALL, ThreadRead, Thread, NotFound, Mutation),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
     method_entry(
         THREADS_TOOLS_RESULT_READ,

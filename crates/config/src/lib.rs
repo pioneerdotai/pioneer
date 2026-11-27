@@ -102,6 +102,8 @@ pub struct GatewayConfig {
     pub remote_access: GatewayRemoteAccessConfig,
     #[serde(default)]
     pub voice: GatewayVoiceConfig,
+    #[serde(default)]
+    pub calls: GatewayCallsConfig,
     pub provider: GatewayProviderConfig,
     pub database: GatewayDatabaseConfig,
     #[serde(default)]
@@ -117,6 +119,32 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub context_compaction: GatewayContextCompactionConfig,
     pub auth: GatewayAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GatewayCallsConfig {
+    pub enabled: bool,
+    pub livekit_executable: Option<PathBuf>,
+    pub signaling_url: Option<String>,
+    pub relay_media: bool,
+    pub livekit_http_port: u16,
+    pub livekit_udp_port: u16,
+    pub livekit_node_ip: Option<IpAddr>,
+}
+
+impl Default for GatewayCallsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            livekit_executable: None,
+            signaling_url: None,
+            relay_media: false,
+            livekit_http_port: 0,
+            livekit_udp_port: 7882,
+            livekit_node_ip: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

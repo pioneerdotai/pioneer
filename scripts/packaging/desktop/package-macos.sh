@@ -366,7 +366,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Pioneer uses your microphone for voice input while you hold to talk.</string>
+  <string>Pioneer uses your microphone for calls and voice input.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Pioneer uses your camera when you enable video in a call.</string>
 </dict>
 </plist>
 PLIST
@@ -377,6 +379,8 @@ cat > "$APP_ENTITLEMENTS_PATH" <<PLIST
 <plist version="1.0">
 <dict>
   <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <key>com.apple.security.device.camera</key>
   <true/>
 </dict>
 </plist>

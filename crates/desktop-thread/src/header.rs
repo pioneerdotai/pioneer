@@ -27,6 +27,7 @@ pub(crate) enum HeaderCommand {
     Back,
     Rename,
     Members,
+    Call { workspace_id: String, title: String },
     SetVisibility(ThreadVisibility),
     SetFileOpener(Option<String>),
 }
@@ -44,6 +45,7 @@ pub(crate) struct ThreadHeader {
     pub status: Option<ThreadStatus>,
     pub connected: bool,
     pub pending: ThreadScopePendingAction,
+    pub call: Option<(String, String, bool)>,
     pub file_openers: ThreadFileOpenerPresentation,
 }
 
@@ -241,6 +243,36 @@ impl RenderOnce for ThreadHeader {
         let action_region = self.action_region.clone();
         let file_picker = self.file_opener_picker();
         let title_menu = self.title_menu();
+        let call_button = self.call.map(|(workspace_id, label, missed)| {
+            let title = self.title.clone();
+            let operation = operation.clone();
+            let action_region = action_region.clone();
+            h_flex()
+                .gap_2()
+                .items_center()
+                .when(missed, |row| {
+                    row.child(div().text_xs().child(t!("thread.call.missed").to_string()))
+                })
+                .child(
+                    small_outline_button("thread-start-call")
+                        .compact()
+                        .label(label)
+                        .on_click(move |_, window, cx| {
+                            action_region.dispatch_action(
+                                &HeaderAction {
+                                    operation: operation.clone(),
+                                    command: HeaderCommand::Call {
+                                        workspace_id: workspace_id.clone(),
+                                        title: title.clone(),
+                                    },
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+        });
+
         h_flex()
             .justify_between()
             .items_center()
@@ -292,6 +324,7 @@ impl RenderOnce for ThreadHeader {
                 h_flex()
                     .items_center()
                     .gap_1()
+                    .children(call_button)
                     .child(file_picker)
                     .child(title_menu),
             )

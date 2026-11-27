@@ -34,6 +34,19 @@ runs:
         packages=(pkg-config libssl-dev libegl1-mesa-dev libgbm-dev
                   libpipewire-0.3-dev libwayland-dev libxkbcommon-dev)
         if [[ "${{ inputs.component }}" == desktop ]]; then
+          # Desktop links the same WebRTC archive as the Linux CI image.
+          if [[ ! -x /usr/lib/llvm-21/bin/clang++ || ! -e /usr/lib/llvm-21/lib/libclang.so ]]; then
+            llvm_key="$RUNNER_TEMP/llvm.asc"
+            curl --fail --silent --show-error --location --retry 3 \
+              https://apt.llvm.org/llvm-snapshot.gpg.key --output "$llvm_key"
+            echo "8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d  $llvm_key" | sha256sum -c -
+            sudo install -m 0644 "$llvm_key" /etc/apt/keyrings/pioneer-llvm.asc
+            echo 'deb [signed-by=/etc/apt/keyrings/pioneer-llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' \
+              | sudo tee /etc/apt/sources.list.d/pioneer-llvm.list >/dev/null
+            packages+=(clang-21 libclang-21-dev)
+          fi
+          echo '/usr/lib/llvm-21/bin' >> "$GITHUB_PATH"
+          echo 'LIBCLANG_PATH=/usr/lib/llvm-21/lib' >> "$GITHUB_ENV"
           packages+=(libasound2-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype6-dev
                      libwebkit2gtk-4.1-dev libx11-dev libxi-dev libxtst-dev libxext-dev
                      libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev)

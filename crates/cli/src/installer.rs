@@ -1888,7 +1888,17 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLa
                     "Gateway bundle executable is not executable"
                 );
             }
-            if !cfg!(feature = "computer-use") && !companion.starts_with("postgres") {
+            if companion.starts_with("livekit") {
+                let program = format!("livekit/livekit-server{}", std::env::consts::EXE_SUFFIX);
+                anyhow::ensure!(
+                    companion == Path::new(&program) || companion == Path::new("livekit/LICENSE"),
+                    "unexpected LiveKit runtime member"
+                );
+                if companion == Path::new(&program) {
+                    #[cfg(unix)]
+                    anyhow::ensure!(mode & 0o111 != 0, "LiveKit runtime is not executable");
+                }
+            } else if !cfg!(feature = "computer-use") && !companion.starts_with("postgres") {
                 bail!("server archive must not contain a CUA payload");
             }
             if companion.as_os_str().is_empty() {
@@ -1993,6 +2003,16 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLa
         anyhow::ensure!(
             postgres.join("share/extension/vector.control").is_file(),
             "Gateway runtime is missing pgvector"
+        );
+    }
+    let livekit = payload.join("livekit");
+    if livekit.exists() {
+        anyhow::ensure!(
+            livekit
+                .join(format!("livekit-server{}", std::env::consts::EXE_SUFFIX))
+                .is_file()
+                && livekit.join("LICENSE").is_file(),
+            "Gateway runtime contains an incomplete LiveKit payload"
         );
     }
     if cfg!(feature = "computer-use") {

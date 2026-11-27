@@ -832,7 +832,7 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
     ) -> Result<SessionLeaseFacts, AuthError> {
-        self.validate_session_lease_in_scope(principal, trace, &self.database)
+        self.validate_session_lease_in_scope(principal, trace, &self.database, false)
             .await
     }
     pub(crate) async fn validate_session_lease_with_database(
@@ -840,24 +840,40 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
         database: &PostgresDatabase,
     ) -> Result<SessionLeaseFacts, AuthError> {
-        self.validate_session_lease_in_scope(principal, None, database)
+        self.validate_session_lease_in_scope(principal, None, database, false)
             .await
     }
+    pub(crate) async fn validate_retryable_notification_lease(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        database: &PostgresDatabase,
+    ) -> Result<SessionLeaseFacts, AuthError> {
+        self.validate_session_lease_in_scope(principal, None, database, true)
+            .await
+    }
+
     async fn validate_session_lease_in_scope(
         &self,
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
         database: &PostgresDatabase,
+        retry_storage_failure: bool,
     ) -> Result<SessionLeaseFacts, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         self.validate_session_lease_context(principal, now_unix)?;
-        let row = trace_auth_me_database_read(
-            trace,
-            pioneer_observability::GatewayOperationStage::AuthMeLeaseFactsLoad,
-            load_session_lease(database, &principal.session_id),
-        )
-        .await?
+        let read = load_session_lease(database, &principal.session_id);
+        let row = if retry_storage_failure {
+            read.await
+                .map_err(|_| AuthError::new(AuthErrorCode::TemporarilyUnavailable))?
+        } else {
+            trace_auth_me_database_read(
+                trace,
+                pioneer_observability::GatewayOperationStage::AuthMeLeaseFactsLoad,
+                read,
+            )
+            .await?
+        }
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         validate_session_lease_facts(row, principal, now_unix)
     }

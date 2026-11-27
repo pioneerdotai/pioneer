@@ -756,6 +756,7 @@ mod tests {
                 cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
                 remote_access: Default::default(),
                 voice: Default::default(),
+                calls: Default::default(),
                 provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
                     development_url: None,

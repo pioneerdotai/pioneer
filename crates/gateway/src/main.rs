@@ -3,6 +3,12 @@
 use anyhow::Context as _;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = pioneer_gateway::dispatch_livekit_supervisor(std::env::args_os().skip(1))
+    {
+        return result;
+    }
+
     let startup = pioneer_observability::GatewayStartupTrace::start();
     // The persisted gateway preference is loaded inside the runtime. Keep all
     // external telemetry closed until that happens so a previous opt-out is

@@ -15,6 +15,10 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
         Some(state.message_processor.clone()),
     )
         .route("/", get(crate::transport::ws::root_websocket))
+        .route("/rtc", get(super::calls::upgrade))
+        .route("/rtc/v1", get(super::calls::upgrade))
+        .route("/rtc/validate", get(super::calls::validate))
+        .route("/rtc/v1/validate", get(super::calls::validate))
         .route("/apps/host", get(crate::host_api::websocket))
         .route(
             "/storage/workspaces/{workspace_id}/artifacts/{artifact_id}/versions/{version_id}/content",

@@ -725,6 +725,9 @@ impl GatewayNotification {
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
+            events::THREAD_CALL_CHANGED => {
+                Some(Self::Unknown(unknown_notification(method, params)))
+            }
             _ if method.starts_with("item/")
                 || method.starts_with("turn/")
                 || method.starts_with("context/")

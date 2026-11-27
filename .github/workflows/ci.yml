@@ -70,7 +70,7 @@ jobs:
     container: &linux-container
       # Reap orphaned descendants so the process-group tests see completed cleanup.
       options: --init
-      image: &linux-image ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
+      image: &linux-image ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:64a27096c203f1818576d1f3f649de3793cec97412b098405366fcbf3855f729
       credentials: &linux-registry-credentials
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

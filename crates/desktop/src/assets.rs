@@ -11,7 +11,12 @@ use std::borrow::Cow;
 #[include = "logos/**/*.svg"]
 struct PioneerAssets;
 
-gpui_kit::assets::icon_assets!(AppPanelAssets, [Maximize2, Minimize2, X]);
+gpui_kit::assets::icon_assets!(
+    AppPanelAssets,
+    [
+        Ellipsis, Maximize2, Minimize2, X, Mic, MicOff, PhoneOff, UserRound, Video, VideoOff
+    ]
+);
 
 /// Asset source that serves Pioneer's custom icons,
 /// falling back to GPUI Kit's bundled assets for built-in icons.
@@ -103,6 +108,25 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn serves_every_call_window_icon() {
+        for icon in [
+            "ellipsis",
+            "mic",
+            "mic-off",
+            "phone-off",
+            "user-round",
+            "users",
+            "video",
+            "video-off",
+            "x",
+        ] {
+            let path = format!("icons/{icon}.svg");
+            let svg = PioneerAssetsSource.load(&path).unwrap().expect(&path);
+            assert!(svg.windows(4).any(|prefix| prefix == b"<svg"), "{path}");
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod assets;
 mod avatar;
 mod binding;
 mod buttons;
+mod calls;
 mod code_highlight;
 mod composer;
 mod file_opener;
@@ -29,6 +30,7 @@ mod test_support;
 mod thread;
 mod timeline;
 pub use artifacts::format_local_timestamp;
+pub use calls::init_thread_calls;
 pub use thread::{ThreadNavigationEvent, ThreadView, ThreadViewConfig};
 
 pub use ports::{

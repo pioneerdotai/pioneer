@@ -1081,6 +1081,7 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) calls: crate::calls::CallNotifications,
     pub(crate) session_driver: Mutex<crate::gateway::session_driver::SessionDriver>,
     pub(crate) invitation_commits: Mutex<crate::gateway::invitation_commits::InvitationCommits>,
     pub(crate) device_activation:
@@ -1415,6 +1416,7 @@ impl ClientCore {
             provider_runtimes: Mutex::default(),
             artifact_store: Mutex::default(),
             artifact_downloads: Mutex::default(),
+            calls: crate::calls::CallNotifications::default(),
             thread_members: Mutex::default(),
             thread_capabilities: Mutex::default(),
             composer_store: Mutex::default(),
@@ -1846,6 +1848,7 @@ impl ClientCore {
             .lock()
             .expect("thread registry poisoned")
             .retire_opening(pioneer_observability::opening::Result::Unconfirmed);
+        self.calls.clear();
         self.cancel_composer_send_budgets();
         self.session_driver
             .lock()
@@ -2085,6 +2088,9 @@ impl ClientCore {
                 .ws_command_sender()
                 .accepts_gateway_event(event)
         {
+            return None;
+        }
+        if self.observe_call_transport(event) {
             return None;
         }
         // Accepted retiring-connection events still own exact Voice cleanup even
