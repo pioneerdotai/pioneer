@@ -11,6 +11,8 @@ use livekit::{
         video_stream::native::NativeVideoStream,
     },
 };
+#[cfg(target_os = "linux")]
+use livekit_linux as livekit;
 use nokhwa::{
     Camera,
     pixel_format::RgbAFormat,
