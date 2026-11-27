@@ -944,6 +944,11 @@ impl TaskScheduler {
                     .map(|mut spec| {
                         spec.id = generate_id(ID_LEN);
                         spec.run_id = Some(run.id.clone());
+                        if let Some(policy) = spec.review_policy.as_mut() {
+                            // Legacy schedules can fall back to another run's
+                            // spec. Its revision override is scoped to that run.
+                            policy.run_revision_budget = None;
+                        }
                         spec.updated_at = now;
                         spec
                     }),
@@ -1130,6 +1135,11 @@ impl TaskScheduler {
                     .map(|mut spec| {
                         spec.id = generate_id(ID_LEN);
                         spec.run_id = Some(run.id.clone());
+                        if let Some(policy) = spec.review_policy.as_mut() {
+                            // Legacy schedules can fall back to another run's
+                            // spec. Its revision override is scoped to that run.
+                            policy.run_revision_budget = None;
+                        }
                         spec.updated_at = now;
                         spec
                     }),

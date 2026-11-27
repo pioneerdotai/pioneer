@@ -451,6 +451,17 @@
             }
           ]
         },
+        "reviewBudget": {
+          "description": "Present on task_get for reviewed runs. A null cap is unlimited.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRevisionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "runNumber": {
           "type": "integer",
           "format": "int64"
@@ -702,6 +713,24 @@
         "thread",
         "workspace",
         "system"
+      ]
+    },
+    "TaskRevisionBudget": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "description": "Required. A non-negative integer sets the cap. Null removes the cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "maxRevisionRounds"
       ]
     },
     "TaskRunExecutionStatus": {

@@ -291,6 +291,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} candidats à réviser"
 "timeline.task_review.details.revision_blocked" = "Révision bloquée"
 "timeline.task_review.details.revision_rounds_remaining" = "Tours de révision restants"
+"timeline.task_review.details.revision_rounds_unlimited" = "Illimité"
 "timeline.task_review.details.round" = "Tour"
 "timeline.task_review.details.run_id" = "ID exécution"
 "timeline.task_review.details.summary" = "Résumé"

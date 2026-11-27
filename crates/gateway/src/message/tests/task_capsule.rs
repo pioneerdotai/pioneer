@@ -732,6 +732,86 @@ async fn capsule_deliveries(
         .deliveries
 }
 
+async fn assert_revision_budget_event_page_is_legacy_readable(
+    store: &CrudStore,
+    task_id: &str,
+    run_id: &str,
+) {
+    // The baseline operator payload enum is closed. Only the variant needed
+    // for the neighboring revision event is modeled by this decoder.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+    enum LegacyPayload {
+        TaskResultReviewEventRecorded {
+            review_event: pioneer_protocol::TaskResultReviewEvent,
+        },
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyOperatorEvent {
+        sequence: i64,
+        payload: LegacyPayload,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyPage {
+        events: Vec<pioneer_protocol::PublicTaskEvent>,
+        operator_events: Option<Vec<LegacyOperatorEvent>>,
+        last_sequence: i64,
+        has_more: bool,
+    }
+
+    let history = store.get_task_events(task_id, None).await.unwrap();
+    let update = history
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                pioneer_protocol::TaskEventPayload::TaskRunRevisionBudgetUpdated { .. }
+            )
+        })
+        .expect("task_update persisted the run budget event");
+    let page = store
+        .get_task_events_page(task_id, Some(update.sequence - 1), 1)
+        .await
+        .unwrap();
+    let payload =
+        serde_json::to_value(crate::task_projection::project_task_events(&page, true)).unwrap();
+    let legacy: LegacyPage = serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(legacy.events.len(), 1);
+    assert_eq!(legacy.events[0].id, update.id);
+    assert_eq!(legacy.events[0].run_id.as_deref(), Some(run_id));
+    assert_eq!(legacy.events[0].event_type, update.event_type);
+    assert_eq!(legacy.events[0].created_at, update.created_at);
+    assert_eq!(legacy.last_sequence, update.sequence);
+    assert!(legacy.has_more);
+    assert!(legacy.operator_events.unwrap().is_empty());
+
+    let current: pioneer_protocol::PublicTaskEventsResponse =
+        serde_json::from_value(payload).unwrap();
+    let extension = current.operator_revision_budget_events.unwrap();
+    assert_eq!(extension.as_slice(), std::slice::from_ref(update));
+
+    let without_operator = crate::task_projection::project_task_events(&page, false);
+    assert!(without_operator.operator_events.is_none());
+    assert!(without_operator.operator_revision_budget_events.is_none());
+    assert_eq!(without_operator.events, legacy.events);
+
+    let next = store
+        .get_task_events_page(task_id, Some(legacy.last_sequence), 1)
+        .await
+        .unwrap();
+    let payload =
+        serde_json::to_value(crate::task_projection::project_task_events(&next, true)).unwrap();
+    let legacy: LegacyPage = serde_json::from_value(payload).unwrap();
+    let subsequent = legacy.operator_events.unwrap();
+    assert_eq!(subsequent.len(), 1);
+    assert_eq!(subsequent[0].sequence, legacy.last_sequence);
+    let LegacyPayload::TaskResultReviewEventRecorded { review_event } = &subsequent[0].payload;
+    assert_eq!(review_event.run_id, run_id);
+}
+
 #[test]
 fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executions() {
     run_standard_stack_message_test("Detached capsule review", async {
@@ -747,7 +827,7 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
                 100,
                 "task_create",
                 json!({"title":"Reviewed detached worker", "goal":"Return a capsule report",
-                "background":true,"requireReview":true}),
+                "background":true,"requireReview":true,"maxRevisionRounds":0}),
             ), call(150, "task_create", json!({"title":"Second reviewed worker", "goal":"Return independent evidence", "background":true,"requireReview":true})),
             call(151, "task_create", json!({
                 "title":"Recurring capsule monitor", "goal":"Review saved workers", "requireReview":false,
@@ -838,6 +918,11 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
             .find(|item| item["taskId"] == task.id)
             .unwrap();
         assert_eq!(creation["deliveryMode"], "none");
+        let uncapped = creations
+            .iter()
+            .find(|item| item["taskId"] == second_id)
+            .unwrap();
+        assert_eq!(uncapped["reviewBudget"], json!({"maxRevisionRounds": null}));
         assert_eq!(
             creation["waitRecommendation"],
             "do_not_call_task_wait_observe_detached_task"
@@ -852,7 +937,7 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
                 .as_ref()
                 .unwrap()
                 .max_revision_rounds,
-            5
+            0
         );
         // Reconstructed Gateway; neither creator binding nor its work graph is retained.
         let observed = capsule_run_with_rounds(
@@ -880,13 +965,21 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
         assert!(outputs[0].get("operator").is_none());
         assert_eq!(
             outputs[0]["reviewRequired"][0]["remainingRevisionRounds"],
-            5
+            0
         );
         let actions = outputs[0]["reviewRequired"][0]["allowedActions"]
             .as_array()
             .unwrap();
         assert!(actions.contains(&json!("task_accept")));
-        assert!(actions.contains(&json!("task_revise")));
+        assert!(!actions.contains(&json!("task_revise")));
+        assert_eq!(
+            outputs[0]["runs"][0]["reviewBudget"]["maxRevisionRounds"],
+            0
+        );
+        let patch = json!({
+            "taskId":task.id,
+            "revisionBudget":{"runId":run,"budget":{"maxRevisionRounds":null}}
+        });
 
         let foreign = capsule_step(
             manager.clone(),
@@ -896,6 +989,7 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
             102,
             vec![
                 call(102, "task_result", json!({"candidateId":candidate.id})),
+                call(153, "task_update", patch.clone()),
                 call(
                     103,
                     "task_accept",
@@ -905,12 +999,16 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
         )
         .await;
         assert_outcome(&foreign, "task_result", false);
+        assert_outcome(&foreign, "task_update", false);
         assert_outcome(&foreign, "task_accept", false);
         let revised = capsule_run_with_rounds(manager.clone(), store.clone(), &workspace, thread, 103,
-            vec![vec![call(104,"task_result",json!({"candidateId":candidate.id}))],
+            vec![vec![call(154, "task_update", patch)],
+                 vec![call(104,"task_result",json!({"candidateId":candidate.id}))],
                  vec![call(105,"task_revise",json!({"taskId":task.id,"runId":run,"candidateId":candidate.id,"feedback":"Include the complete evidence."}))]], capsule_review_config(), Some((monitor_id.clone(), 4_000_000_010))).await;
+        assert_outcome(&revised, "task_update", true);
         assert_outcome(&revised, "task_result", true);
         assert_outcome(&revised, "task_revise", true);
+        assert_revision_budget_event_page_is_legacy_readable(store.as_ref(), &task.id, &run).await;
         assert_eq!(
             wait_for_task_status(store.clone(), &task.id, TaskStatus::WaitingReview).await,
             TaskStatus::WaitingReview
@@ -954,7 +1052,11 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
         assert_eq!(observed[0]["reviewRequired"][0]["candidate"]["id"], next.id);
         assert_eq!(
             observed[0]["reviewRequired"][0]["remainingRevisionRounds"],
-            4
+            u32::MAX - 1
+        );
+        assert_eq!(
+            observed[0]["reviewRequired"][0]["unlimitedRevisionRounds"],
+            true
         );
         assert_outcome(&accepted, "task_result", true);
         assert!(

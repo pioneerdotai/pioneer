@@ -13,6 +13,7 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use self::validator::no_tool_final_answer_rejection;
+use crate::compaction::thread_pages;
 use crate::hooks::{
     AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
     AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
@@ -2698,6 +2699,58 @@ fn annotate_request_tool_observation(
 const TURN_INPUT_PROJECTION: &str = "turn_input_projection_v1";
 const RUNTIME_CONTEXT: &str = "runtime_context_v1";
 
+async fn persist_terminal_task_observation(
+    observation: RenderedTaskObservation,
+    event_tx: &AgentEventHub,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Result<ChatMessage, ChatTurnError> {
+    let item = generate_id(TURN_ITEM_ID_LEN);
+    let mut message = ChatMessage::user(observation.message);
+    thread_pages::persist_replay(
+        event_tx,
+        thread,
+        turn,
+        &item,
+        &thread_pages::ResultReplay::Task {
+            outcomes: observation.outcomes.clone(),
+        },
+    )
+    .await
+    .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+    persist_runtime_message(
+        event_tx,
+        workspace,
+        thread,
+        turn,
+        &item,
+        RUNTIME_CONTEXT,
+        &mut message,
+    )
+    .await?;
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.to_owned(),
+                thread_id: thread.to_owned(),
+                turn_id: turn.to_owned(),
+                item: TurnItem::SystemEvent {
+                    id: item,
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: message.content.clone(),
+                    code: Some("task.terminal.observed".to_owned()),
+                    details: Some(observation.details),
+                },
+            },
+        },
+    )
+    .await?;
+    crate::task_observation::save_observations(&mut message, &observation.outcomes);
+    Ok(message)
+}
+
 async fn persist_runtime_message(
     event_tx: &AgentEventHub,
     workspace_id: &str,
@@ -3389,7 +3442,7 @@ fn inventory_is_retained(
 
 async fn prepare_request_with_inventory(
     session: Option<&crate::compaction::controller::NativeContextSession>,
-    request: ChatRequest,
+    mut request: ChatRequest,
     event_tx: &AgentEventHub,
     workspace: &str,
     thread: &str,
@@ -3402,6 +3455,11 @@ async fn prepare_request_with_inventory(
     ),
     ChatTurnError,
 > {
+    // The continuation retains task deduplication evidence separately from
+    // the provider request, even when a message becomes a portable transcript.
+    for message in &mut request.messages {
+        crate::task_observation::remove_observations(message);
+    }
     let saved = request
         .messages
         .iter()
@@ -3432,6 +3490,18 @@ async fn prepare_request_with_inventory(
             Ok((request, None))
         }
     };
+    let fresh_pages = (!inventory.is_empty()).then(|| {
+        request
+            .messages
+            .iter()
+            .filter(|message| thread_pages::fresh_reference(message).is_some())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let pending_declarations = fresh_pages
+        .as_ref()
+        .filter(|pages| !pages.is_empty())
+        .and_then(|_| request.tool_declarations.clone());
     let (mut request, receipt) = prepare(request).await?;
     if inventory_is_retained(&inventory, &request.messages) {
         return Ok((request, receipt, None));
@@ -3466,6 +3536,23 @@ async fn prepare_request_with_inventory(
     request.messages.push(message.clone());
     // Include the restored bytes in admission/budgeting; never append after the
     // final preparation without checking whether that preparation removed them.
+    // Full pages still awaiting the next send may need to be deferred when
+    // the restored inventory adds bytes. Previously selected pointers stay fixed.
+    let mut has_fresh_pages = false;
+    for page in fresh_pages.into_iter().flatten() {
+        if let Some(message) = request.messages.iter_mut().find(|message| {
+            thread_pages::same_result(message, &page) && message.content == page.content
+        }) && let Some(reference) = thread_pages::fresh_reference(&page)
+        {
+            thread_pages::mark_fresh(message, reference.clone());
+            has_fresh_pages = true;
+        }
+    }
+    if has_fresh_pages {
+        // The first preflight bound declarations to its proposal. Reconcile
+        // from the confirmed prefix when preparing different page bytes.
+        request.tool_declarations = pending_declarations;
+    }
     let (request, receipt) = prepare(request).await?;
     if !inventory_is_retained(&inventory, &request.messages) {
         return Err(ChatTurnError::Blocked(
@@ -4348,7 +4435,7 @@ async fn review_required_attached_task_observation(
         .collect::<Vec<_>>();
     let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). unlimitedRevisionRounds=true indicates unlimited revisions. If a finite cap is exhausted, an authorized task manager and reviewer can change the target run via task_update with revisionBudget; re-read its actions before revising. Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
     );
     let details = json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
@@ -4365,12 +4452,13 @@ async fn review_required_attached_task_observation(
 
 fn review_required_observation_signature(observation: &ReviewRequiredTaskObservation) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}",
         observation.task_id,
         observation.run_id,
         observation.candidate_id,
         observation.candidate_status,
         observation.round,
+        observation.max_revision_rounds,
         observation.remaining_revision_rounds,
         observation.allowed_actions.join(","),
         observation.revision_blocked_reason.as_deref().unwrap_or("")
@@ -4396,8 +4484,10 @@ fn review_required_observation_payload(observation: &ReviewRequiredTaskObservati
             .collect::<Vec<_>>(),
             "childThreadId": observation.child_thread_id,
             "childTurnId": observation.child_turn_id,
-            "maxRevisionRounds": observation.max_revision_rounds,
-            "remainingRevisionRounds": observation.remaining_revision_rounds,
+            "maxRevisionRounds": observation.max_revision_rounds.unwrap_or(u32::MAX),
+            "remainingRevisionRounds": observation.remaining_revision_rounds
+                .unwrap_or_else(|| u32::MAX.saturating_sub(observation.round)),
+            "unlimitedRevisionRounds": observation.max_revision_rounds.is_none(),
             "allowedActions": observation.allowed_actions,
             "revisionBlockedReason": observation.revision_blocked_reason,
     })
@@ -4472,7 +4562,7 @@ fn render_review_required_snapshot(
         .collect::<Vec<_>>();
     let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). unlimitedRevisionRounds=true indicates unlimited revisions. If a finite cap is exhausted, an authorized task manager and reviewer can change the target run via task_update with revisionBudget; re-read its actions before revising. Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
     );
     Some(RenderedReviewRequiredObservation {
         signatures,
@@ -4687,16 +4777,11 @@ fn record_observed_terminal_task_outcomes(
     observed_outcomes: &mut BTreeSet<crate::ObservedTaskOutcome>,
     result: &ExecutedToolResult,
 ) {
-    if !result.success {
-        return;
+    if result.success {
+        observed_outcomes.extend(
+            crate::task_observation::observed_terminal_task_outcomes_from_message(&result.message),
+        );
     }
-    let Ok(value) = serde_json::from_str::<JsonValue>(&result.model_visible_text) else {
-        return;
-    };
-    observed_outcomes.extend(crate::observed_terminal_task_outcomes_from_payload(
-        &result.tool_name,
-        &value,
-    ));
 }
 
 fn workdir_from_execution_security_snapshot(
@@ -5935,7 +6020,10 @@ fn execute_agent_provider_response<'a>(
         let mut pending_retry_instruction: Option<String> = None;
         let mut applied_retry_instruction: Option<String> = None;
         let mut observed_review_required_signatures = BTreeSet::<String>::new();
-        let mut observed_terminal_task_outcomes = BTreeSet::<crate::ObservedTaskOutcome>::new();
+        let mut observed_terminal_task_outcomes = continuation_provider_history
+            .iter()
+            .flat_map(|entry| crate::task_observation::saved_observations(&entry.message))
+            .collect::<BTreeSet<_>>();
         let window_budget = &tool_loop_config.execution_windows.window;
         let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
             window_budget.clone(),
@@ -6086,28 +6174,14 @@ fn execute_agent_provider_response<'a>(
                 render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_outcomes)
             })
             {
-                observed_terminal_task_outcomes.extend(observation.outcomes.clone());
-                let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::ItemCompleted {
-                        notification: ItemCompletedNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item: TurnItem::SystemEvent {
-                                id: event_item_id,
-                                level: pioneer_protocol::SystemEventLevel::Info,
-                                message: observation.message.clone(),
-                                code: Some("task.terminal.observed".to_owned()),
-                                details: Some(observation.details),
-                            },
-                        },
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                messages.push(ChatMessage::user(observation.message));
+                let message = persist_terminal_task_observation(
+                    observation, event_tx.as_ref(), workspace_id, thread_id, turn_id,
+                ).await.map_err(|error| (error, current_thinking_id.clone()))?;
+                observed_terminal_task_outcomes.extend(crate::task_observation::saved_observations(&message));
+                retain_provider_history_message(
+                    &mut continuation_provider_history, &mut next_provider_history_sequence, &message,
+                );
+                messages.push(message);
             }
 
             let round_plan = tool_loop_guard.begin_provider_round().map_err(|message| {
@@ -6393,6 +6467,28 @@ fn execute_agent_provider_response<'a>(
                 retain_provider_history_message(&mut continuation_provider_history,
                     &mut next_provider_history_sequence, &message);
             }
+            let mut page_rounds = BTreeSet::new();
+            for entry in &mut continuation_provider_history {
+                if thread_pages::take_fresh_reference(&mut entry.message)
+                    .map_err(|error| (ChatTurnError::Terminal(error.to_string()), current_thinking_id.clone()))?
+                    .is_some()
+                    && let Some(origin) = &entry.message.provenance
+                    && request.messages.iter().any(|message| {
+                        message.provenance.as_ref().is_some_and(|current| {
+                            current.workspace_id == origin.workspace_id
+                                && current.thread_id == origin.thread_id
+                                && current.unit_id == origin.unit_id
+                        })
+                    })
+                {
+                    page_rounds.insert(origin.unit_id.clone());
+                    if let Some(model) = request.messages.iter().find(|message| {
+                        thread_pages::same_result(message, &entry.message)
+                    }) && model.content != entry.message.content {
+                        entry.message.content.clone_from(&model.content);
+                    }
+                }
+            }
             annotate_request_tool_observation(&mut request,router.as_ref(),observation_change_reason);
             observation_change_reason="runtime_selection_cause_unobserved";
             messages = request.messages.clone();
@@ -6408,17 +6504,25 @@ fn execute_agent_provider_response<'a>(
             let declaration_snapshot = (sent_declarations.is_some() || tool_declarations.is_some()
                 || keeps_disabled_schemas && (request.tools.is_some() || !sent_tool_schemas.is_empty()))
                 .then(|| (request.compiled_prompt.clone(), request.tools.clone()));
-            let round = await_context_request(context_session, provider::request_agent_round(
-                provider,
-                request,
-                workspace_id,
-                thread_id,
-                turn_id,
-                current_thinking_id.as_str(),
-                force_non_stream,
-                tool_loop_config.provider,
-                event_tx.as_ref(),
-            ))
+            let round = await_context_request(context_session, Box::pin(async {
+                // An ACK fences the full pages before any provider dispatch,
+                // including a request that may fail without a provider response.
+                for unit in page_rounds {
+                    thread_pages::persist_dispatch(event_tx.as_ref(), thread_id, turn_id, &unit)
+                        .await.map_err(agent_event_error)?;
+                }
+                provider::request_agent_round(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    current_thinking_id.as_str(),
+                    force_non_stream,
+                    tool_loop_config.provider,
+                    event_tx.as_ref(),
+                ).await
+            }))
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
 
@@ -6914,7 +7018,6 @@ fn execute_agent_provider_response<'a>(
                     render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_outcomes)
                 })
                 {
-                    observed_terminal_task_outcomes.extend(observation.outcomes.clone());
                     send_reasoning_completed(
                         workspace_id,
                         thread_id,
@@ -6925,27 +7028,24 @@ fn execute_agent_provider_response<'a>(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.terminal.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    // This response is already in messages. Its durable position
+                    // must precede the notice that triggered the next round.
+                    if let Some(envelope) = pending_completed.take() {
+                        provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
+                            .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                        retain_provider_history_message(
+                            &mut continuation_provider_history, &mut next_provider_history_sequence,
+                            &envelope.message,
+                        );
+                    }
+                    let message = persist_terminal_task_observation(
+                        observation, event_tx.as_ref(), workspace_id, thread_id, turn_id,
+                    ).await.map_err(|error| (error, current_thinking_id.clone()))?;
+                    observed_terminal_task_outcomes.extend(crate::task_observation::saved_observations(&message));
+                    retain_provider_history_message(
+                        &mut continuation_provider_history, &mut next_provider_history_sequence, &message,
+                    );
+                    messages.push(message);
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -7986,6 +8086,23 @@ fn execute_agent_provider_response<'a>(
                             result.message = retained_search_page_message(
                                 event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result, &reference,
                             ).await?;
+                        } else if thread_pages::is_thread_reader(&result.message) {
+                            let deferrable = context_session.is_some() && result.success;
+                            if let Some(raw) = &result.full_message {
+                                let replay = thread_pages::capture_page(raw, &result.message, deferrable);
+                                thread_pages::persist_replay(
+                                    event_tx.as_ref(), &thread_id, &turn_id, &result.item_id, &replay,
+                                ).await.map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+                            }
+                            persist_retained_tool_result(
+                                event_tx.as_ref(), &thread_id, &turn_id, &result,
+                            ).await?;
+                            if deferrable && result.full_message.is_some() {
+                                thread_pages::mark_fresh(&mut result.message, json!({
+                                    "workspace_id": workspace_id, "thread_id": thread_id,
+                                    "turn_id": turn_id, "item_id": result.item_id,
+                                }));
+                            }
                         } else if result.shell_model_projection.is_some() {
                             prepare_shell_tool_result(
                                 event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &mut result, &reference,
@@ -8002,6 +8119,23 @@ fn execute_agent_provider_response<'a>(
                                 let source = result.full_message.as_mut().unwrap_or(&mut result.message);
                                 select_new_tool_result(source, &reference, result_limit).map(Some)
                             };
+                            let observed = crate::task_observation::reports_terminal_outcome(&result.tool_name).then(|| {
+                                let mut observed = BTreeSet::new();
+                                match &projected {
+                                    Ok(Some(message)) if result.success => {
+                                        observed = crate::task_observation::observed_terminal_task_outcomes_from_message(message);
+                                    }
+                                    Ok(None) => record_observed_terminal_task_outcomes(&mut observed, &result),
+                                    _ => {}
+                                }
+                                observed
+                            });
+                            if let Some(outcomes) = &observed {
+                                let replay = thread_pages::ResultReplay::Task { outcomes: outcomes.clone() };
+                                thread_pages::persist_replay(
+                                    event_tx.as_ref(), &thread_id, &turn_id, &result.item_id, &replay,
+                                ).await.map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+                            }
                             if !result.full_source_in_item {
                                 persist_retained_tool_result(
                                     event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result,
@@ -8017,6 +8151,9 @@ fn execute_agent_provider_response<'a>(
                                 persist_retained_tool_result(
                                     event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result,
                                 ).await?;
+                            }
+                            if let Some(observed) = &observed {
+                                crate::task_observation::save_observations(&mut result.message, observed);
                             }
                         }
                         Ok::<(), ChatTurnError>(())
@@ -8099,7 +8236,7 @@ fn execute_agent_provider_response<'a>(
             record_requested_tool_names(&mut requested_tool_names, &executed_results);
 
             for result in &executed_results {
-                record_observed_terminal_task_outcomes(&mut observed_terminal_task_outcomes, result);
+                observed_terminal_task_outcomes.extend(crate::task_observation::saved_observations(&result.message));
                 task_mutation_finalization_guard.observe(result);
             }
             post_turn_tool_events.extend(
@@ -9689,8 +9826,8 @@ mod tests {
             diagnostics: vec!["d".repeat(500), "diagnostic two".to_owned()],
             child_thread_id: Some("child_thread_review_payload".to_owned()),
             child_turn_id: Some("child_turn_review_payload".to_owned()),
-            max_revision_rounds: 2,
-            remaining_revision_rounds: 0,
+            max_revision_rounds: Some(2),
+            remaining_revision_rounds: Some(0),
             allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
             revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
         };
@@ -11005,8 +11142,8 @@ mod tests {
             diagnostics: Vec::new(),
             child_thread_id: None,
             child_turn_id: None,
-            max_revision_rounds: 2,
-            remaining_revision_rounds: 0,
+            max_revision_rounds: Some(2),
+            remaining_revision_rounds: Some(0),
             allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
             revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
         }];

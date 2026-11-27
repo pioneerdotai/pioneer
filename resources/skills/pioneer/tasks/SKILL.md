@@ -186,14 +186,28 @@ Use `requireReview:false` for ordinary task/subagent work; it is the default for
 all types and attachment modes, including scheduled, interval, cron and webhook.
 Set `requireReview:true` explicitly when each run result must wait for acceptance
 and may need same-worker revisions. The meaning does not depend on the trigger.
-Enabled review has no timeout acceptance. The saved policy supplies the revision
-budget (normally five); acceptance is final. Detaching a task or changing its
-schedule does not silently change its saved review choice.
+Enabled review has no timeout acceptance. Take the effective revision budget
+from the exact run. New reviewed tasks default to unlimited revisions unless
+the site has a finite default. At creation, set `maxRevisionRounds` to a
+non-negative integer for a finite cap or to `null` for unlimited revisions.
+Acceptance is final.
+
+In `task_get.reviewRequired` and `task_wait.reviewRequired`,
+`unlimitedRevisionRounds:true` means unlimited. Otherwise,
+`remainingRevisionRounds:0` means the finite budget is exhausted.
+With task management and review authority, use `task_update` with
+`revisionBudget: {"runId":"RUN_ID","budget":{"maxRevisionRounds":null}}`
+and the task ID to clear a saved cap on that run. Use an integer to set a cap.
+Re-read the exact candidate and its actions before requesting changes. A cap
+change keeps the existing worker, candidate, round and review history.
 
 Later authorized executions in the same capsule can inspect and review saved
 workers under current grants, without creator/graph ownership or adoption.
 `task_get.reviewRequired` exposes current candidate references and available
 actions; read full content through `task_result(candidateId)` and all pages.
+When `task_get.runs[]` includes a `candidateId` for an automatically
+completed run, use it to read the full result through `task_result`.
+Match the exact run ID when the task has multiple runs.
 For recurring/webhook work, decisions target the exact run and candidate, even
 when another run is queued or running. Read access does not require TaskReview;
 self-review, policy eligibility, finality and stale-candidate guards still apply.

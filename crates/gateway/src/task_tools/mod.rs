@@ -1603,11 +1603,18 @@ impl TaskToolHandler {
         Ok(Some(context))
     }
 
-    async fn wait_review_content(
+    async fn wait_result_content(
         &self,
         response: &pioneer_protocol::TaskWaitResponse,
     ) -> Result<BTreeMap<String, PublicTaskReviewContent>, ToolError> {
-        if response.review_required.is_empty() {
+        let completed = response.completed.iter().filter_map(|item| {
+            Some((
+                item.auto_accepted_candidate_id.as_deref()?,
+                item.task.id.as_str(),
+            ))
+        });
+        let has_completed_candidates = completed.clone().next().is_some();
+        if response.review_required.is_empty() && !has_completed_candidates {
             return Ok(BTreeMap::new());
         }
         let Some(context) = self
@@ -1617,14 +1624,45 @@ impl TaskToolHandler {
             return Ok(BTreeMap::new());
         };
 
+        // The wait may have outlived its receiver's original read authority.
+        let completed_authorization = if has_completed_candidates {
+            resolve_task_tool_action_scope(
+                self.processor.as_ref(),
+                &self.context,
+                crate::authorization::ResourceAction::TaskRead,
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
         let service = self.processor.task_runtime.service();
         let mut contents = BTreeMap::new();
-        for item in &response.review_required {
-            // A wait may be visible to a summary-only observer. Failure of the
-            // exact reviewer check therefore withholds content for that item
-            // without turning an otherwise valid observation into an oracle.
+        let candidates = response
+            .review_required
+            .iter()
+            .map(|item| (item.candidate.id.as_str(), None))
+            .chain(completed.map(|(candidate, task)| (candidate, Some(task))));
+        for (candidate_id, completed_task_id) in candidates {
+            if let Some(task_id) = completed_task_id {
+                let Some(authorization) = &completed_authorization else {
+                    continue;
+                };
+                if authorization
+                    .authorize_task(
+                        self.processor.crud_store.as_ref(),
+                        task_id,
+                        crate::authorization::ResourceAction::TaskRead,
+                    )
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            // An otherwise valid observation can still have summary-only access.
             let Ok(candidate) = service
-                .get_task_result_candidate_for_reviewer(context.clone(), item.candidate.id.as_str())
+                .get_task_result_candidate_for_reviewer(context.clone(), candidate_id)
                 .await
             else {
                 continue;
@@ -1644,6 +1682,7 @@ impl TaskToolHandler {
     fn uses_durable_mutation_receipt(&self, invocation: &ToolInvocation) -> bool {
         self.cli_replay
             || invocation.tool_name == TASK_RUN_NOW_TOOL
+            || is_revision_budget_update(invocation)
             || (invocation.tool_name == TASK_RESUME_TOOL
                 && matches!(&invocation.payload, ToolPayload::Function { arguments }
                     if arguments.get("retryRevisionTurnId").is_some_and(JsonValue::is_string)))
@@ -1691,6 +1730,11 @@ impl TaskToolHandler {
             let marker = &mut response["pioneerTaskToolCall"];
             for key in ["taskId", "runId", "candidateId"] {
                 marker[key] = arguments.get(key).cloned().unwrap_or_default();
+            }
+            if invocation.tool_name == TASK_UPDATE_TOOL
+                && let Some(run_id) = arguments.pointer("/revisionBudget/runId")
+            {
+                marker["runId"] = run_id.clone();
             }
         }
         let response = serde_json::to_string(&response)
@@ -2387,7 +2431,7 @@ impl TaskToolHandler {
             .wait_tasks(authorization.wait_context(Some(confirmed_activity)), params)
             .await
             .map_err(task_runtime_tool_error)?;
-        let review_content = self.wait_review_content(&response).await?;
+        let review_content = self.wait_result_content(&response).await?;
 
         Ok(function_output(task_wait_tool_output(
             &response,
@@ -2746,6 +2790,22 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
+        let reviewer_context = if input.revision_budget.is_some() {
+            authorization
+                .authorize_task(
+                    self.processor.crud_store.as_ref(),
+                    task_id.as_str(),
+                    crate::authorization::ResourceAction::TaskReview,
+                )
+                .await?;
+            Some(
+                self.bound_task_actor_context(AgentToolCapability::TaskReview)
+                    .await?
+                    .ok_or_else(task_tool_authorization_error)?,
+            )
+        } else {
+            None
+        };
         let mut params = self.update_params(input).await?;
         if let Some(policy) = params.delivery_policy.as_mut() {
             crate::task_delivery_policy::resolve_task_delivery_policy(
@@ -2784,7 +2844,11 @@ impl TaskToolHandler {
                 AgentToolCapability::TaskControl,
             )
             .await?;
-        let mut mutation_context = authorization.mutation_context(&self.context);
+        if reviewer_context.is_some() && action_plan.is_none() {
+            return Err(task_tool_authorization_error());
+        }
+        let mut mutation_context =
+            reviewer_context.unwrap_or_else(|| authorization.mutation_context(&self.context));
         mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = self
             .processor
@@ -3379,6 +3443,11 @@ impl TaskToolHandler {
         }
         let trigger_kind = trigger.spec.kind();
         let require_review = input.require_review;
+        if input.max_revision_rounds.is_some() && !require_review {
+            return Err(ToolError::invalid_arguments(
+                "maxRevisionRounds requires requireReview=true",
+            ));
+        }
         let lifecycle_policy =
             task_create_lifecycle_policy(input.background, trigger_kind, input.lifecycle_policy)?;
         let delivery_policy =
@@ -3409,10 +3478,15 @@ impl TaskToolHandler {
             security_cap: Some(security_cap),
             result_contract: input.result_contract,
             review_policy: require_review.then(|| {
-                self.processor
+                let mut policy = self
+                    .processor
                     .task_runtime
                     .service()
-                    .explicit_review_policy()
+                    .explicit_review_policy();
+                if let Some(limit) = input.max_revision_rounds {
+                    policy.set_configured_max_revision_rounds(limit);
+                }
+                policy
             }),
             depth: 0,
             max_depth: requested_max_depth,
@@ -3486,6 +3560,7 @@ impl TaskToolHandler {
     ) -> Result<Option<JsonValue>, ToolError> {
         let current_key = invocation.idempotency_key.as_deref().map(str::trim);
         if api_create_receipt
+            || is_revision_budget_update(invocation)
             || (self.uses_durable_mutation_receipt(invocation)
                 && current_key.is_some_and(|key| !key.is_empty()))
         {
@@ -3643,7 +3718,21 @@ impl TaskToolHandler {
         validate_model_visible_context_policy(input.context_policy.as_ref())?;
         validate_model_task_tool_policy(input.tool_policy.as_ref())?;
 
+        if input.revision_budget.is_some() && input.has_task_settings_patch() {
+            return Err(ToolError::invalid_arguments(
+                "revisionBudget must be a standalone patch",
+            ));
+        }
         let task_id = validate_entity_id(input.task_id, "taskId")?;
+        if let Some(mut patch) = input.revision_budget {
+            patch.run_id = validate_entity_id(patch.run_id, "revisionBudget.runId")?;
+            return Ok(TaskUpdateParams {
+                task_id,
+                expected_revision: input.expected_revision,
+                revision_budget: Some(patch),
+                ..TaskUpdateParams::default()
+            });
+        }
         let trigger = input
             .trigger
             .map(TaskTriggerToolInput::into_trigger_input)
@@ -3673,6 +3762,7 @@ impl TaskToolHandler {
         Ok(TaskUpdateParams {
             task_id,
             expected_revision: input.expected_revision,
+            revision_budget: None,
             title: input.title,
             goal: input.goal,
             priority: input.priority,
@@ -3816,6 +3906,14 @@ struct TaskCreateToolInput {
     /// Set true when each run result must wait for explicit review without timeout acceptance.
     /// False disables review; background and trigger do not change this choice.
     require_review: bool,
+    /// Cap for requireReview=true. Use null for unlimited, zero for no revisions, or omit for the site default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_revision_limit"
+    )]
+    #[schemars(with = "Option<u32>")]
+    max_revision_rounds: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
     executor_kind: Option<TaskToolExecutorKind>,
@@ -3878,6 +3976,12 @@ struct TaskCreateToolInput {
     )]
     /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
     idempotency_key: Option<String>,
+}
+
+fn deserialize_optional_revision_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u32>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 impl TaskCreateToolInput {
@@ -4184,11 +4288,11 @@ impl TaskWaitToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for reading the full, reviewer-safe content of one immutable result candidate.
 struct TaskResultToolInput {
-    /// Exact candidate id returned by task_get or task_wait reviewRequired.
+    /// Exact candidate id of an automatically accepted result or a review candidate from task_get or task_wait.
     #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque continuation cursor returned by a previous task_result call.
+    /// Opaque continuation cursor returned by task_result or task_wait.
     #[schemars(length(min = 1, max = 32))]
     cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4352,6 +4456,9 @@ struct TaskUpdateToolInput {
     /// Optional optimistic-concurrency guard. If supplied, the task service rejects the update when the current revision differs.
     expected_revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Standalone reviewed-run patch. Set budget.maxRevisionRounds to a number, or null for unlimited.
+    revision_budget: Option<pioneer_protocol::TaskRunRevisionBudgetPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Replacement task title. For child agents this is also the human-facing task label.
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4449,6 +4556,10 @@ struct TaskUpdateToolInput {
 
 impl TaskUpdateToolInput {
     fn has_patch_fields(&self) -> bool {
+        self.revision_budget.is_some() || self.has_task_settings_patch()
+    }
+
+    fn has_task_settings_patch(&self) -> bool {
         self.title.is_some()
             || self.goal.is_some()
             || self.priority.is_some()
@@ -4634,7 +4745,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. Reviewed tasks can revise without a cap by default; maxRevisionRounds accepts a finite number or null for unlimited. An explicit site default can supply a cap when omitted. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -4661,7 +4772,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESULT_TOOL,
-            "Read reviewer-safe content for the exact immutable candidate returned by task_get or task_wait. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
+            "Read reviewer-safe content for the exact immutable candidate returned by task_get or task_wait. Use the run's candidateId for an automatically completed result or the candidate id from reviewRequired. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
             task_result_schema(),
             safe_read_recovery(),
         ),
@@ -4691,7 +4802,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_UPDATE_TOOL,
-            "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.",
+            "Update a non-terminal task through the task service. To set or remove the cap for a particular reviewed run, supply only taskId and revisionBudget with runId and budget.maxRevisionRounds (number or null). This requires both task management and review authority. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.",
             task_update_schema(),
             safe_mutation_recovery(),
         ),
@@ -4774,7 +4885,34 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
     }
 }
 
-// Frozen CLI bindings still carry these schema descriptions in their hash.
+/// Reconstruct the catalog installed before revision budgets were exposed.
+/// Keep the original descriptions as part of the frozen provider contract.
+pub(crate) fn restore_pre_revision_budget_catalog(spec: &mut ToolSpec) {
+    let properties = |schema: &mut JsonValue, property| {
+        schema["properties"]
+            .as_object_mut()
+            .expect("Task input properties")
+            .remove(property);
+    };
+    match spec.name.as_str() {
+        TASK_CREATE_TOOL => {
+            spec.description = "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.".to_owned();
+            properties(&mut spec.parameters, "maxRevisionRounds");
+        }
+        TASK_UPDATE_TOOL => {
+            spec.description = "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.".to_owned();
+            properties(&mut spec.parameters, "revisionBudget");
+            let definitions = spec.parameters["$defs"]
+                .as_object_mut()
+                .expect("Task update definitions");
+            definitions.remove("TaskRunRevisionBudgetPatch");
+            definitions.remove("TaskRevisionBudget");
+        }
+        _ => unreachable!("no previous revision-budget catalog for this tool"),
+    }
+}
+
+// Frozen canonical schema hashes include the launch field descriptions.
 pub(crate) fn restore_legacy_task_create_catalog(spec: &mut ToolSpec) {
     spec.description = spec.description.replacen(
         "Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup.",
@@ -4793,6 +4931,18 @@ pub(crate) fn restore_legacy_task_create_catalog(spec: &mut ToolSpec) {
         "Set useDefaultReasoning=true to use the model's native default instead\n",
         "of inheriting effort; this cannot be combined with reasoning."
     ));
+}
+
+pub(crate) fn restore_legacy_task_result_catalog(spec: &mut ToolSpec) {
+    spec.description = spec.description.replacen(
+        " Use the run's candidateId for an automatically completed result or the candidate id from reviewRequired.",
+        "",
+        1,
+    );
+    spec.parameters["properties"]["candidateId"]["description"] =
+        json!("Exact candidate id returned by task_get or task_wait reviewRequired.");
+    spec.parameters["properties"]["cursor"]["description"] =
+        json!("Opaque continuation cursor returned by a previous task_result call.");
 }
 
 fn task_create_schema() -> JsonValue {
@@ -4924,13 +5074,13 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
             "Expected fields: taskId and trigger. For scheduled_at set trigger.scheduledAt to a Unix timestamp such as 1893456000 and optional trigger.timezone to UTC. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec."
         }
         TASK_UPDATE_TOOL => {
-            "Expected field: taskId plus at least one patch field such as instructions, inputText, input, outputInstructions, or trigger. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec. Omitted fields stay unchanged; use clear* flags to remove optional values."
+            "Expected field: taskId plus at least one patch field such as instructions, inputText, input, outputInstructions, or trigger. To change one reviewed run's cap use revisionBudget.runId and revisionBudget.budget.maxRevisionRounds (number or null). For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec. Omitted fields stay unchanged; use clear* flags to remove optional values."
         }
         TASK_WAIT_TOOL => {
             "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
         }
         TASK_RESULT_TOOL => {
-            "Expected field: candidateId from task_get or task_wait reviewRequired. To continue truncated content, also pass the exact nextCursor returned by the previous task_result call."
+            "Expected field: candidateId for the completed run or review candidate returned by task_get or task_wait. To continue truncated content, pass nextCursor from task_wait or task_result as cursor."
         }
         TASK_ACCEPT_TOOL => {
             "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_get or task_wait reviewRequired."
@@ -5574,6 +5724,12 @@ fn wait_result_from_storage(storage: &ToolStoragePayload) -> Option<JsonValue> {
     }
 }
 
+fn is_revision_budget_update(invocation: &ToolInvocation) -> bool {
+    invocation.tool_name == TASK_UPDATE_TOOL
+        && matches!(&invocation.payload, ToolPayload::Function { arguments }
+            if arguments.get("revisionBudget").is_some_and(JsonValue::is_object))
+}
+
 fn mutation_idempotency_key_for_item(
     tool_name: &str,
     item_id: &str,
@@ -5659,6 +5815,12 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
         "maxDepth": anchor.max_depth,
         "childThreadId": anchor.child_thread_id,
         "childTurnId": anchor.child_turn_id,
+        "reviewBudget": response.agent_spec.as_ref()
+            .and_then(|spec| spec.review_policy.as_ref())
+            .filter(|policy| policy.is_enabled())
+            .map(|policy| pioneer_protocol::TaskRevisionBudget {
+                max_revision_rounds: policy.effective_max_revision_rounds(),
+            }),
     })
 }
 
@@ -5934,12 +6096,22 @@ fn task_delivery_policy_targets_origin_thread(policy: &TaskDeliveryPolicy) -> bo
 }
 
 fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
-    json!({
+    let mut output = json!({
         "task": task_summary(&response.task),
         "changedFields": &response.changed_fields,
         "trigger": response.trigger.as_ref().map(task_trigger_detail_output),
         "revision": response.task.revision,
-    })
+    });
+    if let Some(spec) = response.agent_spec.as_ref()
+        && let Some(run_id) = spec.run_id.as_ref()
+        && let Some(budget) = spec
+            .review_policy
+            .as_ref()
+            .and_then(|policy| policy.run_revision_budget.as_ref())
+    {
+        output["revisionBudget"] = json!({"runId": run_id, "budget": budget});
+    }
+    output
 }
 
 fn task_wait_tool_output(
@@ -5947,12 +6119,52 @@ fn task_wait_tool_output(
     signature: &TaskWaitSignature,
     review_content: &BTreeMap<String, PublicTaskReviewContent>,
 ) -> JsonValue {
-    let mut output = serde_json::to_value(
-        crate::task_projection::project_task_wait_with_review_content(response, review_content),
-    )
-    .unwrap_or_else(|_| json!({}));
+    let projected =
+        crate::task_projection::project_task_wait_with_review_content(response, review_content);
+    let mut output = serde_json::to_value(projected).unwrap_or_else(|_| json!({}));
     if let Some(object) = output.as_object_mut() {
         object.insert("waitSignature".to_owned(), signature.to_json());
+    }
+    if let Some(completed) = output
+        .get_mut("completed")
+        .and_then(JsonValue::as_array_mut)
+    {
+        for (item, projected) in response.completed.iter().zip(completed) {
+            if let Some(id) = &item.auto_accepted_candidate_id
+                && let Some(run) = projected.get_mut("run")
+            {
+                run["candidateId"] = json!(id);
+            }
+        }
+    }
+
+    // Each inserted field increases both JSON envelopes by the same number of
+    // bytes. Measure the larger envelope after adding all candidate references.
+    if !response.completed.is_empty() && !review_content.is_empty() {
+        let mut remaining_bytes = pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+            .saturating_sub(pioneer_tools::thread_read_page_bytes(&output));
+        if let Some(completed) = output
+            .get_mut("completed")
+            .and_then(JsonValue::as_array_mut)
+        {
+            for (item, projected) in response.completed.iter().zip(completed) {
+                let Some(content) = item
+                    .auto_accepted_candidate_id
+                    .as_ref()
+                    .and_then(|id| review_content.get(id))
+                else {
+                    continue;
+                };
+                let Ok(content) = serde_json::to_value(content) else {
+                    continue;
+                };
+                let bytes = content.to_string().len() + r#","reviewContent":"#.len();
+                if bytes <= remaining_bytes {
+                    projected["reviewContent"] = content;
+                    remaining_bytes -= bytes;
+                }
+            }
+        }
     }
     output
 }
@@ -5981,8 +6193,16 @@ fn task_get_tool_output(
             observed_at,
         });
     }
-    serde_json::to_value(projected)
-        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))
+    let mut output = serde_json::to_value(projected)
+        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))?;
+    if let Some(runs) = output.get_mut("runs").and_then(JsonValue::as_array_mut) {
+        for (source, projected) in response.runs.iter().zip(runs) {
+            if let Some(id) = pioneer_tasks::auto_accepted_candidate_id(response, source) {
+                projected["candidateId"] = json!(id);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn task_wait_non_waitable_output(
@@ -6067,8 +6287,9 @@ fn review_required_task_observation(
         diagnostics: bounded_diagnostics(candidate.diagnostics.as_slice()),
         child_thread_id: item.item.child_thread_id.clone(),
         child_turn_id: item.item.child_turn_id.clone(),
-        max_revision_rounds: item.max_revision_rounds,
-        remaining_revision_rounds: item.remaining_revision_rounds,
+        max_revision_rounds: (!item.unlimited_revision_rounds).then_some(item.max_revision_rounds),
+        remaining_revision_rounds: (!item.unlimited_revision_rounds)
+            .then_some(item.remaining_revision_rounds),
         allowed_actions: item
             .allowed_actions
             .iter()
@@ -7240,6 +7461,7 @@ mod tests {
             cancelled: Vec::new(),
             review_required: vec![pioneer_protocol::TaskWaitReviewItem {
                 item: pioneer_protocol::TaskWaitItem {
+                    auto_accepted_candidate_id: None,
                     task: sample_task(TaskStatus::WaitingReview),
                     run: Some(sample_run(TaskRunStatus::WaitingReview)),
                     child_thread_id: Some("thread_child12345678".to_owned()),
@@ -7252,6 +7474,7 @@ mod tests {
                 ),
                 max_revision_rounds: 2,
                 remaining_revision_rounds,
+                unlimited_revision_rounds: false,
                 allowed_actions,
                 revision_blocked_reason,
             }],
@@ -7649,6 +7872,92 @@ mod tests {
         assert_eq!(content["format"], "text");
         assert_eq!(content["content"], "complete immutable candidate");
         assert_eq!(content["truncated"], false);
+    }
+
+    #[test]
+    fn task_wait_keeps_completed_references_when_a_page_exceeds_the_model_budget() {
+        let mut response =
+            sample_review_wait_response(vec![], 0, None, TaskResultCandidateStatus::PendingReview);
+        let review = response.review_required.pop().unwrap();
+        response.review_required_count = 0;
+        response.total_count = 2;
+        response.terminal_count = 2;
+
+        let mut pages = BTreeMap::new();
+        let page_text =
+            "\u{0001}".repeat(crate::task_projection::DEFAULT_TASK_REVIEW_CONTENT_BYTES);
+        for index in 0..2 {
+            let mut item = review.item.clone();
+            item.task.status = TaskStatus::Completed;
+            item.task.id = format!("task-{index}");
+            let run = item.run.as_mut().unwrap();
+            run.status = TaskRunStatus::Succeeded;
+            run.id = format!("run-{index}");
+            run.task_id = item.task.id.clone();
+            run.result = review.candidate.result.clone();
+            let id = format!("candidate-{index}");
+            item.auto_accepted_candidate_id = Some(id.clone());
+            response.completed.push(item);
+            pages.insert(
+                id,
+                PublicTaskReviewContent {
+                    format: pioneer_protocol::PublicTaskReviewContentFormat::Text,
+                    content: page_text.clone(),
+                    total_bytes: page_text.len() as u64,
+                    content_sha256: "sha256:test".to_owned(),
+                    truncated: false,
+                    next_cursor: None,
+                },
+            );
+        }
+        let signature = TaskWaitSignature {
+            task_ids: response
+                .completed
+                .iter()
+                .map(|item| item.task.id.clone())
+                .collect(),
+            run_ids: vec![],
+            mode: TaskWaitMode::AllTerminalOrReviewRequired,
+        };
+
+        let limit = pioneer_protocol::TOOL_RESPONSE_MAX_BYTES;
+        let both_pages = task_wait_tool_output(&response, &signature, &pages);
+        assert!(both_pages["completed"][1].get("reviewContent").is_some());
+        let view_bytes = |value| {
+            pioneer_tools::ToolResultView::Json {
+                value,
+                truncated: false,
+            }
+            .serialized_size_bytes()
+        };
+
+        // Pad the base payload so both pages still fit the view but overflow
+        // the delivered model JSON after its outcome fields are added.
+        let padding = limit - view_bytes(both_pages);
+        response.completed[0]
+            .task
+            .goal
+            .push_str(&"x".repeat(padding));
+        let mut with_both_pages = task_wait_tool_output(&response, &signature, &pages);
+        assert!(pioneer_tools::thread_read_page_fits(&with_both_pages));
+        assert_eq!(
+            with_both_pages["completed"][0]["reviewContent"]["content"],
+            page_text
+        );
+        assert!(
+            with_both_pages["completed"][1]
+                .get("reviewContent")
+                .is_none()
+        );
+        for index in 0..2 {
+            let run = &with_both_pages["completed"][index]["run"];
+            assert_eq!(run["candidateId"], format!("candidate-{index}"));
+            assert_eq!(run["result"]["summary"], "candidate summary");
+        }
+
+        with_both_pages["completed"][1]["reviewContent"] = json!(pages["candidate-1"]);
+        assert!(!pioneer_tools::thread_read_page_fits(&with_both_pages));
+        assert_eq!(view_bytes(with_both_pages), limit);
     }
 
     #[test]
@@ -8670,6 +8979,43 @@ mod tests {
         assert!(
             message.contains("Do not use trigger.spec"),
             "decode error should include the model-facing update trigger contract, got: {message}"
+        );
+    }
+
+    #[test]
+    fn review_budget_tool_inputs_distinguish_omitted_finite_and_unlimited() {
+        for (cap, expected) in [
+            (json!(0), Some(0)),
+            (json!(200), Some(200)),
+            (JsonValue::Null, None),
+        ] {
+            let parsed: TaskCreateToolInput = serde_json::from_value(json!({
+                "title": "Reviewed task", "goal": "Check output",
+                "requireReview": true, "maxRevisionRounds": cap
+            }))
+            .unwrap();
+            assert_eq!(parsed.max_revision_rounds, Some(expected));
+        }
+        let parsed: TaskCreateToolInput = serde_json::from_value(json!({
+            "title": "Reviewed task", "goal": "Check output", "requireReview": true,
+        }))
+        .unwrap();
+        assert_eq!(parsed.max_revision_rounds, None);
+        let parsed: TaskUpdateToolInput = serde_json::from_value(json!({
+            "taskId": "task_1234567890123456",
+            "revisionBudget": {"runId": "run_12345678901234567", "budget": {"maxRevisionRounds": null}}
+        })).unwrap();
+        assert!(parsed.has_patch_fields());
+        assert!(!parsed.has_task_settings_patch());
+        assert_eq!(
+            parsed.revision_budget.unwrap().budget.max_revision_rounds,
+            None
+        );
+
+        let schema = task_update_schema();
+        assert_eq!(
+            schema["$defs"]["TaskRevisionBudget"]["required"],
+            json!(["maxRevisionRounds"])
         );
     }
 

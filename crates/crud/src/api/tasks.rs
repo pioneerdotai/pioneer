@@ -80,6 +80,7 @@ pub use pioneer_crud_tasks::task_occurrence_reconcile::{
     TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
     TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
 };
+pub use pioneer_crud_tasks::task_projector::TaskRevisionBudgetConflict;
 pub use pioneer_crud_tasks::task_resume::TaskOwnedTurnResumeOutcome;
 pub use pioneer_crud_tasks::task_run_execution::TaskRunExecutionObservationRecord;
 pub use pioneer_crud_tasks::terminal::finalize_agent_execution;

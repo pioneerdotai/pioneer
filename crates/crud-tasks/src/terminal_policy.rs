@@ -130,21 +130,14 @@ pub fn prepare_retry(
         updated_at: completed_at,
     };
     let agent_spec = task_response
-        .agent_specs
-        .iter()
-        .rev()
-        .find(|spec| spec.run_id.as_deref() == Some(failed_run.id.as_str()))
-        .or_else(|| {
-            task_response
-                .agent_specs
-                .iter()
-                .rev()
-                .find(|spec| spec.run_id.is_none())
-        })
+        .agent_spec_for_run(&failed_run.id)
         .cloned()
         .map(|mut spec| {
             spec.id = generate_id(ID_LEN);
             spec.run_id = Some(retry_run.id.clone());
+            if let Some(policy) = spec.review_policy.as_mut() {
+                policy.run_revision_budget = None;
+            }
             spec.updated_at = completed_at;
             spec
         });

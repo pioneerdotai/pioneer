@@ -1341,6 +1341,17 @@
             }
           ]
         },
+        "reviewBudget": {
+          "description": "Present on task_get for reviewed runs. A null cap is unlimited.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRevisionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "runNumber": {
           "type": "integer",
           "format": "int64"
@@ -1711,6 +1722,12 @@
         "item": {
           "$ref": "#/$defs/PublicTaskWaitItem"
         },
+        "maxRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
         "remainingRevisionRounds": {
           "type": "integer",
           "format": "uint32",
@@ -1736,6 +1753,10 @@
               "type": "null"
             }
           ]
+        },
+        "unlimitedRevisionRounds": {
+          "description": "Authoritative unlimited indicator. Numeric counts remain available to older clients.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -2351,6 +2372,7 @@
           "default": false
         },
         "maxRevisionRounds": {
+          "description": "Configured cap for new occurrences. Unlimited uses u32::MAX for older clients.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -2370,6 +2392,21 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "runRevisionBudget": {
+          "description": "Server-owned override for this occurrence only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRevisionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unlimitedRevisionRounds": {
+          "description": "True when the configured cap is unlimited. A run override takes precedence.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -3459,6 +3496,24 @@
       "required": [
         "maxAttempts",
         "backoff"
+      ]
+    },
+    "TaskRevisionBudget": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "description": "Required. A non-negative integer sets the cap. Null removes the cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "maxRevisionRounds"
       ]
     },
     "TaskRunExecutionStatus": {

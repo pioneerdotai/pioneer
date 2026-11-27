@@ -291,6 +291,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} 个需要审核的候选项"
 "timeline.task_review.details.revision_blocked" = "修订已阻止"
 "timeline.task_review.details.revision_rounds_remaining" = "剩余修订轮次"
+"timeline.task_review.details.revision_rounds_unlimited" = "不限"
 "timeline.task_review.details.round" = "轮次"
 "timeline.task_review.details.run_id" = "运行 ID"
 "timeline.task_review.details.summary" = "摘要"

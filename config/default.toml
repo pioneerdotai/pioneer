@@ -92,7 +92,8 @@ recovery_grace_secs = 900
 # Review is opt-in per task; enabled permits explicit review policies.
 enabled = true
 allow_task_create_review_policy = false
-default_max_revision_rounds = 5
+# Optional site default. Omit for unlimited revisions.
+# default_max_revision_rounds = 5
 auto_accept_after_seconds = 300
 
 [gateway.thread]

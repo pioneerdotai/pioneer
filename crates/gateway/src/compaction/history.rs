@@ -229,7 +229,7 @@ pub(super) fn observe_payload_batch(payloads: &[String]) -> RawPayloadLease {
     RawPayloadLease { stats, bytes }
 }
 
-struct SourcePayloadBatch {
+pub(super) struct SourcePayloadBatch {
     entries: std::vec::IntoIter<(SourceRecord, String)>,
     #[cfg(test)]
     _raw_payloads: RawPayloadLease,
@@ -274,7 +274,7 @@ pub(crate) async fn source_payload(
     Ok(payload)
 }
 
-async fn take_source_payload_batch(
+pub(super) async fn take_source_payload_batch(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
@@ -2643,14 +2643,30 @@ async fn load_line_history_inner(
                 fence,
             )
             .await?;
+            // Dispatch markers are local recovery metadata and never model messages.
+            contexts.retain(|row| row.source_type != "runtime_context_v1"
+                || row.item_id.as_deref().and_then(pioneer_agent::compaction::thread_pages::dispatch_target).is_none());
             let has_input_projection = contexts.iter().any(|row| row.source_type == "turn_input_projection_v1");
+            let presentations = contexts.iter().filter_map(|row| {
+                let item = super::thread_pages::presentation_target(&row.source_type, row.item_id.as_deref())?;
+                Some((item.to_owned(), row.reference.clone()))
+            }).collect::<BTreeMap<_, _>>();
+            let replays = contexts.iter().filter_map(|row| {
+                let item = super::thread_pages::replay_target(&row.source_type, row.item_id.as_deref())?;
+                Some((item.to_owned(), row.reference.clone()))
+            }).collect::<BTreeMap<_, _>>();
+            contexts.retain(|row| {
+                let item = row.item_id.as_deref();
+                super::thread_pages::presentation_target(&row.source_type, item).is_none()
+                    && super::thread_pages::replay_target(&row.source_type, item).is_none()
+            });
             // Covered provider rows are removed before payload reads, but their
             // durable item relationship must still suppress the corresponding UI
             // event copy. This is metadata-only and does not make an unrelated
             // event or item part of checkpoint coverage.
             let context_aliases = contexts
                 .iter()
-                .filter(|row| row.source_type == "tool_result_v2" && is_covered(&row.reference))
+                .filter(|row| matches!(row.source_type.as_str(), "tool_result_v2" | "runtime_context_v1") && is_covered(&row.reference))
                 .filter_map(|row| row.item_id.clone())
                 .collect::<BTreeSet<_>>();
             if covered.is_some() {
@@ -2718,7 +2734,7 @@ async fn load_line_history_inner(
             aliases.extend(
                 contexts
                     .iter()
-                    .filter(|row| row.source_type == "tool_result_v2")
+                    .filter(|row| matches!(row.source_type.as_str(), "tool_result_v2" | "runtime_context_v1"))
                     .filter_map(|row| row.item_id.clone()),
             );
             let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
@@ -2871,9 +2887,14 @@ async fn load_line_history_inner(
                             };
                             let full: ChatMessage = serde_json::from_value(value)?;
                             let reference = serde_json::json!({"workspace_id":workspace,"thread_id":thread,"turn_id":turn.id,"item_id":item}).to_string();
-                            let message = pioneer_agent::compaction::restored_tool_result_message(
-                                &full, &reference,
-                            )?;
+                            let replay = if pioneer_agent::compaction::thread_pages::is_thread_reader(&full) {
+                                super::thread_pages::read_replay(store, workspace, thread, replays.get(&item)).await?
+                            } else {
+                                None
+                            };
+                            let message = super::thread_pages::restore_tool_result(
+                                store, &full, &reference, presentations.get(&item), replay.as_ref(),
+                            ).await?;
                             let source = store
                                 .compaction_tool_item_reference(workspace, thread, &turn.id, &item)
                                 .await?

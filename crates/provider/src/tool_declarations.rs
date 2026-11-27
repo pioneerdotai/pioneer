@@ -20,15 +20,16 @@ struct Batch {
     tools: Vec<ToolDefinition>,
 }
 
+/// Identity used for a confirmed declaration position. Application-only
+/// metadata is excluded in both admission and recovery.
+pub fn message_hash(message: &ChatMessage) -> anyhow::Result<String> {
+    let mut message = message.clone();
+    message.application_context = None;
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&message)?)))
+}
+
 fn prefix(messages: &[ChatMessage]) -> anyhow::Result<Vec<String>> {
-    messages
-        .iter()
-        .map(|message| {
-            let mut message = message.clone();
-            message.application_context = None;
-            Ok(hex::encode(Sha256::digest(serde_json::to_vec(&message)?)))
-        })
-        .collect()
+    messages.iter().map(message_hash).collect()
 }
 
 impl ToolDeclarations {
@@ -113,6 +114,10 @@ impl ToolDeclarations {
                 .batches
                 .windows(2)
                 .all(|pair| pair[0].before_message <= pair[1].before_message)
+    }
+
+    pub fn confirmed_message_prefix(&self) -> Option<&[String]> {
+        (!self.pending && self.valid_prefix(&self.prefix)).then_some(self.prefix.as_slice())
     }
 
     pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {

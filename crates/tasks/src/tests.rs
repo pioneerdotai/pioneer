@@ -387,7 +387,7 @@ fn test_review_config() -> TaskRuntimeConfig {
         review: TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_max_revision_rounds: 2,
+            default_max_revision_rounds: Some(2),
             auto_accept_after_seconds: 300,
         },
     }
@@ -1596,6 +1596,8 @@ async fn review_event_advisory_keeps_candidate_pending() {
         let policy = TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::ParentAgentWithReviewers,
             max_revision_rounds: 2,
+            unlimited_revision_rounds: false,
+            run_revision_budget: None,
             require_explicit_acceptance: true,
             disable_timeout_acceptance: false,
             reviewers: vec![reviewer_spec.clone()],
@@ -2047,6 +2049,8 @@ async fn user_review_event_resolves_when_policy_is_user_final() {
         let policy = TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::UserApproval,
             max_revision_rounds: 1,
+            unlimited_revision_rounds: false,
+            run_revision_budget: None,
             require_explicit_acceptance: true,
             disable_timeout_acceptance: false,
             reviewers: Vec::new(),
@@ -2559,6 +2563,270 @@ async fn revise_validation_rejects_max_revision_rounds() {
         assert!(
             format!("{error:#}").contains("max_revision_rounds"),
             "unexpected error: {error:#}"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn clearing_legacy_run_budget_preserves_candidate_and_admits_round_six() {
+    pioneer_postgres_test::with_database(async |fixture| {
+        let runtime = postgres_runtime_with_review(fixture).await;
+        let (task_id, run_id, candidate_id) = create_waiting_review_agent_task(
+            &runtime,
+            5,
+            5,
+            TaskResultCandidateStatus::PendingReview,
+        )
+        .await;
+        let service = runtime.service();
+        let store = service.store();
+        let context = parent_accept_context_for_candidate(&runtime, &task_id, &candidate_id).await;
+        let before = store.get_task(&task_id).await?.unwrap();
+        let base = before
+            .agent_specs
+            .iter()
+            .find(|spec| spec.run_id.is_none())
+            .unwrap();
+        let spec = before.agent_spec_for_run(&run_id).unwrap();
+        let candidate = store
+            .get_task_result_candidate(&candidate_id)
+            .await?
+            .unwrap();
+        let mut sibling = before
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .clone();
+        sibling.id = pioneer_protocol::generate_id(21);
+        sibling.run_group_id = sibling.id.clone();
+        sibling.run_number += 1;
+        sibling.status = TaskRunStatus::Queued;
+        let mut sibling_spec = spec.clone();
+        sibling_spec.id = pioneer_protocol::generate_id(21);
+        sibling_spec.run_id = Some(sibling.id.clone());
+        service
+            .append_event(
+                TaskEventPayload::RunCreated {
+                    run: sibling.clone(),
+                    agent_spec: Some(sibling_spec.clone()),
+                },
+                sibling.created_at,
+            )
+            .await?;
+
+        let update = |max_revision_rounds| TaskUpdateParams {
+            task_id: task_id.clone(),
+            revision_budget: Some(pioneer_protocol::TaskRunRevisionBudgetPatch {
+                run_id: run_id.clone(),
+                budget: pioneer_protocol::TaskRevisionBudget {
+                    max_revision_rounds,
+                },
+            }),
+            ..Default::default()
+        };
+        let request = revise_params(task_id.clone(), run_id.clone(), candidate_id.clone());
+
+        assert!(
+            service
+                .update_task(TaskMutationContext::default(), update(None))
+                .await
+                .is_err()
+        );
+        let child = TaskMutationContext::parent_agent(&candidate.thread_id, &candidate.turn_id);
+        let denied = service.update_task(child, update(None)).await.unwrap_err();
+        assert!(matches!(
+            denied.downcast_ref::<crate::TaskOperationError>(),
+            Some(crate::TaskOperationError::AccessDenied)
+        ));
+        assert!(
+            service
+                .revise_task_result_candidate(context.clone(), request.clone())
+                .await
+                .is_err()
+        );
+
+        service.update_task(context.clone(), update(None)).await?;
+        let after = store.get_task(&task_id).await?.unwrap();
+        let changed = after.agent_spec_for_run(&run_id).unwrap();
+        assert_eq!(changed.id, spec.id);
+        assert_eq!(changed.prompt, spec.prompt);
+        assert_eq!(after.agent_spec_for_run(&sibling.id), Some(&sibling_spec));
+        assert_eq!(
+            after.agent_specs.iter().find(|spec| spec.run_id.is_none()),
+            Some(base)
+        );
+        assert_eq!(
+            store.get_task_result_candidate(&candidate_id).await?,
+            Some(candidate.clone())
+        );
+        assert!(
+            store
+                .list_task_result_review_events(&candidate_id)
+                .await?
+                .is_empty()
+        );
+        let policy = after.review_policy_for_run(&run_id).unwrap();
+        assert_eq!(policy.effective_max_revision_rounds(), None);
+        assert!(policy.require_explicit_acceptance);
+
+        let revised = service
+            .revise_task_result_candidate(context.clone(), request.clone())
+            .await?;
+        assert_eq!(revised.task_run_turn.round, 6);
+        assert_eq!(revised.child_thread_id, candidate.thread_id);
+
+        service
+            .update_task(context.clone(), update(Some(5)))
+            .await?;
+        let replay = service
+            .revise_task_result_candidate(context, request)
+            .await?;
+        assert!(replay.already_requested);
+        assert_eq!(replay.task_run_turn.id, revised.task_run_turn.id);
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn extraction_outcomes_revalidate_revision_budget_before_publishing() {
+    pioneer_postgres_test::with_database(async |fixture| {
+        let runtime = postgres_runtime_with_review(fixture).await;
+        let (task_id, run_id, candidate_id) = create_waiting_review_agent_task(
+            &runtime,
+            1,
+            0,
+            TaskResultCandidateStatus::PendingReview,
+        )
+        .await;
+        let service = runtime.service();
+        let store = service.store();
+        let actor = parent_accept_context_for_candidate(&runtime, &task_id, &candidate_id).await;
+        let revised = service
+            .revise_task_result_candidate(
+                actor.clone(),
+                revise_params(task_id.clone(), run_id.clone(), candidate_id),
+            )
+            .await?;
+        let turn = revised.task_run_turn;
+        seed_task_turn(&store, &turn.thread_id, &turn.turn_id, "completed").await;
+        let at = crate::service::now_timestamp_secs();
+        let error = TaskError {
+            recovery_diagnostic: None,
+            code: "task_agent_result_missing".to_owned(),
+            message: "No extracted result".to_owned(),
+            class: TaskErrorClass::Validation,
+            details: None,
+            failed_run_id: Some(run_id.clone()),
+        };
+        let update = |max_revision_rounds| TaskUpdateParams {
+            task_id: task_id.clone(),
+            revision_budget: Some(pioneer_protocol::TaskRunRevisionBudgetPatch {
+                run_id: run_id.clone(),
+                budget: pioneer_protocol::TaskRevisionBudget {
+                    max_revision_rounds,
+                },
+            }),
+            ..Default::default()
+        };
+        let terminal = store
+            .prepare_task_terminal_transition(TaskEventPayload::RunFailed {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                error: Some(error.clone()),
+                completed_at: at,
+            })
+            .await?;
+        let terminal = store
+            .prepare_task_terminal_with_extraction_failure(terminal, turn.clone())
+            .await?;
+
+        // The batch was prepared against an exhausted budget. A clear commits first.
+        service.update_task(actor.clone(), update(None)).await?;
+        let conflict = store
+            .commit_task_terminal_transition(terminal)
+            .await
+            .unwrap_err();
+        assert!(conflict.is::<pioneer_crud::TaskRevisionBudgetConflict>());
+        assert_eq!(
+            store.get_task_run(&run_id).await?.unwrap().status,
+            TaskRunStatus::Running
+        );
+        assert_eq!(
+            store
+                .get_task_run_turn_by_turn(&turn.thread_id, &turn.turn_id)
+                .await?,
+            Some(turn.clone())
+        );
+
+        let mut completed = turn.clone();
+        completed.status = TaskRunTurnStatus::CandidateCreated;
+        completed.completed_at = Some(at);
+        let candidate = TaskResultCandidate {
+            id: format!("trc_{}_{}", run_id, turn.turn_id),
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            task_run_turn_id: turn.id.clone(),
+            turn_id: turn.turn_id.clone(),
+            thread_id: turn.thread_id.clone(),
+            round: turn.round,
+            status: TaskResultCandidateStatus::ExtractionFailed,
+            result: None,
+            extraction_error: Some(error),
+            summary: None,
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: at,
+            updated_at: at,
+            resolved_at: None,
+        };
+        let handle = TaskExecutionHandle::new(
+            store.clone(),
+            runtime.event_bus(),
+            task_id.clone(),
+            run_id.clone(),
+        );
+        // The candidate was chosen while uncapped. A tightening commits first.
+        service.update_task(actor.clone(), update(Some(1))).await?;
+        let conflict = handle
+            .record_pending_review_result_candidate(completed.clone(), candidate.clone(), at)
+            .await
+            .unwrap_err();
+        assert!(conflict.is::<pioneer_crud::TaskRevisionBudgetConflict>());
+        assert!(
+            store
+                .get_task_result_candidate(&candidate.id)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_task_run_turn_by_turn(&turn.thread_id, &turn.turn_id)
+                .await?,
+            Some(turn)
+        );
+        assert_eq!(
+            store.get_task_run(&run_id).await?.unwrap().status,
+            TaskRunStatus::Running
+        );
+
+        service.update_task(actor, update(None)).await?;
+        handle
+            .record_pending_review_result_candidate(completed, candidate.clone(), at)
+            .await?;
+        assert_eq!(
+            store.get_task_result_candidate(&candidate.id).await?,
+            Some(candidate)
+        );
+        assert_eq!(
+            store.get_task_run(&run_id).await?.unwrap().status,
+            TaskRunStatus::WaitingReview
         );
         Ok(())
     })
@@ -3164,13 +3432,31 @@ async fn explicit_review_stays_pending_after_timeout_and_runtime_reconstruction(
             .await
             .unwrap()
             .unwrap();
+        // The legacy exact run snapshot has no policy of its own.
+        let exact = store
+            .get_task(&task_id)
+            .await?
+            .unwrap()
+            .agent_spec_for_run(&run_id)
+            .unwrap()
+            .id
+            .clone();
+        pioneer_entity::task_agent_spec::Entity::update(
+            pioneer_entity::task_agent_spec::ActiveModel {
+                id: Set(exact),
+                review_policy_json: Set(None),
+                ..Default::default()
+            },
+        )
+        .exec(fixture.connection())
+        .await?;
         let restored = TaskRuntime::new_with_config(
             store.clone(),
             TaskRuntimeConfig {
                 review: TaskReviewRuntimeConfig {
                     enabled: true,
                     allow_task_create_review_policy: true,
-                    default_max_revision_rounds: 2,
+                    default_max_revision_rounds: Some(2),
                     auto_accept_after_seconds: 300,
                 },
             },
@@ -3202,11 +3488,7 @@ async fn explicit_review_stays_pending_after_timeout_and_runtime_reconstruction(
         );
         assert_eq!(
             response
-                .agent_specs
-                .last()
-                .unwrap()
-                .review_policy
-                .as_ref()
+                .review_policy_for_run(&run_id)
                 .unwrap()
                 .max_revision_rounds,
             5
@@ -3224,6 +3506,37 @@ async fn explicit_review_stays_pending_after_timeout_and_runtime_reconstruction(
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            response
+                .agent_spec_for_run(&run_id)
+                .unwrap()
+                .review_policy
+                .is_none()
+        );
+        let context = parent_accept_context_for_candidate(&restored, &task_id, &candidate_id).await;
+        let updated = restored
+            .service()
+            .update_task(
+                context.clone(),
+                TaskUpdateParams {
+                    task_id: task_id.clone(),
+                    revision_budget: Some(pioneer_protocol::TaskRunRevisionBudgetPatch {
+                        run_id: run_id.clone(),
+                        budget: pioneer_protocol::TaskRevisionBudget {
+                            max_revision_rounds: None,
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let effective = updated.agent_spec.unwrap().review_policy.unwrap();
+        assert!(effective.disable_timeout_acceptance);
+        assert!(effective.require_explicit_acceptance);
+        restored
+            .service()
+            .revise_task_result_candidate(context, revise_params(task_id, run_id, candidate_id))
+            .await?;
         Ok(())
     })
     .await
@@ -3500,6 +3813,8 @@ async fn accept_task_result_candidate_user_records_user_review_when_policy_allow
         let policy = TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::UserApproval,
             max_revision_rounds: 1,
+            unlimited_revision_rounds: false,
+            run_revision_budget: None,
             require_explicit_acceptance: true,
             disable_timeout_acceptance: false,
             reviewers: Vec::new(),

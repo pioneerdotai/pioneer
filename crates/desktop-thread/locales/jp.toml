@@ -291,6 +291,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} 件のレビュー対象候補"
 "timeline.task_review.details.revision_blocked" = "修正ブロック"
 "timeline.task_review.details.revision_rounds_remaining" = "残り修正ラウンド"
+"timeline.task_review.details.revision_rounds_unlimited" = "無制限"
 "timeline.task_review.details.round" = "ラウンド"
 "timeline.task_review.details.run_id" = "実行 ID"
 "timeline.task_review.details.summary" = "概要"

@@ -4673,6 +4673,7 @@ impl RecoveryCoordinator {
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {
+        use pioneer_agent::compaction::thread_pages;
         use pioneer_crud::compaction::PagedSource;
         let store = self.crud_store.with_maintenance_access();
         let (thread, workspace) = store
@@ -4690,6 +4691,9 @@ impl RecoveryCoordinator {
         let mut after = 0;
         let mut rows = Vec::new();
         let mut sources = HashMap::new();
+        let mut presentations = HashMap::new();
+        let mut replays = HashMap::new();
+        let mut dispatched_page_rounds = HashSet::new();
         while after < high_water {
             let page = store
                 .compaction_source_metadata_page(
@@ -4709,6 +4713,37 @@ impl RecoveryCoordinator {
                 row.sequence <= high_water
                     && pioneer_crud::compaction::model_history_context_source(&row.source_type)
             }) {
+                if row.source_type == "runtime_context_v1"
+                    && let Some(unit) = row
+                        .item_id
+                        .as_deref()
+                        .and_then(thread_pages::dispatch_target)
+                {
+                    dispatched_page_rounds.insert(unit.to_owned());
+                    continue;
+                }
+                if let Some(item) = crate::compaction::thread_pages::replay_target(
+                    &row.source_type,
+                    row.item_id.as_deref(),
+                ) {
+                    anyhow::ensure!(
+                        replays.insert(item.to_owned(), row.reference).is_none(),
+                        "duplicate tool replay record"
+                    );
+                    continue;
+                }
+                if let Some(item) = crate::compaction::thread_pages::presentation_target(
+                    &row.source_type,
+                    row.item_id.as_deref(),
+                ) {
+                    anyhow::ensure!(
+                        presentations
+                            .insert(item.to_owned(), row.reference)
+                            .is_none(),
+                        "duplicate retained thread page presentation"
+                    );
+                    continue;
+                }
                 let payload = match row.payload {
                     Some(payload) => payload,
                     None => store
@@ -4727,6 +4762,11 @@ impl RecoveryCoordinator {
                 });
             }
         }
+        let last_assistant_sequence = rows
+            .iter()
+            .filter(|row| row.source == "assistant_round")
+            .map(|row| row.sequence)
+            .max();
         // Legacy assistant calls cannot be replayed with their cleanup-eligible
         // tool_result rows. Dropping that sequence is safe only when durable
         // terminal item state proves every call completed. Never inspect the
@@ -4832,6 +4872,11 @@ impl RecoveryCoordinator {
                 resumable_item_ids.insert(tool.item_id.clone());
             }
         }
+        let runtime_replays = rows
+            .iter()
+            .filter(|row| row.source == "runtime_context_v1")
+            .filter_map(|row| Some((row.sequence, replays.get(row.item_id.as_ref()?)?)))
+            .collect::<HashMap<_, _>>();
         let mut retained = assemble_retained_provider_history_with_outcomes(
             turn_id,
             rows,
@@ -4839,15 +4884,38 @@ impl RecoveryCoordinator {
             &recovered,
         )?;
         let mut round = None;
+        let mut can_complete_page_selection = false;
         for entry in &mut retained {
             if entry.message.role == Role::Assistant {
                 round = origins.get(&entry.sequence);
+                // Only a complete latest round recorded by the fenced writer
+                // can have pending pages. Every earlier send remains fixed.
+                can_complete_page_selection = last_assistant_sequence == Some(entry.sequence)
+                    && round.is_some_and(|origin| {
+                        !dispatched_page_rounds.contains(&origin.assistant.unit_id)
+                    });
                 if let Some(origin) = round {
                     entry.message.provenance = Some(origin.assistant.clone());
                 }
             } else if entry.message.role == Role::User {
                 if let Some(origin) = origins.get(&entry.sequence) {
                     entry.message.provenance = Some(origin.assistant.clone());
+                }
+                if let Some(source) = runtime_replays.get(&entry.sequence) {
+                    let replay = crate::compaction::thread_pages::read_replay(
+                        &store,
+                        &workspace,
+                        &thread,
+                        Some(*source),
+                    )
+                    .await?;
+                    let Some(thread_pages::ResultReplay::Task { outcomes }) = replay else {
+                        anyhow::bail!("task notice has an invalid replay record");
+                    };
+                    pioneer_agent::task_observation::save_observations(
+                        &mut entry.message,
+                        &outcomes,
+                    );
                 }
                 round = None;
             } else if entry.message.role == Role::Tool {
@@ -4896,12 +4964,65 @@ impl RecoveryCoordinator {
                     }];
                 }
                 entry.message.provenance = Some(provenance);
-                let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": origin.item_id}).to_string();
-                entry.message = pioneer_agent::compaction::restored_tool_result_message(
-                    &entry.message,
-                    &reference,
-                )?;
+                let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": origin.item_id});
+                let presentation = presentations.get(&origin.item_id);
+                let replay = crate::compaction::thread_pages::read_replay(
+                    &store,
+                    &workspace,
+                    &thread,
+                    replays.get(&origin.item_id),
+                )
+                .await?;
+                let deferrable = can_complete_page_selection
+                    && presentation.is_none()
+                    && origin.provenance.is_some()
+                    && matches!(&replay, Some(thread_pages::ResultReplay::Page { page }) if page.deferrable);
+                entry.message =
+                    if replay.is_none() && thread_pages::is_thread_reader(&entry.message) {
+                        // Old active rounds stored the raw body after sending its
+                        // framed view. Completed-history snapshots keep their own
+                        // already recorded representation.
+                        thread_pages::restore_frame(&entry.message, None)?
+                    } else {
+                        crate::compaction::thread_pages::restore_tool_result(
+                            &store,
+                            &entry.message,
+                            &reference.to_string(),
+                            presentation,
+                            replay.as_ref(),
+                        )
+                        .await?
+                    };
+                if deferrable {
+                    thread_pages::mark_recovered(&mut entry.message, reference);
+                }
+                if let Some(thread_pages::ResultReplay::Task { outcomes }) = replay {
+                    pioneer_agent::task_observation::save_observations(
+                        &mut entry.message,
+                        &outcomes,
+                    );
+                } else {
+                    restore_legacy_task_observations(
+                        &store,
+                        turn_id,
+                        &origin.item_id,
+                        &mut entry.message,
+                    )
+                    .await?;
+                }
             }
+        }
+        if crate::compaction::legacy_task_notices::restore(
+            &store,
+            &workspace,
+            &thread,
+            turn_id,
+            &mut retained,
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("exact legacy task notice proof unavailable during recovery");
         }
         Ok(retained)
     }
@@ -5102,6 +5223,35 @@ impl RecoveryCoordinator {
 
 fn provider_snapshot_field<'a>(job: &'a RecoveryJobRecord, key: &str) -> Option<&'a str> {
     job.policy_snapshot.get(key)?.as_str()
+}
+
+async fn restore_legacy_task_observations(
+    store: &pioneer_crud::CrudStore,
+    turn: &str,
+    item: &str,
+    message: &mut ChatMessage,
+) -> Result<()> {
+    use pioneer_agent::task_observation;
+    let Some(name) = message
+        .name
+        .as_deref()
+        .filter(|name| task_observation::reports_terminal_outcome(name))
+    else {
+        return Ok(());
+    };
+    let outcomes = task_observation::observed_terminal_task_outcomes_from_message(message);
+    if !outcomes.is_empty()
+        && matches!(
+            store.get_turn_item(turn, item).await?,
+            Some(pioneer_protocol::TurnItem::DynamicToolCall {
+                tool_name, status: pioneer_protocol::ToolCallStatus::Completed,
+                success: Some(true), ..
+            }) if tool_name == name
+        )
+    {
+        task_observation::save_observations(message, &outcomes);
+    }
+    Ok(())
 }
 
 struct RetainedRoundOrigins {
@@ -5475,6 +5625,16 @@ fn assemble_canonical_provider_history(
             );
         }
 
+        for identity in &identities {
+            let message = &pending.results[&identity.turn_item_id];
+            anyhow::ensure!(
+                !pioneer_agent::compaction::thread_pages::is_thread_reader(message)
+                    || calls.get(identity.ordinal as usize).is_some_and(|call| {
+                        message.name.as_deref() == Some(call.name.as_str())
+                    }),
+                "retained thread page does not match its canonical call"
+            );
+        }
         retained.push(RetainedProviderHistoryMessage {
             sequence: pending.sequence,
             message: pending.envelope.message,

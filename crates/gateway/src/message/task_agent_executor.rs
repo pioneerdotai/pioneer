@@ -1839,11 +1839,7 @@ impl TaskAgentExecutor {
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
     ) -> Result<TaskExecutorStartOutcome> {
-        let Some(review_policy) = agent_spec
-            .review_policy
-            .as_ref()
-            .filter(|policy| policy.is_enabled())
-        else {
+        let Some(review_policy) = task_response.review_policy_for_run(&run.id) else {
             return Ok(TaskExecutorStartOutcome::Queued);
         };
         let mut candidates = processor
@@ -5875,7 +5871,10 @@ impl TaskAgentExecutor {
         match result {
             // The terminal child remains discoverable. The claimed background
             // path defers it through its existing next-attempt deadline.
-            Err(error) if error.is::<crate::compaction::frozen::TaskOutputHistoryChanged>() => {
+            Err(error)
+                if error.is::<crate::compaction::frozen::TaskOutputHistoryChanged>()
+                    || error.is::<pioneer_crud::TaskRevisionBudgetConflict>() =>
+            {
                 Ok(false)
             }
             result => result.map(|()| true),
@@ -5926,10 +5925,8 @@ impl TaskAgentExecutor {
                 .ok_or_else(|| {
                     anyhow!("agent task `{}` has no agent spec", task_response.task.id)
                 })?;
-        let review_policy = agent_spec
-            .review_policy
-            .clone()
-            .filter(|policy| policy.is_enabled());
+        let review_policy =
+            task_response.review_policy_for_run(&child_runtime.task_run_turn.run_id);
         if reuse_published_child_result(processor, &child_runtime, &handle, closing).await? {
             return Ok(());
         }
@@ -5959,41 +5956,35 @@ impl TaskAgentExecutor {
         } else {
             Fact::InvalidResult
         });
+        if review_policy.is_some() {
+            let failure = match &extracted {
+                Ok(result) => invalid_structured_result_error(
+                    result,
+                    &agent_spec,
+                    &child_runtime.task_run_turn.run_id,
+                ),
+                Err(error) => Some(error.clone()),
+            };
+            if let Some(error) = failure {
+                return self
+                    .close_reviewed_extraction_failure(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+            }
+        }
         match extracted {
             Ok(result) if review_policy.is_some() => {
-                let review_policy = review_policy.as_ref().expect("review policy checked");
+                let review_policy = review_policy.expect("review policy checked");
                 let completed_at = now_timestamp_secs();
                 let completed_turn =
                     candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
-                let candidate = match invalid_structured_result_error(
-                    &result,
-                    &agent_spec,
-                    child_runtime.task_run_turn.run_id.as_str(),
-                ) {
-                    Some(error) if revision_possible(review_policy, &completed_turn) => {
-                        extraction_failed_result_candidate(&completed_turn, error, completed_at)
-                    }
-                    Some(error) => {
-                        record_task_run_turn_failure(
-                            &handle,
-                            &child_runtime.task_run_turn,
-                            TaskRunTurnStatus::Failed,
-                            Some(error.clone()),
-                            completed_at,
-                        )
-                        .await?;
-                        handle.fail_run(Some(error), completed_at).await?;
-                        mark_task_run_occurrence_turn_failed(
-                            processor,
-                            &child_runtime.lineage,
-                            "child task result extraction failed",
-                        )
-                        .await?;
-                        closing.finish(Fact::InvalidResult);
-                        return Ok(());
-                    }
-                    None => pending_review_result_candidate(&completed_turn, result, completed_at),
-                };
+                let candidate =
+                    pending_review_result_candidate(&completed_turn, result, completed_at);
                 let candidate_for_review = candidate.clone();
                 if let Err(error) = handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
@@ -6008,13 +5999,7 @@ impl TaskAgentExecutor {
                     )
                     .await;
                 }
-                closing.finish(
-                    if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
-                        Fact::InvalidResult
-                    } else {
-                        Fact::PendingReview
-                    },
-                );
+                closing.finish(Fact::PendingReview);
                 self.start_reviewer_turns_for_candidate(
                     processor,
                     &task_response,
@@ -6053,47 +6038,6 @@ impl TaskAgentExecutor {
                 closing.finish(Fact::Accepted);
                 mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             }
-            Err(error)
-                if review_policy.as_ref().is_some_and(|policy| {
-                    revision_possible(policy, &child_runtime.task_run_turn)
-                }) =>
-            {
-                let completed_at = now_timestamp_secs();
-                let completed_turn =
-                    candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
-                let candidate =
-                    extraction_failed_result_candidate(&completed_turn, error, completed_at);
-                let candidate_for_review = candidate.clone();
-                if let Err(error) = handle
-                    .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
-                    .await
-                {
-                    return recover_child_completion_replay(
-                        processor,
-                        &child_runtime,
-                        &handle,
-                        closing,
-                        error,
-                    )
-                    .await;
-                }
-                closing.finish(
-                    if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
-                        Fact::InvalidResult
-                    } else {
-                        Fact::PendingReview
-                    },
-                );
-                let review_policy = review_policy.as_ref().expect("review policy checked");
-                self.start_reviewer_turns_for_candidate(
-                    processor,
-                    &task_response,
-                    &agent_spec,
-                    review_policy,
-                    &candidate_for_review,
-                )
-                .await?;
-            }
             Err(error) => {
                 let failed_at = now_timestamp_secs();
                 record_task_run_turn_failure(
@@ -6115,6 +6059,83 @@ impl TaskAgentExecutor {
             }
         }
         Ok(())
+    }
+
+    async fn close_reviewed_extraction_failure(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        child: &TaskRunChildRuntime,
+        handle: &TaskExecutionHandle,
+        closing: &mut Closing,
+        error: TaskError,
+    ) -> Result<()> {
+        let turn = &child.task_run_turn;
+        let mut budget_conflict = None;
+        for _ in 0..4 {
+            if reuse_published_child_result(processor, child, handle, closing).await? {
+                return Ok(());
+            }
+            let response = processor
+                .crud_store
+                .get_task(&turn.task_id)
+                .await?
+                .context("reviewed extraction task disappeared")?;
+            let policy = response
+                .review_policy_for_run(&turn.run_id)
+                .context("reviewed extraction policy disappeared")?;
+            let at = now_timestamp_secs();
+            // Choose the batch on the reader, then fence the choice in the
+            // same stream transaction that commits it. Reuse the extraction.
+            if policy.allows_revision_after(turn.round) {
+                let completed = candidate_created_task_run_turn(turn, at);
+                let candidate = extraction_failed_result_candidate(&completed, error.clone(), at);
+                match handle
+                    .record_pending_review_result_candidate(completed, candidate.clone(), at)
+                    .await
+                {
+                    Ok(()) => {
+                        closing.finish(Fact::InvalidResult);
+                        let spec = response
+                            .agent_spec_for_run(&turn.run_id)
+                            .context("reviewed extraction agent spec disappeared")?;
+                        return self
+                            .start_reviewer_turns_for_candidate(
+                                processor, &response, spec, policy, &candidate,
+                            )
+                            .await;
+                    }
+                    Err(error) if error.is::<pioneer_crud::TaskRevisionBudgetConflict>() => {
+                        budget_conflict = Some(error);
+                    }
+                    Err(error) => {
+                        return recover_child_completion_replay(
+                            processor, child, handle, closing, error,
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                match handle
+                    .fail_reviewed_extraction(turn.clone(), error.clone(), at)
+                    .await
+                {
+                    Ok(()) => {
+                        closing.finish(Fact::InvalidResult);
+                        return mark_task_run_occurrence_turn_failed(
+                            processor,
+                            &child.lineage,
+                            "child task result extraction failed",
+                        )
+                        .await;
+                    }
+                    Err(error) if error.is::<pioneer_crud::TaskRevisionBudgetConflict>() => {
+                        budget_conflict = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(budget_conflict.expect("each unsuccessful attempt observed a budget conflict"))
     }
 
     async fn start_reviewer_turns_for_candidate(
@@ -7110,10 +7131,8 @@ impl TaskAgentExecutor {
             .get_task(candidate.task_id.as_str())
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
-        let agent_spec = select_agent_spec(&task_response, candidate.run_id.as_str())
-            .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", task_response.task.id))?;
         let reviewer_key = reviewer_key_for_turn(
-            agent_spec.review_policy.as_ref(),
+            task_response.review_policy_for_run(&candidate.run_id),
             &candidate,
             &reviewer_runtime.task_run_turn,
         );
@@ -10755,10 +10774,6 @@ fn extraction_failed_result_candidate(
     }
 }
 
-fn revision_possible(review_policy: &TaskAgentReviewPolicy, task_run_turn: &TaskRunTurn) -> bool {
-    task_run_turn.round < review_policy.max_revision_rounds
-}
-
 fn invalid_structured_result_error(
     result: &TaskResult,
     agent_spec: &TaskAgentSpec,
@@ -11626,19 +11641,7 @@ fn normalized_task_policy_values(values: &[String]) -> Vec<String> {
 }
 
 pub(super) fn select_agent_spec(response: &TaskGetResponse, run_id: &str) -> Option<TaskAgentSpec> {
-    response
-        .agent_specs
-        .iter()
-        .rev()
-        .find(|spec| spec.run_id.as_deref() == Some(run_id))
-        .or_else(|| {
-            response
-                .agent_specs
-                .iter()
-                .rev()
-                .find(|spec| spec.run_id.is_none())
-        })
-        .cloned()
+    response.agent_spec_for_run(run_id).cloned()
 }
 
 #[derive(Debug, Clone)]
@@ -11886,7 +11889,9 @@ Return only one JSON object:
         goal = task_response.task.goal,
         instructions = agent_spec.prompt.instructions.join("\n"),
         strategy = review_policy.resolution_strategy,
-        max_revision_rounds = review_policy.max_revision_rounds,
+        max_revision_rounds = review_policy
+            .effective_max_revision_rounds()
+            .map_or_else(|| "unlimited".to_owned(), |max| max.to_string()),
         required = reviewer_spec.required,
         candidate_id = candidate.id,
         round = candidate.round,
@@ -14799,8 +14804,13 @@ mod tests {
             weight: None,
         };
         let policy = TaskAgentReviewPolicy {
-            mode: pioneer_protocol::TaskAgentReviewMode::ParentAgentWithReviewers, max_revision_rounds: 1,
-            require_explicit_acceptance: true, disable_timeout_acceptance: false, reviewers: vec![reviewer.clone()],
+            mode: pioneer_protocol::TaskAgentReviewMode::ParentAgentWithReviewers,
+            max_revision_rounds: 1,
+            unlimited_revision_rounds: false,
+            run_revision_budget: None,
+            require_explicit_acceptance: true,
+            disable_timeout_acceptance: false,
+            reviewers: vec![reviewer.clone()],
             resolution_strategy: pioneer_protocol::TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
         };
         response.agent_specs[0].review_policy = Some(policy.clone());

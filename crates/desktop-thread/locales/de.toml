@@ -291,6 +291,7 @@
 "timeline.task_review.details.review_required_count" = "%{count} prüfungspflichtige Kandidaten"
 "timeline.task_review.details.revision_blocked" = "Überarbeitung blockiert"
 "timeline.task_review.details.revision_rounds_remaining" = "Verbleibende Überarbeitungsrunden"
+"timeline.task_review.details.revision_rounds_unlimited" = "Unbegrenzt"
 "timeline.task_review.details.round" = "Runde"
 "timeline.task_review.details.run_id" = "Run-ID"
 "timeline.task_review.details.summary" = "Zusammenfassung"

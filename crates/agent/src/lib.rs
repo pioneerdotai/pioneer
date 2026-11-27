@@ -14,7 +14,7 @@ mod hooks;
 mod manager_recovery;
 #[cfg(test)]
 mod manager_tests;
-mod task_observation;
+pub mod task_observation;
 pub use task_observation::{ObservedTaskOutcome, observed_terminal_task_outcomes_from_payload};
 pub mod post_turn;
 
@@ -420,8 +420,8 @@ pub struct ReviewRequiredTaskObservation {
     pub diagnostics: Vec<String>,
     pub child_thread_id: Option<String>,
     pub child_turn_id: Option<String>,
-    pub max_revision_rounds: u32,
-    pub remaining_revision_rounds: u32,
+    pub max_revision_rounds: Option<u32>,
+    pub remaining_revision_rounds: Option<u32>,
     pub allowed_actions: Vec<String>,
     pub revision_blocked_reason: Option<String>,
 }

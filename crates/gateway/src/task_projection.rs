@@ -53,6 +53,7 @@ pub(crate) fn project_task_get_with_configuration(
                     })
                     .max_by_key(|candidate| (candidate.round, candidate.created_at))?;
                 let item = TaskWaitItem {
+                    auto_accepted_candidate_id: None,
                     task: response.task.clone(),
                     run: Some(run.clone()),
                     child_thread_id: None,
@@ -104,7 +105,15 @@ pub(crate) fn project_task_get_with_configuration(
         runs: response
             .runs
             .iter()
-            .map(|run| project_run(&response.task, run))
+            .map(|run| {
+                let mut projected = project_run(&response.task, run);
+                projected.review_budget = response.review_policy_for_run(&run.id).map(|policy| {
+                    pioneer_protocol::TaskRevisionBudget {
+                        max_revision_rounds: policy.effective_max_revision_rounds(),
+                    }
+                });
+                projected
+            })
             .collect(),
         dependencies: response
             .dependencies
@@ -240,7 +249,12 @@ fn project_task_configuration(response: &TaskGetResponse) -> PublicTaskConfigura
                     schema_configured: contract.schema.is_some(),
                 }
             }),
-            review_policy: spec.review_policy.clone(),
+            review_policy: spec.review_policy.clone().map(|mut policy| {
+                // A legacy recurring task can use the latest run spec as its
+                // default. Only the configured cap applies to future runs.
+                policy.run_revision_budget = None;
+                policy
+            }),
             depth: spec.depth,
             max_depth: spec.max_depth,
         }),
@@ -338,6 +352,20 @@ pub(crate) fn project_task_events(
     response: &TaskEventsResponse,
     operator_allowed: bool,
 ) -> PublicTaskEventsResponse {
+    // Older operator clients use a closed payload enum for operatorEvents.
+    // Keep the full new payload behind the same permission in an additive field.
+    let (operator_events, operator_revision_budget_events) = if operator_allowed {
+        let (budget, other): (Vec<_>, Vec<_>) =
+            response.events.iter().cloned().partition(|event| {
+                matches!(
+                    &event.payload,
+                    pioneer_protocol::TaskEventPayload::TaskRunRevisionBudgetUpdated { .. }
+                )
+            });
+        (Some(other), (!budget.is_empty()).then_some(budget))
+    } else {
+        (None, None)
+    };
     PublicTaskEventsResponse {
         task_id: response.task_id.clone(),
         events: response
@@ -354,7 +382,8 @@ pub(crate) fn project_task_events(
             .collect(),
         last_sequence: response.last_sequence,
         has_more: response.has_more,
-        operator_events: operator_allowed.then(|| response.events.clone()),
+        operator_events,
+        operator_revision_budget_events,
     }
 }
 
@@ -384,7 +413,9 @@ fn project_review_item(
         item: project_wait_item(&review.item),
         candidate: project_candidate(&review.candidate),
         review_content: content,
+        max_revision_rounds: review.max_revision_rounds,
         remaining_revision_rounds: review.remaining_revision_rounds,
+        unlimited_revision_rounds: review.unlimited_revision_rounds,
         allowed_actions: review.allowed_actions.clone(),
         revision_blocked_reason: review.revision_blocked_reason,
     }
@@ -661,6 +692,7 @@ fn task_public_error_code(class: TaskErrorClass) -> pioneer_protocol::PublicErro
 pub(crate) fn project_run(task: &Task, run: &TaskRun) -> PublicTaskRun {
     let status = run.effective_status(task);
     PublicTaskRun {
+        review_budget: None,
         id: run.id.clone(),
         task_id: run.task_id.clone(),
         attempt_number: run.attempt_number,
@@ -1065,6 +1097,183 @@ mod tests {
     }
 
     #[test]
+    fn public_review_budget_projections_are_readable_by_legacy_clients() {
+        use pioneer_protocol::{
+            PublicTaskGetResponse, PublicTaskWaitResponse, TaskAgentReviewPolicy,
+            TaskRevisionBudget, TaskRun, TaskRunStatus, TaskWaitItem, TaskWaitMode,
+            TaskWaitResponse,
+        };
+
+        // These fields retain the types and default rules of the base protocol.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyReviewItem {
+            #[serde(default)]
+            remaining_revision_rounds: u32,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyReviewPolicy {
+            max_revision_rounds: u32,
+            require_explicit_acceptance: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyReviewResponse {
+            review_required: Vec<LegacyReviewItem>,
+        }
+
+        let mut response = collaborator_fixture("path", "webhook", "error", "input", "filter");
+        response.task.status = TaskStatus::WaitingReview;
+        response.task.completed_at = None;
+        response.task.result = None;
+        response.task.error = None;
+        let mut candidate = review_candidate(TaskValue::String("result".to_owned()));
+        candidate.task_id = response.task.id.clone();
+        let run = TaskRun {
+            id: candidate.run_id.clone(),
+            task_id: response.task.id.clone(),
+            trigger_id: None,
+            trigger_input: None,
+            parent_run_id: None,
+            run_group_id: candidate.run_id.clone(),
+            attempt_number: 1,
+            retry_of_run_id: None,
+            ready_at: None,
+            run_number: 1,
+            status: TaskRunStatus::WaitingReview,
+            executor_kind: TaskExecutorKind::Agent,
+            started_at: Some(1),
+            completed_at: None,
+            heartbeat_at: None,
+            locked_by: None,
+            lock_expires_at: None,
+            result: None,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        response.runs = vec![run.clone()];
+        response.result_candidates = vec![candidate.clone()];
+
+        for (configured, run_override, effective) in [
+            (None, None, None),
+            (Some(0), None, Some(0)),
+            (Some(5), None, Some(5)),
+            (Some(u32::MAX), None, Some(u32::MAX)),
+            (
+                Some(5),
+                Some(TaskRevisionBudget {
+                    max_revision_rounds: None,
+                }),
+                None,
+            ),
+            (
+                None,
+                Some(TaskRevisionBudget {
+                    max_revision_rounds: Some(0),
+                }),
+                Some(0),
+            ),
+        ] {
+            let policy = TaskAgentReviewPolicy::parent_agent_with_revision_limit(configured);
+            response.agent_specs[0].review_policy = Some(policy.clone());
+            let mut run_spec = response.agent_specs[0].clone();
+            run_spec.id = "exact-run-spec".to_owned();
+            run_spec.run_id = Some(run.id.clone());
+            run_spec.review_policy.as_mut().unwrap().run_revision_budget = run_override.clone();
+            response.agent_specs.truncate(1);
+            response.agent_specs.push(run_spec);
+
+            let get = serde_json::to_value(project_task_get(&response, false)).unwrap();
+            let managed_get =
+                serde_json::to_value(project_task_get_with_configuration(&response, true, true))
+                    .unwrap();
+            let review = pioneer_tasks::task_review_wait_item(
+                &response,
+                TaskWaitItem {
+                    auto_accepted_candidate_id: None,
+                    task: response.task.clone(),
+                    run: Some(run.clone()),
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    permission_profile: None,
+                },
+                candidate.clone(),
+            );
+            let wait = serde_json::to_value(super::project_task_wait(&TaskWaitResponse {
+                completed: vec![],
+                failed: vec![],
+                blocked: vec![],
+                cancelled: vec![],
+                review_required: vec![review],
+                pending: vec![],
+                non_waitable: vec![],
+                timed_out: false,
+                total_count: 1,
+                terminal_count: 0,
+                pending_count: 0,
+                review_required_count: 1,
+                blocked_count: 0,
+                non_waitable_count: 0,
+                mode: TaskWaitMode::AllTerminalOrReviewRequired,
+            }))
+            .unwrap();
+
+            let legacy_remaining = effective
+                .unwrap_or(u32::MAX)
+                .saturating_sub(candidate.round);
+            for projection in [&get, &managed_get, &wait] {
+                let legacy: LegacyReviewResponse =
+                    serde_json::from_value(projection.clone()).unwrap();
+                assert_eq!(
+                    legacy.review_required[0].remaining_revision_rounds,
+                    legacy_remaining
+                );
+            }
+            let new_get: PublicTaskGetResponse = serde_json::from_value(get).unwrap();
+            let new_wait: PublicTaskWaitResponse = serde_json::from_value(wait).unwrap();
+            assert_eq!(
+                new_get.runs[0]
+                    .review_budget
+                    .as_ref()
+                    .unwrap()
+                    .max_revision_rounds,
+                effective
+            );
+            for review in [&new_get.review_required[0], &new_wait.review_required[0]] {
+                assert_eq!(review.unlimited_revision_rounds, effective.is_none());
+                assert_eq!(review.remaining_revision_rounds, legacy_remaining);
+                assert_eq!(
+                    review
+                        .allowed_actions
+                        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise),
+                    effective.is_none_or(|cap| cap > candidate.round),
+                );
+            }
+            for (projected_policy, expected_effective) in [
+                (
+                    &managed_get["configuration"]["agent"]["reviewPolicy"],
+                    configured,
+                ),
+                (
+                    &managed_get["operator"]["agentSpecs"][1]["reviewPolicy"],
+                    effective,
+                ),
+            ] {
+                let legacy: LegacyReviewPolicy =
+                    serde_json::from_value(projected_policy.clone()).unwrap();
+                assert_eq!(legacy.max_revision_rounds, configured.unwrap_or(u32::MAX));
+                assert!(legacy.require_explicit_acceptance);
+                let decoded: TaskAgentReviewPolicy =
+                    serde_json::from_value(projected_policy.clone()).unwrap();
+                assert_eq!(decoded.configured_max_revision_rounds(), configured);
+                assert_eq!(decoded.effective_max_revision_rounds(), expected_effective);
+            }
+        }
+    }
+
+    #[test]
     fn repeated_saved_error_projections_are_silent_for_every_failure_class() {
         use super::*;
         use crate::public_error::test_support::capture_events;
@@ -1180,6 +1389,7 @@ mod tests {
                         project_task_tree(&TaskTreeResponse { tree: tree.clone() }, true);
                     assert_eq!(tree_response.operator.unwrap(), tree);
                     let item = TaskWaitItem {
+                        auto_accepted_candidate_id: None,
                         task: response.task.clone(),
                         run: Some(run.clone()),
                         child_thread_id: None,
@@ -1308,7 +1518,12 @@ mod tests {
         assert!(!notification_run.contains("triggerInput"));
         let mut run_spec = response.agent_specs[0].clone();
         run_spec.id = "agent-spec-run-1".to_owned();
-        run_spec.run_id = Some("run-1".to_owned());
+        run_spec.run_id = Some(response.runs[0].id.clone());
+        let mut policy = pioneer_protocol::TaskAgentReviewPolicy::parent_agent_default(5);
+        policy.run_revision_budget = Some(pioneer_protocol::TaskRevisionBudget {
+            max_revision_rounds: None,
+        });
+        run_spec.review_policy = Some(policy);
         run_spec.prompt.instructions = vec![latest_projected_instruction.to_owned()];
         response.agent_specs.push(run_spec);
 
@@ -1351,9 +1566,41 @@ mod tests {
         // still expose that effective configuration when no separate base row
         // remains, while continuing to redact the input and security details.
         response.agent_specs.remove(0);
+        let projected = project_task_get_with_configuration(&response, false, true);
+        let future_policy = projected
+            .configuration
+            .as_ref()
+            .unwrap()
+            .agent
+            .as_ref()
+            .unwrap()
+            .review_policy
+            .as_ref()
+            .unwrap();
+        assert_eq!(future_policy.effective_max_revision_rounds(), Some(5));
+        assert!(future_policy.run_revision_budget.is_none());
+        assert_eq!(
+            projected.runs[0]
+                .review_budget
+                .as_ref()
+                .unwrap()
+                .max_revision_rounds,
+            None
+        );
+        let operator = project_task_get_with_configuration(&response, true, true);
+        assert_eq!(
+            operator.operator.unwrap().agent_specs[0]
+                .review_policy
+                .as_ref()
+                .unwrap()
+                .run_revision_budget
+                .as_ref()
+                .unwrap()
+                .max_revision_rounds,
+            None
+        );
         let post_run =
-            serde_json::to_string(&project_task_get_with_configuration(&response, false, true))
-                .expect("post-run managed Task projection serializes");
+            serde_json::to_string(&projected).expect("post-run managed Task projection serializes");
         assert!(post_run.contains(latest_projected_instruction));
         assert!(!post_run.contains(canary_input));
         assert!(!post_run.contains("\"operator\":"));

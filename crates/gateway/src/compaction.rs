@@ -19,9 +19,11 @@ pub(crate) use history::load_exact_line_history;
 #[cfg(test)]
 pub(crate) use history::pause_selected_turn_load;
 pub(crate) use history::provider_round_aliases;
+pub(crate) mod legacy_task_notices;
 mod native;
 pub(crate) mod native_budget;
 mod origins;
+pub(crate) mod thread_pages;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;
 mod service;

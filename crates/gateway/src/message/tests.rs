@@ -10122,7 +10122,7 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
         review: pioneer_tasks::TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_max_revision_rounds: 2,
+            default_max_revision_rounds: Some(2),
             auto_accept_after_seconds: 300,
         },
     }
@@ -25417,6 +25417,17 @@ fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_return
 
 async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result_impl()
  {
+    use pioneer_agent::TaskToolProvider;
+
+    let result_text = "€ result details\n".repeat(4_000);
+    let child_output = format!(
+        "<task_result>{}</task_result>",
+        json!({"summary": "Child result preview", "data": result_text}),
+    );
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(CountingDelayedProvider::new(Duration::ZERO, child_output)),
+    ));
     let session_manager = Arc::new(SessionManager::new());
     let (tx, _rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -25424,7 +25435,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
-        test_provider(),
+        provider,
         session_manager,
         workspace_manager,
         crud_store.clone(),
@@ -25546,7 +25557,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     .expect("task_wait should succeed");
     assert!(
         !wait_response.completed.is_empty(),
-        "child echo turn should complete the task"
+        "child turn should complete the task"
     );
     assert_admitted_turn_owner(&processor, &lineage.child_thread_id, &lineage.child_turn_id).await;
     let completed = &wait_response.completed[0];
@@ -25728,6 +25739,146 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     assert_eq!(stored_task.result_candidates[0], accepted_candidate);
     assert_eq!(stored_task.result_review_events.len(), 1);
     assert_eq!(stored_task.result_review_events[0], review_events[0]);
+
+    let parent_context = pioneer_agent::TaskTurnContext {
+        workspace_id: workspace_id.clone(),
+        thread_id: "thr_parent_task_test".to_owned(),
+        turn_id: "turn_parent_task_test".to_owned(),
+    };
+    processor
+        .materialize_agent_action_tools(pioneer_agent::TurnToolContext {
+            workspace_id: parent_context.workspace_id.clone(),
+            thread_id: parent_context.thread_id.clone(),
+            turn_id: parent_context.turn_id.clone(),
+        })
+        .await
+        .expect("bind the parent to its durable Agent execution");
+    let tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .materialize_task_tools(parent_context.clone())
+        .await
+        .expect("materialize the parent's Task tools");
+    let handlers = tools
+        .bundles
+        .into_iter()
+        .flat_map(|bundle| bundle.handlers)
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let call = |name: &'static str, arguments| {
+        let handler = handlers[name].clone();
+        let trace = pioneer_tools::ToolEventBus::new(16).start_trace(
+            parent_context.turn_id.clone(),
+            name,
+            name,
+        );
+        async move {
+            handler
+                .handle(
+                    pioneer_tools::ToolInvocation {
+                        call_id: name.into(),
+                        tool_name: name.into(),
+                        source: pioneer_tools::ToolCallSource::Model,
+                        payload: pioneer_tools::ToolPayload::Function { arguments },
+                        workdir: Default::default(),
+                        environment: Default::default(),
+                        attempt_id: 0,
+                        idempotency_key: None,
+                        recovery: Default::default(),
+                        permission_metadata: Default::default(),
+                        execution_security_snapshot: None,
+                        apply_patch_preflight: None,
+                        cancellation: tokio_util::sync::CancellationToken::new(),
+                    },
+                    trace,
+                )
+                .await
+        }
+    };
+
+    let get_arguments = json!({"taskId": response.task.id});
+    let get = call("task_get", get_arguments.clone())
+        .await
+        .unwrap()
+        .raw_json();
+    assert!(get.get("reviewRequired").is_none());
+    assert_eq!(get["runs"][0]["id"], run.id);
+    assert_eq!(get["runs"][0]["candidateId"], accepted_candidate.id);
+    assert_eq!(get["runs"][0]["result"]["summary"], "Child result preview");
+    assert!(get["runs"][0]["result"].get("data").is_none());
+    assert!(!get.to_string().contains("result details"));
+
+    let wait_arguments = json!({"runIds": [run.id]});
+    let wait = call("task_wait", wait_arguments.clone())
+        .await
+        .unwrap()
+        .raw_json();
+    assert_eq!(wait["reviewRequired"], json!([]));
+    let completed = &wait["completed"][0];
+    assert_eq!(completed["task"]["status"], "completed");
+    assert_eq!(completed["run"]["id"], run.id);
+    assert_eq!(
+        completed["run"]["candidateId"],
+        get["runs"][0]["candidateId"]
+    );
+    assert!(completed.get("allowedActions").is_none());
+    let first_page = &completed["reviewContent"];
+    assert_eq!(first_page["format"], "text");
+    assert_eq!(first_page["truncated"], true);
+    assert_eq!(first_page["totalBytes"], result_text.len());
+    let candidate_id = &get["runs"][0]["candidateId"];
+    let reread = call("task_result", json!({"candidateId": candidate_id}))
+        .await
+        .unwrap()
+        .raw_json();
+    assert_eq!(&reread["reviewContent"], first_page);
+
+    let mut content = first_page["content"].as_str().unwrap().to_owned();
+    let mut cursor = first_page["nextCursor"].clone();
+    for max_bytes in [11, 64 * 1024] {
+        let result = call(
+            "task_result",
+            json!({"candidateId": candidate_id, "cursor": cursor, "maxBytes": max_bytes}),
+        )
+        .await
+        .unwrap()
+        .raw_json();
+        assert_eq!(&result["candidate"]["id"], candidate_id);
+        assert_eq!(result["candidate"]["runId"], run.id);
+        let page = &result["reviewContent"];
+        assert_eq!(page["contentSha256"], first_page["contentSha256"]);
+        content.push_str(page["content"].as_str().unwrap());
+        cursor = page["nextCursor"].clone();
+    }
+    assert!(JsonValue::is_null(&cursor));
+    assert_eq!(content, result_text);
+
+    let mut binding = processor
+        .agent_action_binding(&parent_context.turn_id)
+        .await
+        .expect("parent has an execution binding");
+    assert!(
+        binding
+            .capabilities
+            .remove(&pioneer_protocol::AgentToolCapability::ResultRead),
+        "the authorized case must have an actual result-reading grant",
+    );
+    assert!(
+        binding
+            .capabilities
+            .contains(&pioneer_protocol::AgentToolCapability::TaskObserve)
+    );
+    processor
+        .register_agent_action_binding(parent_context.turn_id.clone(), binding)
+        .await;
+    let observed = call("task_wait", wait_arguments).await.unwrap().raw_json();
+    assert_eq!(observed["completed"][0]["run"], completed["run"]);
+    assert!(observed["completed"][0].get("reviewContent").is_none());
+    let observed = call("task_get", get_arguments).await.unwrap().raw_json();
+    assert_eq!(observed["runs"][0]["result"], get["runs"][0]["result"]);
+    assert!(!observed.to_string().contains("result details"));
+    assert!(
+        call("task_result", json!({"candidateId": candidate_id}))
+            .await
+            .is_err()
+    );
 
     let task_events = crud_store
         .get_task_events(response.task.id.as_str(), None)
@@ -26289,6 +26440,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26565,6 +26718,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26598,6 +26753,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26646,8 +26803,8 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         observation_a.child_turn_id.as_deref(),
         Some(candidate_a.turn_id.as_str())
     );
-    assert_eq!(observation_a.max_revision_rounds, 2);
-    assert_eq!(observation_a.remaining_revision_rounds, 2);
+    assert_eq!(observation_a.max_revision_rounds, Some(2));
+    assert_eq!(observation_a.remaining_revision_rounds, Some(2));
     assert!(
         observation_a
             .allowed_actions
@@ -26739,6 +26896,8 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 3,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26963,6 +27122,8 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -27118,6 +27279,8 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
+        unlimited_revision_rounds: false,
+        run_revision_budget: None,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),

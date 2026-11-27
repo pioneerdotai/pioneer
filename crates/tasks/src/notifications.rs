@@ -60,6 +60,9 @@ impl TaskNotificationMapper {
                 events::TASK_RESULT_CANDIDATE_CANCELLED
             }
             TaskEventPayload::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
+            TaskEventPayload::TaskRunRevisionBudgetUpdated { .. } => {
+                events::TASK_RUN_REVISION_BUDGET_UPDATED
+            }
             TaskEventPayload::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             TaskEventPayload::DeliveryQueued { .. } => events::TASK_DELIVERY_QUEUED,
             TaskEventPayload::DeliveryStarted { .. } => events::TASK_DELIVERY_STARTED,

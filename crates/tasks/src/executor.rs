@@ -393,6 +393,27 @@ impl TaskExecutionHandle {
         .await
     }
 
+    /// Commit failure and the completed source turn together after verifying
+    /// that the reviewed run still has no available revision.
+    pub async fn fail_reviewed_extraction(
+        &self,
+        turn: TaskRunTurn,
+        error: TaskError,
+        completed_at: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.commit_terminal_run_with_turn(
+            TaskEventPayload::RunFailed {
+                task_id: self.task_id.clone(),
+                run_id: self.run_id.clone(),
+                error: Some(error),
+                completed_at,
+            },
+            Some(turn),
+            true,
+        )
+        .await
+    }
+
     pub async fn cancel_run(
         &self,
         reason: Option<String>,
@@ -416,6 +437,16 @@ impl TaskExecutionHandle {
         terminal: TaskEventPayload,
         revision: Option<TaskRunTurn>,
     ) -> TaskRuntimeResult<()> {
+        self.commit_terminal_run_with_turn(terminal, revision, false)
+            .await
+    }
+
+    async fn commit_terminal_run_with_turn(
+        &self,
+        terminal: TaskEventPayload,
+        turn: Option<TaskRunTurn>,
+        reviewed_extraction_failure: bool,
+    ) -> TaskRuntimeResult<()> {
         let (links, link_count) = self.event_bus.closing_run_links(&self.run_id);
         let mut closing = Closing::start_linked(
             Phase::RunCommit,
@@ -431,13 +462,20 @@ impl TaskExecutionHandle {
             .context(TerminalCommitPhase::Preparation)?
             .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())
             .context(TerminalCommitPhase::AttemptFence)?;
-        if let Some(revision) = revision {
+        if let Some(turn) = turn {
             prepared = preparation
                 .correlation()
-                .scope(
-                    self.store
-                        .prepare_task_terminal_with_revision(prepared, revision),
-                )
+                .scope(async {
+                    if reviewed_extraction_failure {
+                        self.store
+                            .prepare_task_terminal_with_extraction_failure(prepared, turn)
+                            .await
+                    } else {
+                        self.store
+                            .prepare_task_terminal_with_revision(prepared, turn)
+                            .await
+                    }
+                })
                 .await
                 .context(TerminalCommitPhase::Preparation)?;
         }

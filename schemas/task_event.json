@@ -1225,6 +1225,7 @@
           "default": false
         },
         "maxRevisionRounds": {
+          "description": "Configured cap for new occurrences. Unlimited uses u32::MAX for older clients.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -1244,6 +1245,21 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "runRevisionBudget": {
+          "description": "Server-owned override for this occurrence only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRevisionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unlimitedRevisionRounds": {
+          "description": "True when the configured cap is unlimited. A run override takes precedence.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -3372,6 +3388,53 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_run_revision_budget_updated"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "agent_spec": {
+                  "$ref": "#/$defs/TaskAgentSpec"
+                },
+                "expected_agent_spec_id": {
+                  "type": "string"
+                },
+                "expected_task_revision": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "mutation_id": {
+                  "type": "string"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "expected_agent_spec_id",
+                "agent_spec",
+                "mutation_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_run_entered_review"
             },
             "payload": {
@@ -4345,6 +4408,24 @@
       "required": [
         "maxAttempts",
         "backoff"
+      ]
+    },
+    "TaskRevisionBudget": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "description": "Required. A non-negative integer sets the cap. Null removes the cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "maxRevisionRounds"
       ]
     },
     "TaskRun": {
