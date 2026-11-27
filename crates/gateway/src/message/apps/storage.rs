@@ -475,7 +475,7 @@ impl Drop for DiskReservation {
     }
 }
 
-pub(in crate::message) struct AppInstallAdmission {
+pub(crate) struct AppInstallAdmission {
     _install: OwnedMutexGuard<()>,
 }
 
