@@ -312,6 +312,7 @@ async fn operation(
         previous_checkpoint: None,
         phase,
         resume_phase: None,
+        retry_feedback: None,
         observation: None,
         diagnostic: None,
     };

@@ -2162,6 +2162,7 @@ mod tests {
                 }
             },
             resume_phase: None,
+            retry_feedback: None,
             observation: None,
             diagnostic: None,
         };

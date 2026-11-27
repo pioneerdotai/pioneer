@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_compaction::summary::INSTRUCTIONS;
 
 async fn saved(f: &Fixture) -> RunnerState {
     f.store
@@ -33,29 +34,68 @@ async fn finish(task: tokio::task::JoinHandle<Result<CompactionExit>>) -> Compac
         .unwrap()
 }
 
-fn assert_same_request(f: &Fixture, start: usize, end: usize) {
+fn assert_retry_requests(f: &Fixture, start: usize, feedback: &[Option<&str>]) {
     let calls = f.provider.calls.lock().unwrap();
     let expected = &calls[start];
-    for call in &calls[start + 1..end] {
-        assert_eq!(call.messages, expected.messages);
-        assert_eq!(call.model, expected.model);
-        assert_eq!(call.max_tokens, expected.max_tokens);
-        assert_eq!(call.reasoning, expected.reasoning);
-        assert_eq!(call.temperature, expected.temperature);
-        assert_eq!(call.compiled_prompt, expected.compiled_prompt);
-        assert_eq!(call.parallel_tool_calls, expected.parallel_tool_calls);
-        assert!(call.tools.is_none());
-        assert!(call.tool_choice.is_none());
+    assert_eq!(expected.messages[0].content, INSTRUCTIONS);
+    for (call, feedback) in calls[start..start + feedback.len()].iter().zip(feedback) {
+        if let Some(detail) = feedback {
+            let instructions = &call.messages[0].content;
+            assert!(
+                instructions
+                    .lines()
+                    .any(|line| line.strip_prefix("Retry: ") == Some(*detail))
+            );
+            assert_eq!(instructions.matches("Retry: ").count(), 1);
+            let headings: Vec<_> = instructions
+                .lines()
+                .filter(|line| line.starts_with("## "))
+                .collect();
+            assert_eq!(headings, HEADINGS);
+            let mut system = call.messages[0].clone();
+            system.content.clone_from(&expected.messages[0].content);
+            assert_eq!(system, expected.messages[0]);
+            assert_eq!(call.messages[1..], expected.messages[1..]);
+        } else {
+            assert_eq!(call.messages, expected.messages);
+        }
+        assert!(
+            !serde_json::to_string(&call.messages)
+                .unwrap()
+                .contains("private invalid model response")
+        );
+        assert_request_options(call, expected);
     }
 }
+
+pub(super) fn assert_same_request(actual: &ChatRequest, expected: &ChatRequest) {
+    assert_eq!(actual.messages, expected.messages);
+    assert_request_options(actual, expected);
+}
+
+fn assert_request_options(call: &ChatRequest, expected: &ChatRequest) {
+    assert_eq!(call.model, expected.model);
+    assert_eq!(call.max_tokens, expected.max_tokens);
+    assert_eq!(call.reasoning, expected.reasoning);
+    assert_eq!(call.temperature, expected.temperature);
+    assert_eq!(call.compiled_prompt, expected.compiled_prompt);
+    assert_eq!(call.parallel_tool_calls, expected.parallel_tool_calls);
+    assert!(call.tools.is_none());
+    assert!(call.tool_choice.is_none());
+    assert!(call.tool_declarations.is_none());
+    assert_eq!(call.service_mode, expected.service_mode);
+}
+
+const START_WITH_FIRST: &str = "Start with ## Goal and constraints.";
+const MISSING_SECOND: &str = "Recognized 1/6; next: ## Decisions and rationale.";
 
 #[pioneer_postgres_test::postgres_test]
 async fn two_invalid_completions_then_success_survive_runner_restart() {
     let f = fixture(
         "small",
         vec![
-            Reply::Invalid,
             Reply::MissingSummarySections,
+            Reply::Invalid,
             Reply::Success,
         ],
         true,
@@ -64,14 +104,19 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
     .await;
     let mut task = start(&f);
     let expected_explanations = [
-        "Nonempty content appeared before the first recognized summary heading",
         "Summary ended before required section 2 was recognized",
+        "Nonempty content appeared before the first recognized summary heading",
     ];
     for (index, explanation) in expected_explanations.iter().enumerate() {
         let calls = index + 1;
         let retry_at = retry_time(&f, calls).await;
         let before = saved(&f).await;
         assert_eq!(before.portion_attempts as usize, calls);
+        assert!(
+            !serde_json::to_string(&before)
+                .unwrap()
+                .contains("private invalid model response")
+        );
         assert_eq!(before.cursor, SourceCursor::default());
         assert_eq!(before.previous_checkpoint, None);
         assert!(f.store.compaction_head("owner").await.unwrap().is_none());
@@ -98,7 +143,7 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
     }
     assert!(matches!(finish(task).await, CompactionExit::Applied(_)));
     assert_eq!(f.provider.calls.lock().unwrap().len(), 3);
-    assert_same_request(&f, 0, 3);
+    assert_retry_requests(&f, 0, &[None, Some(MISSING_SECOND), Some(START_WITH_FIRST)]);
     let state = saved(&f).await;
     assert_eq!(state.retries, 0);
     assert_eq!(state.attempts, 3);
@@ -149,6 +194,11 @@ async fn third_invalid_completion_stops_without_checkpoint_or_fourth_call() {
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), 3);
     let state = saved(&f).await;
+    assert_retry_requests(
+        &f,
+        0,
+        &[None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+    );
     assert_eq!(state.portion_attempts, 3);
     assert_eq!(state.previous_checkpoint, None);
     assert_eq!(state.cursor, SourceCursor::default());
@@ -216,7 +266,11 @@ async fn invalid_portion_exhaustion_preserves_previous_summary_and_cursor() {
     );
     assert!(f.store.compaction_head("owner").await.unwrap().is_none());
     assert_eq!(f.provider.calls.lock().unwrap().len(), 4);
-    assert_same_request(&f, 1, 4);
+    assert_retry_requests(
+        &f,
+        1,
+        &[None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+    );
     let calls = f.provider.calls.lock().unwrap();
     let retried: SummaryInput = serde_json::from_str(&calls[1].messages[1].content).unwrap();
     assert_eq!(retried.previous_summary, checkpoint.summary);
@@ -253,34 +307,51 @@ async fn next_portion_has_its_own_attempt_budget_after_third_call_succeeds() {
         f.clock.advance(retry_at);
     }
     assert!(matches!(finish(task).await, CompactionExit::Applied(_)));
-    assert_same_request(&f, 0, 3);
-    assert_same_request(&f, 3, 6);
+    for start in [0, 3] {
+        assert_retry_requests(
+            &f,
+            start,
+            &[None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+        );
+    }
     assert_eq!(saved(&f).await.retries, 0);
     assert_eq!(saved(&f).await.corrections, 0);
 }
 
 #[pioneer_postgres_test::postgres_test]
 async fn mixed_failures_cannot_make_a_fourth_call_for_the_same_portion() {
-    for replies in [
-        vec![
-            Reply::Transient,
-            Reply::Invalid,
-            Reply::Invalid,
-            Reply::Success,
-        ],
-        vec![
-            Reply::Invalid,
-            Reply::Transient,
-            Reply::Invalid,
-            Reply::Success,
-        ],
-        vec![
-            Reply::Invalid,
-            Reply::Invalid,
-            Reply::Transient,
-            Reply::Success,
-        ],
+    for (replies, feedback) in [
+        (
+            vec![
+                Reply::Transient,
+                Reply::Invalid,
+                Reply::Invalid,
+                Reply::Success,
+            ],
+            [None, None, Some(START_WITH_FIRST)],
+        ),
+        (
+            vec![
+                Reply::Invalid,
+                Reply::Transient,
+                Reply::Invalid,
+                Reply::Success,
+            ],
+            [None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+        ),
+        (
+            vec![
+                Reply::Invalid,
+                Reply::Invalid,
+                Reply::Transient,
+                Reply::Success,
+            ],
+            [None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+        ),
     ] {
+        let transport_retry = replies[..2]
+            .iter()
+            .position(|reply| matches!(reply, Reply::Transient));
         let f = fixture("small", replies, true, false).await;
         let task = start(&f);
         for calls in 1..=2 {
@@ -293,7 +364,11 @@ async fn mixed_failures_cannot_make_a_fourth_call_for_the_same_portion() {
         ));
         assert_eq!(f.provider.calls.lock().unwrap().len(), 3);
         assert_eq!(saved(&f).await.portion_attempts, 3);
-        assert_same_request(&f, 0, 3);
+        assert_retry_requests(&f, 0, &feedback);
+        if let Some(failed) = transport_retry {
+            let calls = f.provider.calls.lock().unwrap();
+            assert_same_request(&calls[failed + 1], &calls[failed]);
+        }
     }
 }
 
@@ -496,9 +571,14 @@ async fn deadline_resume_executes_after_third_portion_or_correction_call_was_int
         assert!(
             matches!(claimed.phase, RunnerPhase::Attempt { purpose: actual, .. } if actual == purpose)
         );
-        assert_same_request(&f, 1, 5);
+        assert_retry_requests(
+            &f,
+            1,
+            &[None, None, Some(START_WITH_FIRST), Some(START_WITH_FIRST)],
+        );
         let retried: SummaryInput = {
             let calls = f.provider.calls.lock().unwrap();
+            assert_same_request(&calls[4], &calls[3]);
             serde_json::from_str(&calls[4].messages[1].content).unwrap()
         };
         assert_eq!(retried.previous_summary, checkpoint.summary);

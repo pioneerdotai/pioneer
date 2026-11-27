@@ -3480,6 +3480,7 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
                 kind: FailureKind::Deadline,
             },
             resume_phase: Some(phase),
+            retry_feedback: None,
             observation: None,
             diagnostic: None,
         };

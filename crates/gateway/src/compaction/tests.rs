@@ -6392,7 +6392,7 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
             canonical_agent_message_event_payload("middle", "interleaved input"),
             canonical_agent_message_event_payload("result", "terminal result"),
         ],
-        vec![Reply::Success, Reply::Hang],
+        vec![Reply::Success, Reply::MissingSummarySections, Reply::Hang],
         true,
         false,
     )
@@ -6430,6 +6430,18 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
         async move { runner.run(CancellationToken::new()).await }
     });
     f.provider.wait_calls(2).await;
+    wait_backoff(&f.store).await;
+    let backoff = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerPhase::Backoff { not_before_ms, .. } = backoff.phase else {
+        panic!("expected validation backoff");
+    };
+    f.clock.advance(not_before_ms);
+    f.provider.wait_calls(3).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(f.provider.active.load(Ordering::SeqCst), 0);
@@ -6440,29 +6452,44 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
         .unwrap()
         .unwrap();
     assert!(before.previous_checkpoint.is_some());
-    assert_eq!(before.attempts, 2);
+    assert!(matches!(before.phase, RunnerPhase::Attempt { .. }));
+    assert_eq!(before.attempts, 3);
+    assert_eq!(before.portion_attempts, 2);
+    assert!(before.retry_feedback.is_some());
     let task = tokio::spawn({
         let runner = f.runner.clone();
         async move { runner.run(CancellationToken::new()).await }
     });
     wait_backoff(&f.store).await;
-    f.clock.advance(2250);
+    let recovered = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerPhase::Backoff { not_before_ms, .. } = recovered.phase else {
+        panic!("expected interrupted-attempt backoff");
+    };
+    assert_eq!(recovered.retry_feedback, before.retry_feedback);
+    assert_eq!(recovered.portion_attempts, before.portion_attempts);
+    f.clock.advance(not_before_ms);
     assert!(matches!(
         task.await.unwrap().unwrap(),
         CompactionExit::Applied(_)
     ));
     let calls = f.provider.calls.lock().unwrap();
-    let interrupted: SummaryInput = serde_json::from_str(&calls[1].messages[1].content).unwrap();
-    let resumed: SummaryInput = serde_json::from_str(&calls[2].messages[1].content).unwrap();
-    assert!(!resumed.previous_summary.is_empty());
-    assert_eq!(
-        serde_json::to_value(interrupted).unwrap(),
-        serde_json::to_value(resumed).unwrap()
+    assert!(
+        calls[2].messages[0]
+            .content
+            .contains("Recognized 1/6; next: ## Decisions and rationale.")
     );
+    invalid_completion_tests::assert_same_request(&calls[3], &calls[2]);
+    let resumed: SummaryInput = serde_json::from_str(&calls[3].messages[1].content).unwrap();
+    assert!(!resumed.previous_summary.is_empty());
     let inputs = calls
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != 1) // The interrupted request is retried verbatim.
+        .filter(|(index, _)| !matches!(*index, 1 | 2)) // Neither failed call advances coverage.
         .map(|(_, call)| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
         .collect::<Vec<_>>();
     let parts = inputs
@@ -6493,7 +6520,7 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
         "SELECT observation::text AS observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt")).await.unwrap();
     assert_eq!(observations.len() as u64, state.attempts);
     let failed: pioneer_compaction::runner::AttemptObservation = serde_json::from_str(
-        &observations[1]
+        &observations[2]
             .try_get::<String>("", "observation")
             .unwrap(),
     )

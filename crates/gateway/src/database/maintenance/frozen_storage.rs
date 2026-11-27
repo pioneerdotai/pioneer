@@ -1196,6 +1196,7 @@ mod tests {
                 kind: FailureKind::Deadline,
             },
             resume_phase: None,
+            retry_feedback: None,
             observation: None,
             diagnostic: None,
         };

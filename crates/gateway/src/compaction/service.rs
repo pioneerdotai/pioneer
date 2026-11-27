@@ -10,9 +10,7 @@ use pioneer_cli_agent_runtime::{
 use pioneer_compaction::{
     ModelBudget, ModelSelection, Transport,
     runner::FailureKind,
-    summary::{
-        CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
-    },
+    summary::{CompletionKind, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest},
 };
 use pioneer_config::GatewayCliAgentRuntimeKindConfig;
 use pioneer_protocol::ProviderFailureClass;
@@ -206,7 +204,12 @@ impl CliSummarizer {
         );
         request.data_json()
     }
-    fn framed_tokens(&self, request: &SummaryRequest, input: &str) -> Result<u64> {
+    fn framed_tokens(
+        &self,
+        request: &SummaryRequest,
+        instructions: &str,
+        input: &str,
+    ) -> Result<u64> {
         #[derive(serde::Serialize)]
         struct Frame<'a> {
             model: &'a str,
@@ -218,7 +221,7 @@ impl CliSummarizer {
         Ok(pioneer_compaction::estimator::json_size(&Frame {
             model: &request.selection.model,
             effort: &request.selection.effort,
-            instructions: INSTRUCTIONS,
+            instructions,
             input,
             output_cap: request.output_cap,
         })?
@@ -388,14 +391,17 @@ impl Summarizer for CliSummarizer {
     }
     fn input_tokens(&self, request: &SummaryRequest) -> Result<u64> {
         let input = self.input(request)?;
-        self.framed_tokens(request, &input)
+        self.framed_tokens(request, &request.instructions(), &input)
     }
     async fn summarize(
         &self,
         request: SummaryRequest,
     ) -> Result<SummaryCompletion, SummaryFailure> {
         let input = self.input(&request).map_err(failure)?;
-        let input_tokens = self.framed_tokens(&request, &input).map_err(failure)?;
+        let instructions = request.instructions();
+        let input_tokens = self
+            .framed_tokens(&request, &instructions, &input)
+            .map_err(failure)?;
         if !self.budget.fits(input_tokens, request.output_cap, false) {
             return Err(SummaryFailure {
                 diagnostic: None,
@@ -438,7 +444,7 @@ impl Summarizer for CliSummarizer {
         };
         let completion = async {
         let (text, input_tokens, output_tokens, raw) = match &self.service {
-            CliService::OpenCode(service) => service.summarize(request.selection.model, request.selection.effort, INSTRUCTIONS, input, timeout).await.map_err(|error| {
+            CliService::OpenCode(service) => service.summarize(request.selection.model, request.selection.effort, &instructions, input, timeout).await.map_err(|error| {
                 if let Some(usage)=error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>() { apply_cli_usage(&mut observed,&usage.0); }
                 failure(error)
             })?,
@@ -448,7 +454,7 @@ impl Summarizer for CliSummarizer {
                         CodexServiceRequest {
                             model: request.selection.model,
                             effort: request.selection.effort,
-                            instructions: INSTRUCTIONS.into(),
+                            instructions: instructions.into_owned(),
                             input,
                         },
                         timeout,
@@ -466,7 +472,7 @@ impl Summarizer for CliSummarizer {
                         ClaudeServiceRequest {
                             model: request.selection.model,
                             effort: request.selection.effort,
-                            instructions: INSTRUCTIONS.into(),
+                            instructions: instructions.into_owned(),
                             input,
                             output_cap: request.output_cap,
                         },
@@ -967,6 +973,7 @@ mod tests {
         let request = SummaryRequest {
             selection,
             output_cap: 512,
+            retry_feedback: None,
             input: SummaryInput {
                 mode: CompactionMode::Normal,
                 coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
@@ -1065,6 +1072,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
         let request = SummaryRequest {
             selection: selection.clone(),
             output_cap: 1024,
+            retry_feedback: None,
             input: SummaryInput {
                 mode: CompactionMode::Normal,
                 coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
