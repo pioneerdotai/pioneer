@@ -17,8 +17,12 @@ if __name__ == "__main__":
     if args.out.exists():
         raise ValueError(f"Build output already exists: {args.out}")
     for package in ("pioneer-desktop", "pioneer-app-updater"):
-        subprocess.run(["cargo", "build", "--timings", "--locked", "--release", "-p", package,
-                        "--target", args.target], check=True)
+        command = ["cargo", "build", "--timings", "--locked", "--release", "-p", package,
+                   "--target", args.target]
+        if package == "pioneer-desktop" and args.target.endswith("windows-msvc"):
+            # Match the static MSVC runtime used by LiveKit's prebuilt WebRTC library.
+            command.extend(["--config", f'target.{args.target}.rustflags=["-Ctarget-feature=+crt-static"]'])
+        subprocess.run(command, check=True)
     suffix = ".exe" if args.target.endswith("windows-msvc") else ""
     binaries = [Path("target") / args.target / "release" / (name + suffix)
                 for name in ("pioneer-app", "pioneer-app-updater")]
