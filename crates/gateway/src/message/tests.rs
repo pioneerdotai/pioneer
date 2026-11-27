@@ -23898,6 +23898,43 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         }
     }
 
+    // The first authorization succeeds. Break the actual resolver only
+    // after serialization, then repeat the same notification after recovery.
+    let method = "test/retryable-thread-notification";
+    let fault = processor
+        .send_retryable_thread_notification(
+            THREAD_ID,
+            method,
+            &NotificationSerializationProbe {
+                serializations: Arc::new(AtomicUsize::new(0)),
+                on_serialize: || {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            crud_store.database_connection().execute_unprepared(
+                                "ALTER TABLE thread RENAME TO thread_unavailable_for_notification_test",
+                            ).await.expect("inject final resolver failure");
+                        });
+                    });
+                },
+            },
+            vec![allowed_connection_id],
+        )
+        .await;
+    crud_store.database_connection().execute_unprepared(
+        "ALTER TABLE thread_unavailable_for_notification_test RENAME TO thread",
+    ).await.expect("restore final resolver storage");
+    assert_eq!(
+        fault.unwrap_err().to_string(),
+        "final thread notification authorization unavailable",
+    );
+    assert!(allowed_rx.try_recv().is_err(), "final authorization failure must fail closed");
+    processor.send_retryable_thread_notification(
+        THREAD_ID, method, &json!({"protected": true}),
+        vec![allowed_connection_id],
+    ).await.expect("retry after resolver recovery");
+    let _ = recv_notification_by_method(&mut allowed_rx, method).await;
+    assert!(denied_rx.try_recv().is_err());
+
     // Re-registering a different principal creates a new connection. An old
     // subscriber snapshot cannot become a candidate for that new session.
     processor

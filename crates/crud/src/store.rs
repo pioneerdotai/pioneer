@@ -2,6 +2,7 @@
 
 pub(super) mod access;
 pub(super) mod artifacts;
+mod calls;
 pub(super) mod compaction;
 pub(super) mod connection;
 pub(super) mod conversations;

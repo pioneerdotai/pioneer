@@ -8,6 +8,7 @@ use crate::events::TurnEventPayload;
 pub use api::*;
 #[cfg(test)]
 use pioneer_crud_access::authorization_scope::principal_current_thread_access_kind;
+pub use pioneer_crud_calls::Scope as ThreadCallScope;
 use pioneer_crud_conversations::events;
 #[cfg(test)]
 use pioneer_crud_conversations::message_commands::message_mutation_actor_current_thread_write_kind;

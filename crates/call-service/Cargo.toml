@@ -1,0 +1,21 @@
+[package]
+name = "pioneer-call-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+pioneer-calls.workspace = true
+pioneer-crud.workspace = true
+pioneer-postgres-pools.workspace = true
+pioneer-protocol.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }

@@ -133,6 +133,8 @@ fn main() {
         print_version_probe(version_probe);
         return;
     }
+    // The client and LiveKit dependency graph enables both rustls providers.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     std::hint::black_box(&PIONEER_BUILD_SECTION);
     let _ = pioneer_observability::identity::configure_build(include_str!(concat!(
         env!("OUT_DIR"),

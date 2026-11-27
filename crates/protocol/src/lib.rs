@@ -26,6 +26,8 @@ mod artifact;
 mod audit;
 mod auth;
 mod authorization;
+mod calls;
+pub use calls::*;
 mod cli_runtime;
 mod client_projection;
 mod gateway_endpoint;

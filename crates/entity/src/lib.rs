@@ -174,6 +174,7 @@ pub mod task_write_lock;
 pub mod thread;
 pub mod thread_agents_doc;
 pub mod thread_agents_doc_revision;
+pub mod thread_call;
 pub mod thread_cli_runtime_binding;
 pub mod thread_episodic_embedding_artifacts;
 pub mod thread_episodic_exclusions;

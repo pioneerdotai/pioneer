@@ -3,6 +3,7 @@ mod rename;
 use super::{HeaderAction, HeaderCommand, ThreadHeader};
 use crate::{
     binding::ThreadBindings,
+    calls::{CallTarget, Calls},
     panel_layout::{ThreadPanelKind, ThreadPanelLayoutStore},
     ports::*,
 };
@@ -12,7 +13,7 @@ use pioneer_client::{
     core::{ClientCore, ClientScope},
     threads::{
         members::{ThreadMemberIntent, ThreadMemberRequestState},
-        scope::{ThreadScopeAction, ThreadScopePendingAction},
+        scope::{ThreadScopeAction, ThreadScopePendingAction, ThreadStatus},
     },
 };
 use pioneer_desktop_foundation::ClientBindingRegistrar;
@@ -30,6 +31,8 @@ pub(crate) struct ThreadHeaderView {
     dialog_open: Rc<Cell<bool>>,
     _binding_task: Task<()>,
     _release: Subscription,
+    _call_updates: Option<Subscription>,
+    call_scope: Option<(u64, String)>,
 }
 impl EventEmitter<HeaderBack> for ThreadHeaderView {}
 impl ThreadHeaderView {
@@ -74,7 +77,13 @@ impl ThreadHeaderView {
                     if input.drain().is_empty() {
                         continue;
                     }
-                    if view.update(cx, |_, cx| cx.notify()).is_err() {
+                    if view
+                        .update(cx, |view, cx| {
+                            view.refresh_calls(cx);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -84,7 +93,12 @@ impl ThreadHeaderView {
                     window.close_dialog(cx);
                 }
             });
+            let call_updates =
+                Calls::get(cx).map(|calls| cx.observe(&calls, |_, _, cx| cx.notify()));
+            cx.defer_in(window, |view, _, cx| view.refresh_calls(cx));
             Self {
+                call_scope: None,
+                _call_updates: call_updates,
                 operation: ThreadPresentationOperation::new(thread_id.clone(), mount, 0),
                 client,
                 thread_id,
@@ -98,6 +112,47 @@ impl ThreadHeaderView {
             }
         })
     }
+    fn refresh_calls(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.client.current_auth_ticket().1 else {
+            self.call_scope = None;
+            return;
+        };
+        let Some(coordinator) = self
+            .binding
+            .publication(&ClientScope::Thread {
+                thread_id: self.thread_id.clone(),
+            })
+            .and_then(|publication| {
+                publication
+                    .snapshot()
+                    .payload::<pioneer_client::threads::registry::ThreadDomainSnapshot>()
+            })
+            .map(|domain| domain.coordinator())
+        else {
+            return;
+        };
+        if coordinator.thread().is_none() {
+            return;
+        }
+        let scope = (connection, coordinator.workspace_id.clone());
+        if self.call_scope.as_ref() == Some(&scope) {
+            return;
+        }
+        let Some(calls) = Calls::get(cx) else {
+            return;
+        };
+        self.call_scope = Some(scope);
+        calls.update(cx, |calls, cx| {
+            calls.refresh(
+                CallTarget {
+                    workspace_id: coordinator.workspace_id.clone(),
+                    thread_id: self.thread_id.clone(),
+                },
+                cx,
+            )
+        });
+    }
+
     fn can_manage(&self) -> bool {
         let principal = self.binding.publication(&ClientScope::Administration { workspace_id: None }).and_then(|p| p.snapshot().payload::<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>());
         principal
@@ -125,6 +180,23 @@ impl ThreadHeaderView {
             HeaderCommand::Back => cx.emit(HeaderBack),
             HeaderCommand::Rename => {
                 self.open_rename_thread_dialog(self.thread_id.clone(), window, cx)
+            }
+            HeaderCommand::Call {
+                workspace_id,
+                title,
+            } => {
+                if let Some(calls) = Calls::get(cx) {
+                    calls.update(cx, |calls, cx| {
+                        calls.open(
+                            CallTarget {
+                                workspace_id: workspace_id.clone(),
+                                thread_id: self.thread_id.clone(),
+                            },
+                            title.clone(),
+                            cx,
+                        )
+                    });
+                }
             }
             HeaderCommand::Members => self
                 .layout
@@ -207,6 +279,24 @@ impl Render for ThreadHeaderView {
             _ => ThreadScopePendingAction::Idle,
         };
         let connected = self.binding.publication(&ClientScope::Session).and_then(|p| p.snapshot().payload::<pioneer_client::gateway::session_controller::GatewaySessionPublication>()).and_then(|p| p.status.clone()).is_some_and(|status| status.connection_state == crate::screen::GatewayConnectionState::Connected);
+        let call = if connected
+            && !draft
+            && lineage.is_none()
+            && thread.is_some_and(|thread| thread.status != ThreadStatus::Closed)
+        {
+            Calls::get(cx)
+                .zip(coordinator.as_ref())
+                .map(|(calls, coordinator)| {
+                    let calls = calls.read(cx);
+                    (
+                        coordinator.workspace_id.clone(),
+                        calls.label(&self.thread_id),
+                        calls.missed(&self.thread_id),
+                    )
+                })
+        } else {
+            None
+        };
         div()
             .key_context("ThreadHeader")
             .track_focus(&self.focus)
@@ -222,6 +312,7 @@ impl Render for ThreadHeaderView {
                 status: thread.map(|thread| thread.status),
                 connected,
                 pending,
+                call,
                 file_openers: self.files.file_openers(&self.thread_id, cx),
             })
     }

@@ -13,6 +13,7 @@ mod m20261119_000010_database_rules;
 mod m20261122_000011_history_epoch_lock_order;
 mod m20261122_000012_package_component_lock_order;
 mod m20261125_000013_compact_observation_turn_cleanup;
+mod m20261125_000014_thread_calls;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261122_000011_history_epoch_lock_order::Migration),
             Box::new(m20261122_000012_package_component_lock_order::Migration),
             Box::new(m20261125_000013_compact_observation_turn_cleanup::Migration),
+            Box::new(m20261125_000014_thread_calls::Migration),
         ]
     }
 }

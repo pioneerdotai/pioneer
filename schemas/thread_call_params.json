@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadCallParams",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ThreadCallAction"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "action"
+  ],
+  "$defs": {
+    "ThreadCallAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "status"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "before_call_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "history"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "start"
+            },
+            "request_key": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "request_key"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "change"
+            },
+            "revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "transition": {
+              "$ref": "#/$defs/ThreadCallTransition"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id",
+            "revision",
+            "transition"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "keep_held"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "connect"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "restore"
+            },
+            "media_identity": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id",
+            "media_identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "disconnect"
+            },
+            "media_identity": {
+              "type": "string"
+            },
+            "resume_key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id",
+            "media_identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "resume"
+            },
+            "media_identity": {
+              "type": "string"
+            },
+            "resume_key": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "call_id",
+            "media_identity",
+            "resume_key"
+          ]
+        }
+      ]
+    },
+    "ThreadCallTransition": {
+      "type": "string",
+      "enum": [
+        "join",
+        "decline",
+        "leave",
+        "hold",
+        "resume"
+      ]
+    }
+  }
+}

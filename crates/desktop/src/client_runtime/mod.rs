@@ -84,6 +84,7 @@ impl DesktopRuntimeCoordinator {
             return;
         }
         let core = ClientCore::shared();
+        pioneer_desktop_thread::init_thread_calls(core.clone(), cx);
         core.set_mcp_oauth_shell(Arc::new(
             crate::platform::mcp_oauth::DesktopMcpOAuthShell::new(
                 pioneer_config::AppConfig::load()

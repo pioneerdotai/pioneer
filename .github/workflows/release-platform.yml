@@ -64,6 +64,26 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  prepare-livekit:
+    runs-on: ${{ contains(fromJSON(inputs.platform).target, 'apple-darwin') && fromJSON(inputs.platform).os || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Prepare pinned LiveKit runtime
+        run: python3 scripts/packaging/livekit-runtime.py --target "${{ fromJSON(inputs.platform).target }}" --out livekit-runtime
+      - uses: actions/upload-artifact@v6
+        with:
+          name: livekit-runtime-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: livekit-runtime/
+          retention-days: 7
+          if-no-files-found: error
+
   build-gateway-default:
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
@@ -249,7 +269,7 @@ jobs:
           compression-level: 0
 
   package-gateway-default:
-    needs: [build-gateway-default, prepare-postgres]
+    needs: [build-gateway-default, prepare-postgres, prepare-livekit]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -294,11 +314,15 @@ jobs:
         with:
           role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
           path: postgres-runtime
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: livekit-runtime-${{ fromJSON(inputs.platform).target }}
+          path: livekit-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant default --asset "${{ fromJSON(inputs.platform).asset }}"
-          --inputs gateway-inputs --postgres postgres-runtime --out gateway-final
+          --inputs gateway-inputs --postgres postgres-runtime --livekit livekit-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -321,7 +345,7 @@ jobs:
           if-no-files-found: ignore
 
   package-gateway-computer-use:
-    needs: [build-gateway-computer-use, prepare-cua, prepare-postgres]
+    needs: [build-gateway-computer-use, prepare-cua, prepare-postgres, prepare-livekit]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -390,11 +414,15 @@ jobs:
         with:
           role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
           path: postgres-runtime
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: livekit-runtime-${{ fromJSON(inputs.platform).target }}
+          path: livekit-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant computer-use --asset "${{ fromJSON(inputs.platform).cu_asset }}"
-          --inputs gateway-inputs --prepared cua-prepared --postgres postgres-runtime --out gateway-final
+          --inputs gateway-inputs --prepared cua-prepared --postgres postgres-runtime --livekit livekit-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}

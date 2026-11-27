@@ -10,14 +10,15 @@ anyhow.workspace = true
 pioneer-config.workspace = true
 pioneer-protocol.workspace = true
 rathole.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 rathole = { workspace = true, features = ["server"] }
-sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
 sentry = { workspace = true, features = ["test"] }

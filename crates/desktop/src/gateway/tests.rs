@@ -348,6 +348,7 @@ pub(crate) fn test_config() -> AppConfig {
             cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
             remote_access: Default::default(),
             voice: GatewayVoiceConfig::default(),
+            calls: Default::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 development_url: None,

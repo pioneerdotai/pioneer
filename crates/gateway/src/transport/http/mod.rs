@@ -2,6 +2,7 @@ mod app_profiles;
 mod apps;
 mod auth;
 mod avatars;
+mod calls;
 mod content;
 mod errors;
 pub(crate) mod header_policy;

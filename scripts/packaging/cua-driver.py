@@ -368,7 +368,7 @@ def zip_tree(root, archive):
                 output.write(path, path.relative_to(root).as_posix())
 
 
-def package(target, binary, prepared, archive, notary_log_dir=None, postgres=None):
+def package(target, binary, prepared, archive, notary_log_dir=None, postgres=None, livekit=None):
     if target not in TARGETS:
         raise ValueError(f"Unsupported CUA target: {target}")
     selected = release()
@@ -382,6 +382,8 @@ def package(target, binary, prepared, archive, notary_log_dir=None, postgres=Non
     inputs = dict(target=target, gateway_sha256=digest(binary), prepared=metadata)
     if postgres is not None:
         inputs["postgres"] = file_inventory(postgres)
+    if livekit is not None:
+        inputs["livekit"] = file_inventory(livekit)
     identity = os.environ.get("MACOS_DESKTOP_SIGN_IDENTITY", "") if macos else ""
     if macos:
         if not identity:
@@ -439,6 +441,13 @@ def package(target, binary, prepared, archive, notary_log_dir=None, postgres=Non
                 if library.suffix in (".so", ".dylib", ".dll")
             )
         suffix = ".exe" if "windows" in target else ""
+        sidecar_executables = postgres_executables
+        if livekit is not None:
+            staged_livekit = payload / "livekit"
+            shutil.copytree(livekit, staged_livekit)
+            program = staged_livekit / ("livekit-server" + suffix)
+            program.chmod(0o755)
+            sidecar_executables.append(program)
         daemon = payload / daemon_name(target)
         if macos:
             contents = payload / "Pioneer Gateway.app/Contents"
@@ -468,7 +477,7 @@ def package(target, binary, prepared, archive, notary_log_dir=None, postgres=Non
                 options = ["--entitlements", str(entitlements)] if executable.suffix != ".dylib" else []
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 *options, "--sign", identity, str(executable)], check=True)
-            for executable in postgres_executables:
+            for executable in sidecar_executables:
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 "--sign", identity, str(executable)], check=True)
             subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",

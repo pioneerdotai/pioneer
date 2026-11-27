@@ -29,6 +29,10 @@ syntect.workspace = true
 two-face.workspace = true
 url.workspace = true
 serde_json.workspace = true
+futures-util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+livekit = { version = "=0.12.1", features = ["rustls-tls-native-roots"] }
+nokhwa = { version = "=0.10.11", features = ["input-native"] }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

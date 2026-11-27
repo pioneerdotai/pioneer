@@ -1084,6 +1084,9 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             ThreadEpisodicRecallOutput
         ),
         schema_doc!("thread.json", Thread),
+        schema_doc!("thread_call_params.json", crate::ThreadCallParams),
+        schema_doc!("thread_call_response.json", crate::ThreadCallResponse),
+        schema_doc!("thread_call_snapshot.json", crate::ThreadCallSnapshot),
         schema_doc!("thread_visibility.json", ThreadVisibility),
         schema_doc!("thread_status.json", ThreadStatus),
         schema_doc!("thread_mode.json", ThreadMode),

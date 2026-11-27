@@ -1,0 +1,21 @@
+[package]
+name = "pioneer-crud-calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-calls.workspace = true
+pioneer-entity.workspace = true
+pioneer-postgres-pools.workspace = true
+pioneer-protocol.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+pioneer-postgres-test.workspace = true
+tokio.workspace = true

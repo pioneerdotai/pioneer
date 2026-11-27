@@ -15,6 +15,7 @@ RUNTIME = runpy.run_path(str(Path(__file__).with_name("runtime-inputs.py")))
 CUA = runpy.run_path(str(Path(__file__).with_name("cua-driver.py")))
 SYMBOLS = Path(__file__).with_name("symbol-inputs.py")
 POSTGRES = runpy.run_path(str(Path(__file__).with_name("postgres-runtime.py")))
+LIVEKIT = runpy.run_path(str(Path(__file__).with_name("livekit-runtime.py")))
 NOTARY = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
 
 
@@ -28,6 +29,7 @@ def package_macos_default(args, binary, archive):
     inputs = dict(target=args.target, signing_identity=identity,
                   gateway_sha256=RUNTIME["digest"](args.inputs / binary.name),
                   postgres=RUNTIME["file_inventory"](args.postgres),
+                  livekit=RUNTIME["file_inventory"](args.livekit),
                   onnx={path.name: RUNTIME["digest"](path) for path in libraries})
     logs = args.notary_log_dir
     logs.mkdir(parents=True, exist_ok=True)
@@ -51,6 +53,9 @@ def package_macos_default(args, binary, archive):
             shutil.copytree(args.postgres, postgres)
             for program in POSTGRES["PROGRAMS"]:
                 (postgres / "bin" / program).chmod(0o755)
+            livekit = root / "runtime/livekit"
+            shutil.copytree(args.livekit, livekit)
+            (livekit / LIVEKIT["executable"](args.target)).chmod(0o755)
             for library in libraries:
                 shutil.copy2(library, root / library.name)
             for executable in NOTARY["mach_o_files"](root):
@@ -75,6 +80,7 @@ def package(args):
     if args.variant == "computer-use" and args.prepared is None:
         raise ValueError("CU packaging requires --prepared verified CUA inputs")
     POSTGRES["validate"](args.target, args.postgres)
+    LIVEKIT["validate"](args.target, args.livekit)
     args.out.mkdir(parents=True, exist_ok=False)
     assets = args.out / "assets"
     assets.mkdir()
@@ -96,13 +102,21 @@ def package(args):
             subprocess.run(["pwsh", "-NoProfile", "-File",
                             str(Path(__file__).with_name("sign-windows.ps1")),
                             "-Path", str(binary)], check=True)
+        livekit = work / "livekit"
+        shutil.copytree(args.livekit, livekit)
+        livekit_executable = livekit / LIVEKIT["executable"](args.target)
+        livekit_executable.chmod(0o755)
+        if "windows" in args.target:
+            subprocess.run(["pwsh", "-NoProfile", "-File",
+                            str(Path(__file__).with_name("sign-windows.ps1")),
+                            "-Path", str(livekit_executable)], check=True)
         if args.variant == "computer-use":
             # Intel libraries come from the exact compile producer, never from
             # the signing runner's independently selected installation.
             if args.target == "x86_64-apple-darwin":
                 os.environ["PIONEER_ONNXRUNTIME_DYLIB_DIR"] = str(args.inputs.resolve())
             CUA["package"](args.target, binary, args.prepared, archive, args.notary_log_dir,
-                           postgres=args.postgres)
+                           postgres=args.postgres, livekit=livekit)
             CUA["validate_archive"](args.target, archive,
                                      verify_signatures="apple-darwin" in args.target)
             runtime = args.out / "runtime"
@@ -143,6 +157,8 @@ def package(args):
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED,
                                  compresslevel=9) as destination:
                 destination.write(binary, binary.name)
+                for entry in sorted(livekit.iterdir()):
+                    destination.write(entry, (Path("runtime/livekit") / entry.name).as_posix())
                 for path in sorted(args.postgres.rglob("*")):
                     if path.is_symlink():
                         raise ValueError("PostgreSQL runtime archive requires regular files")
@@ -173,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--prepared", type=Path)
     parser.add_argument("--postgres", type=Path, required=True)
+    parser.add_argument("--livekit", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--notary-log-dir", type=Path, default=Path("notary-logs/gateway"))
     package(parser.parse_args())

@@ -15,6 +15,9 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+mod call_media;
+pub use call_media::{CallMediaTarget, CallMediaTransport};
+
 #[derive(Debug, Clone)]
 pub struct RemoteAccessDesiredState {
     pub settings: GatewayRemoteAccessSettings,
@@ -24,6 +27,7 @@ pub struct RemoteAccessDesiredState {
 pub struct RemoteAccessSupervisor {
     config: GatewayRemoteAccessConfig,
     status_tx: watch::Sender<GatewayRemoteAccessStatusSnapshot>,
+    media_client: reqwest::Client,
     state: Mutex<RemoteAccessSupervisorState>,
 }
 
@@ -31,6 +35,7 @@ struct RemoteAccessSupervisorState {
     generation: u64,
     shutdown_tx: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+    media_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -98,10 +103,17 @@ impl RemoteAccessSupervisor {
         Ok(Self {
             config,
             status_tx,
+            media_client: reqwest::Client::builder()
+                .https_only(true)
+                .http1_only()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             state: Mutex::new(RemoteAccessSupervisorState {
                 generation: 0,
                 shutdown_tx: None,
                 task: None,
+                media_key: None,
             }),
         })
     }
@@ -154,6 +166,7 @@ impl RemoteAccessSupervisor {
         );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        state.media_key = Some(run_config.token.clone());
         let status_tx = self.status_tx.clone();
         let task = tokio::spawn(async move {
             supervise_rathole(run_config, status_tx, shutdown_rx).await;
@@ -259,6 +272,7 @@ async fn stop_supervisor_task(state: &mut RemoteAccessSupervisorState) {
     }
     state.task = None;
     state.shutdown_tx = None;
+    state.media_key = None;
 }
 
 async fn supervise_rathole(

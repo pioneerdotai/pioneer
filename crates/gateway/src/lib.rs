@@ -832,7 +832,27 @@ async fn run_gateway_until_shutdown_inner(
     message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
+    if config.gateway.calls.enabled {
+        match prepare_thread_calls(&config.gateway, runtime_home.as_path(), crud_store.as_ref())
+            .await
+        {
+            Ok(calls) => message_processor.thread_calls = Some(Arc::new(calls)),
+            Err(_) => warn!(
+                "Gateway calling is unavailable. Check the bundled LiveKit executable, ports, and signaling configuration."
+            ),
+        }
+    }
     let message_processor = Arc::new(message_processor);
+    let _cancel_calls_runner = message_processor
+        .calls()
+        .map(|calls| calls.shutdown.clone().drop_guard());
+    let calls_runner = message_processor.thread_calls.as_ref().map(|calls| {
+        let calls = calls.clone();
+        let processor = message_processor.clone();
+        tokio::spawn(async move {
+            processor.run_thread_calls(&calls).await;
+        })
+    });
     message_processor.bind_context_compaction().await;
     message_processor
         .initialize_authorization_generation()
@@ -1162,7 +1182,16 @@ async fn run_gateway_until_shutdown_inner(
         "gateway daemon stopping with apply_patch telemetry snapshot"
     );
     message_processor.shutdown_remote_access_supervisor().await;
+    if let Some(calls) = message_processor.calls() {
+        calls.shutdown.cancel();
+    }
     let server_shutdown_result = handle.shutdown().await;
+    if let Some(runner) = calls_runner {
+        let _ = runner.await;
+    }
+    if let Some(calls) = message_processor.calls() {
+        calls.media.shutdown().await;
+    }
     message_processor.shutdown_voice_finalizations().await;
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
@@ -2054,4 +2083,59 @@ pub async fn dev_app_operation(
         transport::local_operations::Operation::DevApp(operation),
     )
     .await
+}
+
+async fn prepare_thread_calls(
+    config: &pioneer_config::GatewayConfig,
+    home: &std::path::Path,
+    store: &pioneer_crud::CrudStore,
+) -> anyhow::Result<crate::message::Calls> {
+    let settings = &config.calls;
+    let gateway = std::env::current_exe()?;
+    let executable = match &settings.livekit_executable {
+        Some(executable) => executable.clone(),
+        None => pioneer_calls::livekit::LiveKit::bundled_executable(&gateway)?,
+    };
+    let media = if settings.relay_media {
+        anyhow::ensure!(
+            settings.signaling_url.is_none() && settings.livekit_node_ip.is_none(),
+            "relayed calls use the authenticated remote access URL and loopback LiveKit"
+        );
+        pioneer_calls::livekit::LiveKit::new_relay(
+            executable,
+            home,
+            settings.livekit_http_port,
+            settings.livekit_udp_port,
+        )?
+    } else {
+        let url = match &settings.signaling_url {
+            Some(url) => url::Url::parse(url)?,
+            None => {
+                let port = config.listen_addr.parse::<std::net::SocketAddr>()?.port();
+                anyhow::ensure!(
+                    port != 0,
+                    "calling requires a signaling URL or a fixed Gateway port"
+                );
+                url::Url::parse(&format!("ws://127.0.0.1:{port}"))?
+            }
+        };
+        pioneer_calls::livekit::LiveKit::new(
+            executable,
+            home,
+            settings.livekit_http_port,
+            settings.livekit_udp_port,
+            settings.livekit_node_ip,
+            url,
+        )?
+    };
+    let calls = crate::message::Calls::new(media);
+    calls.close_inherited(store).await?;
+    Ok(calls)
+}
+
+#[cfg(target_os = "macos")]
+pub fn dispatch_livekit_supervisor(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<anyhow::Result<()>> {
+    pioneer_calls::livekit::dispatch_supervisor(args)
 }

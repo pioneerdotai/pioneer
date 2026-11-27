@@ -51,6 +51,7 @@ futures-util.workspace = true
 sys-locale.workspace = true
 rust-embed.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
 image.workspace = true
 cpal.workspace = true
 webbrowser.workspace = true

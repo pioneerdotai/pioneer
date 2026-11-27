@@ -58,6 +58,8 @@ pub struct Model {
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_many)]
+    pub thread_calls: HasMany<super::thread_call::Entity>,
+    #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(has_many, via = "thread_membership")]
     pub gateway_principals: HasMany<super::gateway_principal::Entity>,

@@ -38,6 +38,7 @@ pub mod methods {
     pub const WORKSPACE_PUSH: &str = "workspace/push";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
+    pub const THREAD_CALL: &str = "thread/call";
     pub const THREAD_PARTICIPANTS_LIST: &str = "thread/participants/list";
     pub const THREAD_PARTICIPANTS_ADD: &str = "thread/participants/add";
     pub const THREAD_PARTICIPANTS_REMOVE: &str = "thread/participants/remove";
@@ -424,6 +425,7 @@ pub mod events {
     pub const WORKSPACE_CHANGED: &str = "workspace/changed";
     pub const THREAD_STARTED: &str = "thread/started";
     pub const THREAD_UPDATED: &str = "thread/updated";
+    pub const THREAD_CALL_CHANGED: &str = "thread/call/changed";
     pub const THREAD_PARTICIPANTS_CHANGED: &str = "thread/participants/changed";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";

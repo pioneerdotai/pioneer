@@ -221,6 +221,13 @@ restart_jitter_percent = 20
 # 0 means retry indefinitely.
 max_restarts = 0
 
+[gateway.calls]
+enabled = true
+# Use the authenticated remote-access URL and the Relay shared UDP ingress.
+relay_media = false
+livekit_http_port = 0
+livekit_udp_port = 7882
+
 [gateway.voice]
 models_dir = "models/voice"
 transcription_strategy = "buffered_gateway_session"

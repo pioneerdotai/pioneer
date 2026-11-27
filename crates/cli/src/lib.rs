@@ -31,6 +31,14 @@ pub fn main_entry() {
         return;
     }
 
+    #[cfg(target_os = "macos")]
+    if let Some(result) = pioneer_gateway::dispatch_livekit_supervisor(env::args_os().skip(1)) {
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     std::hint::black_box(&PIONEER_BUILD_SECTION);
     let _ = pioneer_observability::identity::configure_build(include_str!(concat!(
         env!("OUT_DIR"),

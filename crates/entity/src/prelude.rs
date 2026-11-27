@@ -172,6 +172,7 @@ pub use super::task_write_lock::Entity as TaskWriteLock;
 pub use super::thread::Entity as Thread;
 pub use super::thread_agents_doc::Entity as ThreadAgentsDoc;
 pub use super::thread_agents_doc_revision::Entity as ThreadAgentsDocRevision;
+pub use super::thread_call::Entity as ThreadCall;
 pub use super::thread_cli_runtime_binding::Entity as ThreadCliRuntimeBinding;
 pub use super::thread_episodic_embedding_artifacts::Entity as ThreadEpisodicEmbeddingArtifacts;
 pub use super::thread_episodic_exclusions::Entity as ThreadEpisodicExclusions;

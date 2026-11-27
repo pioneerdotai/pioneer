@@ -50,6 +50,7 @@ mod tests;
 mod webhook_endpoint;
 #[cfg(test)]
 pub(crate) use tests::{test_summary_config, test_tool_loop_config};
+mod call_handlers;
 mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;
@@ -64,6 +65,7 @@ mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
 mod turn_handlers;
+pub(crate) use pioneer_call_service::Calls;
 mod voice_handlers;
 
 const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str =
@@ -797,6 +799,7 @@ pub struct MessageProcessor {
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
+    pub(crate) thread_calls: Option<Arc<Calls>>,
     self_improvement_supervisor:
         Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
@@ -1485,6 +1488,7 @@ impl MessageProcessor {
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_input_supervisor: None,
+            thread_calls: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_finalizations: Default::default(),
@@ -6022,6 +6026,7 @@ impl MessageProcessor {
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_input_supervisor: None,
+            thread_calls: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_finalizations: Default::default(),

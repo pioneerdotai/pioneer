@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadCallSnapshot",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "type": "string"
+    },
+    "created_at_unix": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "end_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadCallEndReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "initiator_id": {
+      "type": "string"
+    },
+    "invitee_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadCallParticipant"
+      }
+    },
+    "phase": {
+      "$ref": "#/$defs/ThreadCallPhase"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "ring_until_unix": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "call_id",
+    "revision",
+    "created_at_unix",
+    "phase",
+    "initiator_id",
+    "participants"
+  ],
+  "$defs": {
+    "ThreadCallEndReason": {
+      "type": "string",
+      "enum": [
+        "left",
+        "declined",
+        "missed",
+        "gateway_restarted"
+      ]
+    },
+    "ThreadCallParticipant": {
+      "type": "object",
+      "properties": {
+        "held": {
+          "type": "boolean"
+        },
+        "media_identity": {
+          "type": "string"
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "principal_id",
+        "media_identity",
+        "held"
+      ]
+    },
+    "ThreadCallPhase": {
+      "type": "string",
+      "enum": [
+        "ringing",
+        "active",
+        "ended"
+      ]
+    }
+  }
+}

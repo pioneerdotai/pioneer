@@ -31,6 +31,9 @@ members = [
   "crates/cli",
   "crates/crud",
   "crates/crud-access",
+  "crates/crud-calls",
+  "crates/calls",
+  "crates/call-service",
   "crates/crud-artifacts",
   "crates/crud-compaction",
   "crates/crud-conversations",
@@ -103,6 +106,9 @@ pioneer-desktop-task-notifications = { path = "crates/desktop-task-notifications
 pioneer-app-updater = { path = "crates/desktop-updater" }
 pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }
+pioneer-call-service = { path = "crates/call-service" }
+pioneer-calls = { path = "crates/calls" }
+pioneer-crud-calls = { path = "crates/crud-calls" }
 pioneer-crud-access = { path = "crates/crud-access" }
 pioneer-crud-artifacts = { path = "crates/crud-artifacts" }
 pioneer-crud-compaction = { path = "crates/crud-compaction" }
