@@ -14,7 +14,7 @@ struct PioneerAssets;
 gpui_kit::assets::icon_assets!(
     AppPanelAssets,
     [
-        Maximize2, Minimize2, X, MicOff, PhoneOff, UserRound, Video, VideoOff
+        Ellipsis, Maximize2, Minimize2, X, Mic, MicOff, PhoneOff, UserRound, Video, VideoOff
     ]
 );
 

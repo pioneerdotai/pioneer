@@ -195,6 +195,7 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 
 # Private behavior delegates implementing the corresponding target region.
 [supporting_units]
+"desktop-thread:CallWindow" = ["Render", "Calls", "TUI-14"]
 "desktop-thread:HtmlView" = ["Render", "TimelineRowView", "TUI-17"]
 "desktop-onboarding:InvitationJoinScreenView" = ["Render", "OnboardingView", "TUI-08"]
 "desktop-workspaces:WorkspaceNavigationView" = ["Render", "WorkspaceNavigationView", "TUI-10"]

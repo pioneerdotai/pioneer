@@ -56,7 +56,7 @@ pub(super) struct Speech {
     was_speaking: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct SpeechFrame {
     pub level: f32,
     pub ring: f32,

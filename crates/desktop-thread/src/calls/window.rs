@@ -80,6 +80,18 @@ fn call_control_icon(path: &'static str) -> Icon {
 }
 
 impl Calls {
+    // Keep the verified call owner during a Gateway outage, until the account or session changes.
+    fn selected_call_owner(&self) -> Option<&super::CallOwner> {
+        self.owner
+            .as_ref()
+            .filter(|account| account.matches(&self.core))
+    }
+
+    fn stay_in_call(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.closing = false;
+        cx.notify();
+    }
+
     pub(super) fn show(&mut self, cx: &mut Context<Self>) {
         let owner = cx.entity();
         cx.defer(move |cx| show_call_window(owner, cx));
@@ -134,12 +146,19 @@ fn show_call_window(owner: Entity<Calls>, cx: &mut App) {
             cx.new(|cx| {
                 let search = cx.new(|cx| InputState::new(window, cx));
                 let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
-                let subscription = cx.observe(&owner, |_, _, cx| cx.notify());
-                CallWindow {
+                let search_focus = search.read(cx).focus_handle(cx);
+                let subscription =
+                    cx.observe_in(&owner, window, |view: &mut CallWindow, _, window, cx| {
+                        view.sync_call(window, cx);
+                        cx.notify();
+                    });
+                let mut view = CallWindow {
                     owner,
                     focus: cx.focus_handle(),
                     textures: HashMap::new(),
                     speech: HashMap::new(),
+                    tiles: HashMap::new(),
+                    animation_pending: false,
                     _subscription: subscription,
                     _resize: cx.observe_window_bounds(
                         window,
@@ -155,6 +174,7 @@ fn show_call_window(owner: Entity<Calls>, cx: &mut App) {
                     names_key: None,
                     names_connection: None,
                     search,
+                    search_focus,
                     _search_subscription: search_subscription,
                     names: HashMap::new(),
                     names_task: None,
@@ -163,7 +183,9 @@ fn show_call_window(owner: Entity<Calls>, cx: &mut App) {
                     inventory: None,
                     open_device_list: None,
                     inventory_task: None,
-                }
+                };
+                view.sync_call(window, cx);
+                view
             })
         },
     );
@@ -195,15 +217,24 @@ enum Panel {
     Video,
 }
 
+struct ParticipantTile {
+    media: ParticipantMedia,
+    texture: Option<(DynamicTexture, u32, u32)>,
+    voice: SpeechFrame,
+}
+
 struct CallWindow {
     owner: Entity<Calls>,
     focus: FocusHandle,
     textures: HashMap<String, Texture>,
     speech: HashMap<String, Speech>,
+    tiles: HashMap<String, ParticipantTile>,
+    animation_pending: bool,
     _subscription: Subscription,
     _resize: Subscription,
     names_key: Option<(super::CallOwner, String)>,
     search: Entity<InputState>,
+    search_focus: FocusHandle,
     _search_subscription: Subscription,
     names_connection: Option<u64>,
     names: HashMap<String, String>,
@@ -216,6 +247,120 @@ struct CallWindow {
 }
 
 impl CallWindow {
+    fn sync_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = self.owner.read(cx);
+        let account = owner.selected_call_owner();
+        let call = owner
+            .active
+            .as_ref()
+            .map(|s| &s.call)
+            .or(owner.incoming.as_ref())
+            .or_else(|| owner.held.as_ref().map(|s| &s.call));
+        let names_key = account
+            .zip(call)
+            .map(|(account, call)| (account.clone(), call.workspace_id.clone()));
+        let active_window_title = (account.is_some()
+            && owner.media.is_some()
+            && owner.incoming.is_none()
+            && !owner
+                .active
+                .as_ref()
+                .is_some_and(|s| s.call.phase == ThreadCallPhase::Ringing))
+        .then(|| {
+            if owner.title.is_empty() {
+                t!("thread.call.title").to_string()
+            } else {
+                owner.title.clone()
+            }
+        });
+        self.load_names(owner.core.clone(), names_key, owner.connection, window, cx);
+        if self.active_window_title != active_window_title {
+            if let Some(title) = &active_window_title {
+                window.set_window_title(title);
+            } else {
+                window.set_window_title(t!("thread.call.title").as_ref());
+            }
+            self.active_window_title = active_window_title;
+        }
+
+        self.sync_media(window, cx);
+    }
+
+    fn sync_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = self.owner.read(cx);
+        let account = owner.selected_call_owner();
+        let (frames, media_participants) = owner
+            .media
+            .as_ref()
+            .map(|media| {
+                (
+                    media.view.frames.lock().unwrap().clone(),
+                    media.view.participants.lock().unwrap().clone(),
+                )
+            })
+            .unwrap_or_default();
+        self.textures.retain(|id, _| frames.contains_key(id));
+        self.speech
+            .retain(|id, _| media_participants.contains_key(id));
+        let now = cx.background_executor().now();
+        let reduce_motion = cx.reduce_motion();
+        self.tiles.clear();
+        let mut animate = false;
+        if let Some((account, session)) = account.zip(owner.active.as_ref()) {
+            for participant in session
+                .call
+                .participants
+                .iter()
+                .filter(|member| !member.held)
+            {
+                let local = account.principal == participant.principal_id;
+                let media = media_participants
+                    .get(&participant.media_identity)
+                    .copied()
+                    .unwrap_or_default();
+                let camera = if local {
+                    session.devices.camera
+                } else {
+                    media.camera
+                };
+                let texture = frames
+                    .get(&participant.media_identity)
+                    .filter(|_| camera)
+                    .and_then(|frame| {
+                        self.texture(&participant.media_identity, frame, window)
+                            .map(|texture| (texture, frame.width, frame.height))
+                    });
+                let voice = if (!local || texture.is_some())
+                    && media_participants.contains_key(&participant.media_identity)
+                {
+                    self.speech
+                        .entry(participant.media_identity.clone())
+                        .or_insert_with(|| Speech::new(now))
+                        .update(media.audio_level, media.microphone, reduce_motion, now)
+                } else {
+                    SpeechFrame::default()
+                };
+                animate |= voice.animate;
+                self.tiles.insert(
+                    participant.media_identity.clone(),
+                    ParticipantTile {
+                        media,
+                        texture,
+                        voice,
+                    },
+                );
+            }
+        }
+        if animate && !self.animation_pending {
+            self.animation_pending = true;
+            cx.on_next_frame(window, |view, window, cx| {
+                view.animation_pending = false;
+                view.sync_media(window, cx);
+                cx.notify();
+            });
+        }
+    }
+
     fn texture(
         &mut self,
         id: &str,
@@ -473,12 +618,7 @@ impl Render for CallWindow {
         let owner = self.owner.read(cx);
         let busy = owner.command.is_some();
         let closing = owner.closing;
-        // The connection-scoped auth projection is cleared during a Gateway outage.
-        // Calls retains this verified owner until the selected account/session changes.
-        let call_owner = owner
-            .owner
-            .as_ref()
-            .filter(|account| account.matches(&owner.core));
+        let call_owner = owner.selected_call_owner();
         let incoming = call_owner.and(owner.incoming.as_ref()).cloned();
         let active = call_owner.and(owner.active.as_ref()).cloned();
         let connected = call_owner.is_some() && owner.media.is_some();
@@ -491,33 +631,14 @@ impl Render for CallWindow {
         let failed = owner.failed;
         let opening = owner.opening;
         let title = owner.title.clone();
-        let (frames, media_participants) = owner
-            .media
-            .as_ref()
-            .map(|media| {
-                (
-                    media.view.frames.lock().unwrap().clone(),
-                    media.view.participants.lock().unwrap().clone(),
-                )
-            })
-            .unwrap_or_default();
         let selection = owner.device_selection.clone();
-        let core = owner.core.clone();
         let principal = call_owner.map(|account| account.principal.clone());
-        let workspace = active
-            .as_ref()
-            .map(|s| &s.call)
-            .or(incoming.as_ref())
-            .or(held.as_ref().map(|s| &s.call));
-        let names_key = call_owner
-            .zip(workspace)
-            .map(|(account, call)| (account.clone(), call.workspace_id.clone()));
-        let local_name = core
+        let local_name = owner
+            .core
             .current_auth()
             .filter(|auth| principal.as_deref() == Some(auth.principal.id.as_str()))
             .map(|auth| auth.principal.display_name)
             .filter(|name| !name.trim().is_empty());
-        self.load_names(core, names_key, owner.connection, window, cx);
 
         let bounds = window.viewport_size();
         let width = f32::from(bounds.width);
@@ -528,11 +649,6 @@ impl Render for CallWindow {
         let mut self_view = None;
         let mut remote_video_visible = false;
         let mut roster = Vec::new();
-        self.textures.retain(|id, _| frames.contains_key(id));
-        self.speech
-            .retain(|id, _| media_participants.contains_key(id));
-        let now = cx.background_executor().now();
-        let reduce_motion = cx.reduce_motion();
         if let Some(session) = &active {
             let remote_count = session
                 .call
@@ -561,10 +677,8 @@ impl Render for CallWindow {
                             t!("thread.call.participant").to_string()
                         }
                     });
-                let media = media_participants
-                    .get(&participant.media_identity)
-                    .copied()
-                    .unwrap_or_default();
+                let tile_media = self.tiles.get(&participant.media_identity);
+                let media = tile_media.map(|tile| tile.media).unwrap_or_default();
                 let roster_media = if local {
                     ParticipantMedia {
                         microphone: session.devices.microphone,
@@ -579,26 +693,8 @@ impl Render for CallWindow {
                 } else {
                     media.camera
                 };
-                let texture = frames
-                    .get(&participant.media_identity)
-                    .filter(|_| camera)
-                    .and_then(|frame| {
-                        self.texture(&participant.media_identity, frame, window)
-                            .map(|texture| (texture, frame.width, frame.height))
-                    });
-                let voice = if (!local || texture.is_some())
-                    && media_participants.contains_key(&participant.media_identity)
-                {
-                    self.speech
-                        .entry(participant.media_identity.clone())
-                        .or_insert_with(|| Speech::new(now))
-                        .update(media.audio_level, media.microphone, reduce_motion, now)
-                } else {
-                    SpeechFrame::default()
-                };
-                if voice.animate {
-                    window.request_animation_frame();
-                }
+                let texture = tile_media.and_then(|tile| tile.texture).filter(|_| camera);
+                let voice = tile_media.map(|tile| tile.voice).unwrap_or_default();
                 if local {
                     self_view = Some(tile(Tile::Preview { camera }, texture, media, voice, false));
                 } else {
@@ -655,17 +751,6 @@ impl Render for CallWindow {
         let heading = incoming_name
             .or((!title.is_empty()).then_some(title))
             .unwrap_or_else(|| t!("thread.call.title").to_string());
-
-        let active_window_title =
-            (connected && !waiting && incoming.is_none()).then(|| heading.clone());
-        if self.active_window_title != active_window_title {
-            if let Some(title) = &active_window_title {
-                window.set_window_title(title);
-            } else {
-                window.set_window_title(t!("thread.call.title").as_ref());
-            }
-            self.active_window_title = active_window_title;
-        }
 
         let mut screen = div()
             .relative()
@@ -1238,7 +1323,7 @@ impl Render for CallWindow {
             if roster_open {
                 let search = self.search.read(cx);
                 let empty_search = search.value().is_empty();
-                let search_focused = search.focus_handle(cx).is_focused(window);
+                let search_focused = self.search_focus.is_focused(window);
                 let query = search.value().trim().to_lowercase();
                 let search_label = t!("thread.call.search_participants").to_string();
                 roster.sort_by_key(|(_, _, local)| !local);
@@ -1391,10 +1476,7 @@ impl Render for CallWindow {
                         "call-remain",
                         t!("thread.call.stay").to_string(),
                         !busy,
-                        |owner, _, cx| {
-                            owner.closing = false;
-                            cx.notify();
-                        },
+                        Calls::stay_in_call,
                     ))
                     .child(self.choice(
                         "call-leave-confirmed",
