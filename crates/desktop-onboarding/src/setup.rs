@@ -813,7 +813,8 @@ mod tests {
                 view.close_pending = true;
                 view.close_completed_dialog(window, cx);
             });
-            assert!(top.is_focused(window));
+            assert!(top.contains_focused(window, cx));
+            assert!(form.read(cx).close_pending);
             assert!(window.has_active_dialog(cx));
             window.close_dialog(cx);
         });
