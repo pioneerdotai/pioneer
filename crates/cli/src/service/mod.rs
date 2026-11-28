@@ -138,10 +138,7 @@ impl ServiceDefinitionBackup {
     pub(super) fn capture(path: PathBuf) -> Result<Self> {
         let contents = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                anyhow::ensure!(
-                    metadata.is_file() && metadata.len() <= 1024 * 1024,
-                    "invalid Gateway service definition"
-                );
+                anyhow::ensure!(metadata.is_file(), "invalid Gateway service definition");
                 Some((std::fs::read(&path)?, metadata.permissions()))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

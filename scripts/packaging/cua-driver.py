@@ -184,11 +184,19 @@ def architecture(path, target):
         if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf") and len(data) >= 8:
             order = "little" if data[:4] == b"\xcf\xfa\xed\xfe" else "big"
             good = int.from_bytes(data[4:8], order) == cpu
-        elif data[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        elif data[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf") and len(data) >= 8:
             count = int.from_bytes(data[4:8], "big")
             width = 32 if data[:4] == b"\xca\xfe\xba\xbf" else 20
-            good = 0 < count <= 16 and any(int.from_bytes(data[8 + index * width:12 + index * width], "big") == cpu
-                                             for index in range(count))
+            with path.open("rb") as source:
+                if 8 + count * width <= os.fstat(source.fileno()).st_size:
+                    source.seek(8)
+                    for _ in range(count):
+                        entry = source.read(width)
+                        if len(entry) != width:
+                            break
+                        if int.from_bytes(entry[:4], "big") == cpu:
+                            good = True
+                            break
     if not good:
         raise ValueError(f"Native architecture mismatch for {target}: {path}")
 

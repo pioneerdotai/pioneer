@@ -1548,7 +1548,7 @@ fn ensure_candidate_schema_compatible(
 ) -> Result<()> {
     let compiled = compiled.context("schema compatibility unknown: candidate does not expose compiled migrations; installation unchanged")?;
     anyhow::ensure!(
-        !compiled.is_empty() && compiled.len() <= 4096,
+        !compiled.is_empty(),
         "schema compatibility unknown: invalid candidate migration set; installation unchanged"
     );
     let names: std::collections::HashSet<_> = compiled.iter().collect();

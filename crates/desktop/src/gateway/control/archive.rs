@@ -316,18 +316,24 @@ fn validate_architecture(path: &Path) -> Result<()> {
             [0xcf, 0xfa, 0xed, 0xfe] => u32::from_le_bytes(header[4..8].try_into()?) == cpu,
             [0xfe, 0xed, 0xfa, 0xcf] => u32::from_be_bytes(header[4..8].try_into()?) == cpu,
             [0xca, 0xfe, 0xba, magic @ (0xbe | 0xbf)] => {
-                let count = u32::from_be_bytes(header[4..8].try_into()?) as usize;
+                let count = u32::from_be_bytes(header[4..8].try_into()?);
+                let width: usize = if *magic == 0xbf { 32 } else { 20 };
                 ensure!(
-                    count > 0 && count <= 16,
-                    "invalid Gateway Mach-O architecture count"
+                    8 + u64::from(count) * width as u64 <= input.metadata()?.len(),
+                    "truncated Gateway Mach-O architecture table"
                 );
-                let width = if *magic == 0xbf { 32 } else { 20 };
-                let mut table = [0u8; 16 * 32];
                 input.seek(std::io::SeekFrom::Start(8))?;
-                input.read_exact(&mut table[..count * width])?;
-                table[..count * width].chunks_exact(width).any(|entry| {
-                    u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) == cpu
-                })
+                let mut reader = std::io::BufReader::new(input);
+                let mut entry = [0u8; 32];
+                let mut found = false;
+                for _ in 0..count {
+                    reader.read_exact(&mut entry[..width])?;
+                    if u32::from_be_bytes(entry[..4].try_into()?) == cpu {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             }
             _ => false,
         }

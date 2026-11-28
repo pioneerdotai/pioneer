@@ -676,14 +676,12 @@ fn verify_packaged_driver(
     let manifest_path = driver_dir.join("manifest.json");
     let metadata = std::fs::symlink_metadata(&manifest_path)
         .map_err(|_| unavailable("Gateway CUA provenance manifest is missing"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(unavailable("Gateway CUA provenance manifest is invalid"));
     }
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(manifest_path)
-            .map_err(|_| unavailable("cannot read Gateway CUA provenance"))?,
-    )
+    let manifest: Value = serde_json::from_reader(std::io::BufReader::new(
+        File::open(manifest_path).map_err(|_| unavailable("cannot read Gateway CUA provenance"))?,
+    ))
     .map_err(|_| unavailable("Gateway CUA provenance is invalid"))?;
     let relative = binary
         .strip_prefix(payload)

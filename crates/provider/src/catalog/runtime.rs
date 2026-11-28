@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, Write},
     path::{Path, PathBuf},
     sync::{OnceLock, RwLock},
     time::Duration,
@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CACHE_FILE: &str = "catalog.json";
-const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const BUNDLED_CATALOG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bundled_model_catalog.json"));
 
@@ -82,17 +81,7 @@ fn load_saved_cache(directory: &Path) -> Result<Option<SavedCatalog>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    ensure!(
-        file.metadata()?.len() <= MAX_CACHE_BYTES,
-        "model catalog cache too large"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_CACHE_BYTES,
-        "model catalog cache too large"
-    );
-    let saved: SavedCatalog = serde_json::from_slice(&bytes)?;
+    let saved: SavedCatalog = serde_json::from_reader(BufReader::new(file))?;
     saved.validate()?;
     Ok(Some(saved))
 }
@@ -105,10 +94,6 @@ fn load_cache(directory: &Path) -> Result<Option<ModelCatalog>> {
 
 fn validate_saved_bytes(bytes: &[u8]) -> Result<ModelCatalog> {
     ensure!(!bytes.is_empty(), "bundled model catalog is unavailable");
-    ensure!(
-        bytes.len() as u64 <= MAX_CACHE_BYTES,
-        "model catalog cache too large"
-    );
     serde_json::from_slice::<SavedCatalog>(bytes)?.validate()
 }
 
@@ -188,10 +173,6 @@ fn prepare_update(directory: &Path, snapshot: generator::SourceSnapshot) -> Resu
     };
     let catalog = saved.validate()?;
     let bytes = serde_json::to_vec(&saved)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_CACHE_BYTES,
-        "model catalog cache too large"
-    );
     persist_bytes(directory, &bytes)?;
     Ok(catalog)
 }
@@ -312,10 +293,6 @@ pub async fn generate_catalog_file(output: &Path, proxy_url: Option<&str>) -> Re
     };
     saved.validate()?;
     let bytes = serde_json::to_vec(&saved)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_CACHE_BYTES,
-        "model catalog cache too large"
-    );
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(&bytes)?;
@@ -727,15 +704,10 @@ mod tests {
         assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), bundled);
     }
     #[test]
-    fn absent_corrupt_and_oversized_cache_leave_catalog_unavailable() {
+    fn absent_and_corrupt_cache_leave_catalog_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_cache(dir.path()).unwrap().is_none());
         fs::write(dir.path().join(CACHE_FILE), b"broken").unwrap();
-        assert!(load_cache(dir.path()).is_err());
-        fs::File::create(dir.path().join(CACHE_FILE))
-            .unwrap()
-            .set_len(MAX_CACHE_BYTES + 1)
-            .unwrap();
         assert!(load_cache(dir.path()).is_err());
         let store = CatalogStore::default();
         assert!(restore_cache(&store, dir.path()).is_err());
