@@ -43,9 +43,9 @@ def context(target, variant):
     if target not in PLATFORMS or variant not in ("default", "computer-use", "desktop"):
         raise ValueError("Unsupported release target or variant")
     catalog = Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"])
-    return dict(schema_version=1, commit=os.environ.get("PIONEER_RELEASE_SOURCE_SHA") or subprocess.check_output(
+    return dict(schema_version=1, commit=subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        run_id=os.environ.get("PIONEER_RELEASE_SOURCE_RUN") or os.environ["GITHUB_RUN_ID"],
+        run_id=os.environ["GITHUB_RUN_ID"],
         run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
         version=tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"],
         target=target, variant=variant, profile="release", catalog_sha256=digest(catalog))

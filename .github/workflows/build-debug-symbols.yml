@@ -6,10 +6,6 @@ run-name: Debug symbols (release run ${{ inputs.source_run_id }})
 on:
   workflow_dispatch:
     inputs:
-      mapping_run_id:
-        description: Optional release recovery run containing replacement packaging mappings
-        type: string
-        required: false
       source_run_id:
         description: Exact Release run that retained the inputs (legacy producers are also supported)
         required: true
@@ -37,7 +33,6 @@ jobs:
         id: select
         env:
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          MAPPING_RUN_ID: ${{ inputs.mapping_run_id }}
         with:
           script: |
             const id = process.env.SOURCE_RUN_ID;
@@ -57,20 +52,6 @@ jobs:
             core.setOutput('source_run_id', String(run.id));
             const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
               {owner: context.repo.owner, repo: context.repo.repo, run_id: run.id, per_page: 100});
-            let recovered = [];
-            let recovery;
-            if (process.env.MAPPING_RUN_ID) {
-              if (!/^[1-9][0-9]*$/.test(process.env.MAPPING_RUN_ID)) throw new Error('Invalid mapping run ID');
-              ({data: recovery} = await github.rest.actions.getWorkflowRun({
-                ...context.repo, run_id: Number(process.env.MAPPING_RUN_ID)}));
-              if (recovery.head_repository.id !== run.head_repository.id ||
-                  recovery.path !== '.github/workflows/release.yml' || recovery.event !== 'workflow_dispatch' ||
-                  recovery.head_branch !== context.payload.repository.default_branch) {
-                throw new Error('Expected packaging mappings from the release recovery workflow');
-              }
-              recovered = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
-                {...context.repo, run_id: recovery.id, per_page: 100});
-            }
             const platforms = {
               'x86_64-unknown-linux-gnu': 'ubuntu-latest',
               'aarch64-unknown-linux-gnu': 'ubuntu-24.04-arm',
@@ -92,20 +73,17 @@ jobs:
                 {target, product: 'desktop', variant: ''}]);
               for (const role of roles) {
                 const base = `${role.product}-${role.target}${role.variant ? '-' + role.variant : ''}`;
-                const fromRecovery = recovery && recovered.some(row =>
-                  row.name.startsWith(`symbol-mapping-${base}-run-${recovery.id}-attempt-`));
-                const producer = fromRecovery ? recovery : run;
-                const prefix = `symbol-mapping-${base}-run-${producer.id}-attempt-`;
-                const matches = (fromRecovery ? recovered : artifacts).filter(row => row.name.startsWith(prefix)).map(row => {
+                const prefix = `symbol-mapping-${base}-run-${run.id}-attempt-`;
+                const matches = artifacts.filter(row => row.name.startsWith(prefix)).map(row => {
                   const suffix = row.name.slice(prefix.length);
                   if (!/^[1-9][0-9]*$/.test(suffix)) throw new Error('Malformed symbol mapping attempt');
                   return {...row, attempt: Number(suffix)};
-                }).filter(row => row.attempt <= producer.run_attempt).sort((a,b) => b.attempt - a.attempt);
+                }).filter(row => row.attempt <= run.run_attempt).sort((a,b) => b.attempt - a.attempt);
                 if (!matches.length || matches[0].expired ||
                     matches.filter(row => row.attempt === matches[0].attempt).length !== 1) {
                   throw new Error(`Missing, expired or ambiguous packaged mapping: ${base}`);
                 }
-                include.push({mapping_id: matches[0].id, mapping_run_id: producer.id, name: `symbol-inputs-${base}`,
+                include.push({mapping_id: matches[0].id, name: `symbol-inputs-${base}`,
                               target: role.target, os: platforms[role.target], variant: role.variant,
                               product: role.product});
               }
@@ -207,7 +185,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           artifact-ids: ${{ matrix.mapping_id }}
-          run-id: ${{ matrix.mapping_run_id }}
+          run-id: ${{ needs.inputs.outputs.source_run_id }}
           github-token: ${{ github.token }}
           path: symbol-mapping
           merge-multiple: true

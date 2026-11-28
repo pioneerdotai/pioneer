@@ -1,22 +1,7 @@
 name: Release
-run-name: Release (${{ inputs.tag || github.ref_name }})
+run-name: Release (${{ github.ref_name }})
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing draft release tag
-        type: string
-        required: true
-      source_run_id:
-        description: Failed tag release with retained compiler outputs
-        type: string
-        required: true
-      windows_target:
-        description: Repackage Computer Use Gateway and Desktop for this target
-        type: choice
-        options: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
-        required: true
   push:
     tags: ["*"]
 
@@ -26,52 +11,10 @@ permissions:
 
 # A second release run for the same tag must not mutate the draft concurrently.
 concurrency:
-  group: release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  recovery:
-    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-      attempt: ${{ steps.source.outputs.attempt }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - name: Verify the retained release and packaging-only changes
-        id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          SOURCE_RUN: ${{ inputs.source_run_id }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_RUN" =~ ^[1-9][0-9]*$ ]]
-          [[ "$TAG" =~ ^[vV]?[0-9]+[.][0-9]+[.][0-9]+([-+][a-zA-Z0-9.+-]+)?$ ]]
-          sha=$(git rev-parse "refs/tags/$TAG^{commit}")
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$RUNNER_TEMP/source.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg tag "$TAG" --arg sha "$sha" '
-            .head_repository.full_name == $repo and .path == ".github/workflows/release.yml" and
-            .event == "push" and .head_branch == $tag and .head_sha == $sha and
-            .status == "completed" and .conclusion == "failure"' "$RUNNER_TEMP/source.json"
-          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == true ]]
-          git diff --exit-code "$sha" HEAD -- . ':!scripts/packaging' ':!.github/actions' ':!.github/workflows'
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "attempt=$(jq .run_attempt "$RUNNER_TEMP/source.json")" >> "$GITHUB_OUTPUT"
-
-  recover-windows:
-    needs: recovery
-    uses: ./.github/workflows/release-platform.yml
-    with:
-      platform: ${{ inputs.windows_target == 'x86_64-pc-windows-msvc' && '{"target":"x86_64-pc-windows-msvc","os":"windows-latest","cu_asset":"pioneer-gateway-windows-x86_64-computer-use-package.zip","asset_name":"Pioneer-x86_64.msi","update_asset_name":"Pioneer-x86_64.exe"}' || '{"target":"aarch64-pc-windows-msvc","os":"windows-11-arm","cu_asset":"pioneer-gateway-windows-aarch64-computer-use-package.zip","asset_name":"Pioneer-aarch64.msi","update_asset_name":"Pioneer-aarch64.exe"}' }}
-      source_run: ${{ inputs.source_run_id }}
-      source_sha: ${{ needs.recovery.outputs.sha }}
-      source_attempt: ${{ needs.recovery.outputs.attempt }}
-      release_tag: ${{ inputs.tag }}
-    secrets: inherit
-
   prepare-release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
@@ -187,15 +130,10 @@ jobs:
   publish-release:
     name: publish-release
     runs-on: ubuntu-latest
-    needs: [platforms, recovery, recover-windows]
-    if: always() && !cancelled() && (needs.platforms.result == 'success' || needs.recover-windows.result == 'success')
+    needs: platforms
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      SOURCE_RUN: ${{ inputs.source_run_id || github.run_id }}
-      SOURCE_ATTEMPT: ${{ needs.recovery.outputs.attempt || github.run_attempt }}
-      SOURCE_SHA: ${{ needs.recovery.outputs.sha || github.sha }}
-      RECOVER_TARGET: ${{ inputs.windows_target }}
 
     steps:
       - uses: actions/checkout@v5
@@ -214,52 +152,33 @@ jobs:
             const targets = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
                              'x86_64-apple-darwin', 'aarch64-apple-darwin',
                              'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'];
-            const load = run_id => github.paginate(github.rest.actions.listWorkflowRunArtifacts,
-              {...context.repo, run_id, per_page: 100});
-            const source = await load(process.env.SOURCE_RUN);
-            const recovered = process.env.RECOVER_TARGET ? await load(context.runId) : [];
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+              {owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100});
             const roles = targets.flatMap(target => [`gateway-assets-${target}-default`,
               `gateway-assets-${target}-computer-use`, `desktop-assets-${target}`]);
-            const ids = {source: [], recovered: []};
-            for (const role of roles) {
-              const useRecovery = process.env.RECOVER_TARGET && [
-                `gateway-assets-${process.env.RECOVER_TARGET}-computer-use`,
-                `desktop-assets-${process.env.RECOVER_TARGET}`].includes(role);
-              const artifacts = useRecovery ? recovered : source;
-              const run = useRecovery ? context.runId : process.env.SOURCE_RUN;
-              const maxAttempt = useRecovery ? process.env.GITHUB_RUN_ATTEMPT : process.env.SOURCE_ATTEMPT;
-              const prefix = `${role}-run-${run}-attempt-`;
+            const ids = roles.map(role => {
+              const prefix = `${role}-run-${context.runId}-attempt-`;
               const candidates = artifacts.filter(row => row.name.startsWith(prefix)).map(row => {
                 const attempt = row.name.slice(prefix.length);
                 if (!/^[1-9][0-9]*$/.test(attempt)) throw new Error(`Malformed release input: ${row.name}`);
                 return {...row, attempt: Number(attempt)};
-              }).filter(row => row.attempt <= Number(maxAttempt));
+              }).filter(row => row.attempt <= Number(process.env.GITHUB_RUN_ATTEMPT));
               candidates.sort((a,b) => b.attempt - a.attempt);
               if (!candidates.length || candidates[0].expired ||
                   candidates.filter(row => row.attempt === candidates[0].attempt).length !== 1) {
                 throw new Error(`Missing, expired or ambiguous release input: ${role}`);
               }
-              ids[useRecovery ? 'recovered' : 'source'].push(candidates[0].id);
-            }
-            for (const [key, values] of Object.entries(ids)) core.setOutput(key, values.join(','));
+              return String(candidates[0].id);
+            });
+            core.setOutput('ids', ids.join(','));
       - name: download-exact-release-assets
         uses: actions/download-artifact@v7
         with:
-          github-token: ${{ github.token }}
-          run-id: ${{ env.SOURCE_RUN }}
-          artifact-ids: ${{ steps.select.outputs.source }}
-          path: dist
-          merge-multiple: true
-      - uses: actions/download-artifact@v7
-        if: steps.select.outputs.recovered != ''
-        with:
-          artifact-ids: ${{ steps.select.outputs.recovered }}
+          artifact-ids: ${{ steps.select.outputs.ids }}
           path: dist
           merge-multiple: true
       - uses: ./.github/actions/download-release-input
         with:
-          run-id: ${{ env.SOURCE_RUN }}
-          max-attempt: ${{ env.SOURCE_ATTEMPT }}
           role: pioneer-release-model-catalog
           path: release-model-catalog
       - name: verify-complete-asset-provenance
@@ -301,12 +220,12 @@ jobs:
               path = dist / name
               receipt = json.loads((dist / (name + '.provenance.json')).read_text())
               source = receipt['source']
-              required = dict(schema_version=1, run_id=os.environ['SOURCE_RUN'], commit=os.environ['SOURCE_SHA'],
+              required = dict(schema_version=1, run_id=os.environ['GITHUB_RUN_ID'], commit=os.environ['GITHUB_SHA'],
                               target=target, variant=variant, version=version, profile='release', catalog_sha256=catalog_hash)
               if receipt.get('schema_version') != 1 or receipt.get('asset') != name or any(source.get(k) != v for k, v in required.items()):
                   raise ValueError(f'Asset provenance differs from this release: {name}')
               attempt = str(source.get('run_attempt', ''))
-              if not attempt.isdecimal() or not 1 <= int(attempt) <= int(os.environ['SOURCE_ATTEMPT']):
+              if not attempt.isdecimal() or not 1 <= int(attempt) <= int(os.environ['GITHUB_RUN_ATTEMPT']):
                   raise ValueError(f'Invalid producer attempt: {name}')
               if hashlib.sha256(path.read_bytes()).hexdigest() != receipt['sha256']:
                   raise ValueError(f'Asset checksum mismatch: {name}')
@@ -379,7 +298,7 @@ jobs:
           from pathlib import Path
 
           dist = Path("dist")
-          tag = os.environ["RELEASE_TAG"]
+          tag = os.environ["GITHUB_REF_NAME"]
           version = tag[1:] if tag.startswith(("v", "V")) else tag
           channel = "stable"
           if "-canary" in tag:
@@ -568,18 +487,18 @@ jobs:
           fi
 
           prerelease_flag=""
-          if [[ "${RELEASE_TAG}" == *-* ]]; then
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             prerelease_flag="--prerelease"
           fi
 
           # prepare-release hides the current tag before any builds start.
           # Keep it hidden throughout asset upload and verification.
-          [[ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq '.isDraft')" == true ]] || {
+          [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == true ]] || {
             echo 'the prepared release must remain draft until all assets are ready' >&2; exit 1;
           }
 
-          gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
-          gh release view "${RELEASE_TAG}" --json assets > release-remote-inventory.json
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+          gh release view "${GITHUB_REF_NAME}" --json assets > release-remote-inventory.json
           python3 <<'PYREMOTE'
           import hashlib
           import json
@@ -598,16 +517,16 @@ jobs:
 
           # This is the only publication point: both products are already uploaded.
           if [[ -n "${prerelease_flag}" ]]; then
-            gh release edit "${RELEASE_TAG}" --draft=false --prerelease
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease
           else
-            gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
           fi
 
   # Dispatch once the exact inputs exist; publication does not wait for symbols.
   queue-debug-symbols:
-    if: always() && !cancelled() && (needs.platforms.result == 'success' || needs.recover-windows.result == 'success')
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: queue-independent-debug-symbols
-    needs: [platforms, recovery, recover-windows]
+    needs: platforms
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -619,7 +538,5 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo,
               workflow_id: 'build-debug-symbols.yml',
               ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
-              inputs: context.eventName === 'workflow_dispatch'
-                ? {source_run_id: context.payload.inputs.source_run_id, mapping_run_id: String(context.runId)}
-                : {source_run_id: String(context.runId)},
+              inputs: {source_run_id: String(context.runId)},
             });
