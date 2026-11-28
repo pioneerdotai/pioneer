@@ -260,8 +260,7 @@ def prepare(target, out):
 def check_prepared(target, prepared):
     selected = release()
     receipt = prepared / "prepared.json"
-    if (prepared.is_symlink() or not prepared.is_dir() or receipt.is_symlink()
-            or not receipt.is_file() or receipt.stat().st_size > 1024 * 1024):
+    if prepared.is_symlink() or not prepared.is_dir() or receipt.is_symlink() or not receipt.is_file():
         raise ValueError("Invalid prepared CUA directory or receipt")
     metadata = json.loads(receipt.read_text())
     actual = file_inventory(prepared / "runtime")
@@ -524,8 +523,7 @@ def dev_source(binary, root, target):
     if binary.is_relative_to(root):
         generation = root / binary.relative_to(root).parts[0]
         receipt_path = generation / "dev-inputs.json"
-        if (generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file()
-                or receipt_path.stat().st_size > 1024 * 1024):
+        if generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file():
             raise ValueError("Invalid dev runtime generation or source receipt")
         payload = generation / "payload"
         validate_tree(target, payload, "apple-darwin" in target, development=True,
@@ -583,7 +581,6 @@ def dev(target, binary, root):
     if generation.exists():
         receipt_path = generation / "dev-inputs.json"
         if (generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file()
-                or receipt_path.stat().st_size > 1024 * 1024
                 or json.loads(receipt_path.read_text()) != inputs):
             raise ValueError("Dev runtime generation does not match the current source inputs")
         validate_tree(target, generation / "payload", macos, development=True)
