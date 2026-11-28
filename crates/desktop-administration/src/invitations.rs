@@ -32,6 +32,7 @@ enum InvitationDialogPhase {
 struct InvitationDialogState {
     generation: Option<u64>,
     client: std::sync::Weak<pioneer_client::core::ClientCore>,
+    dialog_focus: Option<FocusHandle>,
     phase: InvitationDialogPhase,
     selected: HashSet<String>,
     selected_role_key: Option<String>,
@@ -47,6 +48,7 @@ impl InvitationDialogState {
         Self {
             client,
             generation: None,
+            dialog_focus: None,
             phase: InvitationDialogPhase::Create,
             selected: HashSet::new(),
             selected_role_key,
@@ -579,6 +581,7 @@ impl AdministrationView {
                 .footer(DialogFooter::new().children(footer))
                 .child(content)
         });
+        form.update(cx, |form, cx| form.dialog_focus = window.focused(cx));
         attach.update(cx, |owner, cx| owner.attach(window, cx));
         Some(form)
     }
@@ -674,7 +677,12 @@ fn format_invitation_time(unix: u64) -> String {
 }
 
 impl AdministrationView {
-    fn create_invitation(&mut self, state: Entity<InvitationDialogState>, cx: &mut Context<Self>) {
+    fn create_invitation(
+        &mut self,
+        state: Entity<InvitationDialogState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use pioneer_client::administration::operations::*;
         let form = state.read(cx);
         if form.creating || !matches!(form.phase, InvitationDialogPhase::Create) {
@@ -724,6 +732,13 @@ impl AdministrationView {
             return;
         };
         state.update(cx, |form, cx| {
+            // The result replaces the form controls. Park focus on the container
+            // before they disappear, unless another dialog already has focus.
+            if let Some(focus) = &form.dialog_focus
+                && focus.contains_focused(window, cx)
+            {
+                focus.focus(window, cx);
+            }
             form.generation = Some(generation);
             form.creating = true;
             form.error = None;
@@ -823,9 +838,10 @@ impl Render for InvitationSubmit {
             .on_click({
                 let desktop = desktop.clone();
                 let state = state.clone();
-                move |_, _, cx| {
-                    let _ =
-                        desktop.update(cx, |view, cx| view.create_invitation(state.clone(), cx));
+                move |_, window, cx| {
+                    let _ = desktop.update(cx, |view, cx| {
+                        view.create_invitation(state.clone(), window, cx)
+                    });
                 }
             })
             .into_any_element()
@@ -909,13 +925,14 @@ mod tests {
             focus.focus(window, cx);
             focus
         });
-        let form = cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
+        let (form, dialog) = cx.update(|window, cx| {
+            let form = view.update(cx, |view, cx| {
                 // Synthetic connection; all RPC replies use an in-memory transport.
                 view.gateway.connection_state = GatewayConnectionState::Connected;
                 view.open_create_invitation_dialog(window, cx)
                     .expect("authorized form")
-            })
+            });
+            (form, window.focused(cx).unwrap())
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("invitation-create-form").is_some());
@@ -950,9 +967,11 @@ mod tests {
         });
         // Use the owning command, queue, RPC decoder and async form callback.
         // A second click while pending must not issue a second invitation.
-        view.update(cx, |view, cx| {
-            view.create_invitation(form.clone(), cx);
-            view.create_invitation(form.clone(), cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.create_invitation(form.clone(), window, cx);
+                view.create_invitation(form.clone(), window, cx);
+            });
         });
         cx.run_until_parked();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -976,6 +995,7 @@ mod tests {
         core.invalidate_authorization_revision(5);
         cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
         cx.run_until_parked();
+        cx.update(|window, cx| assert!(dialog.contains_focused(window, cx)));
         assert!(
             form.read_with(cx, |form, _| matches!(
                 form.phase,

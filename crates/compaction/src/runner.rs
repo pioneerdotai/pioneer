@@ -1,7 +1,7 @@
 //! Durable, deterministic state transitions for one compaction operation.
 //! The integration layer persists each transition with CAS before performing
 //! its action. Source payloads and summary text are never copied into this state.
-use crate::{ATTEMPT_MILLIS, ModelBudget};
+use crate::{ATTEMPT_MILLIS, ModelBudget, summary::SummaryRetryFeedback};
 use serde::{Deserialize, Serialize};
 
 /// The next source-text representation after main's historical-command v1.
@@ -124,6 +124,9 @@ pub struct RunnerState {
     /// Safe phase before a resumable failure; legacy portions recover from their cursor.
     #[serde(default)]
     pub resume_phase: Option<RunnerPhase>,
+    /// Feedback for this request, retained across retries without a completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_feedback: Option<SummaryRetryFeedback>,
     #[serde(default)]
     pub observation: Option<AttemptObservation>,
     #[serde(default)]
@@ -154,6 +157,7 @@ impl RunnerState {
         anyhow::ensure!(target_tokens > 0, "summarizer has no output capacity");
         Ok(Self {
             resume_phase: None,
+            retry_feedback: None,
             observation: None,
             diagnostic: None,
             generation: 0,
@@ -256,6 +260,11 @@ impl RunnerState {
             anyhow::bail!("no current attempt")
         };
         let mut next = self.next()?;
+        // A transport retry can replay the same request. Overflow instead
+        // prepares a smaller input, and validation supplies fresh feedback.
+        if !matches!(kind, FailureKind::Transient | FailureKind::Deadline) {
+            next.retry_feedback = None;
+        }
         if let Some(observation) = &mut next.observation {
             observation.finished_ms = Some(now_ms);
             observation.failure = Some(kind.clone());
@@ -372,6 +381,7 @@ impl RunnerState {
             "correction changed source coverage"
         );
         let mut next = self.next()?;
+        next.retry_feedback = None;
         next.portion_attempts = 0;
         next.overflow_rejections = 0;
         next.overflow_input_ceiling = None;
@@ -438,6 +448,8 @@ impl RunnerState {
                 RunnerPhase::Attempt { purpose, .. } => RunnerPhase::Ready { purpose: *purpose },
                 phase => phase.clone(),
             });
+        } else {
+            next.retry_feedback = None;
         }
         next.phase = RunnerPhase::Failed { kind };
         Ok(next)
@@ -790,17 +802,21 @@ mod tests {
             attempt.retries = 2; // Resume must not replenish transient retries.
             let attempt = fail_and_retry(attempt, FailureKind::InvalidCompletion, 4);
             let attempt = fail_and_retry(attempt, FailureKind::InvalidCompletion, 2_005);
-            let failed = restart(
-                &attempt
-                    .attempt_failed(FailureKind::InvalidCompletion, 10_006, None)
-                    .unwrap(),
-            );
+            let mut failed = attempt
+                .attempt_failed(FailureKind::InvalidCompletion, 10_006, None)
+                .unwrap();
+            failed.retry_feedback = Some(SummaryRetryFeedback::EmptySection);
+            let failed = restart(&failed);
             assert_eq!(failed.portion_attempts, 3);
             assert_eq!(failed.action(10_007), RunnerAction::Terminal);
             assert!(failed.claim(10_007).is_err());
             let resumed = restart(&failed).resume_invalid_completion(900_100).unwrap();
             assert_eq!(resumed.portion_attempts, 0);
             assert_eq!(resumed.phase, ready.phase);
+            assert_eq!(
+                resumed.retry_feedback,
+                Some(SummaryRetryFeedback::EmptySection)
+            );
             assert_eq!(resumed.cursor, saved.cursor);
             assert_eq!(resumed.previous_checkpoint, saved.previous_checkpoint);
             assert_eq!(
@@ -820,6 +836,7 @@ mod tests {
             let next_attempt = resumed.claim(10_007).unwrap();
             assert_eq!(next_attempt.attempts, failed.attempts + 1);
             assert_eq!(next_attempt.portion_attempts, 1);
+            assert_eq!(next_attempt.retry_feedback, resumed.retry_feedback);
             assert!(matches!(
                 next_attempt
                     .attempt_failed(FailureKind::Transient, 10_008, None)
@@ -841,7 +858,9 @@ mod tests {
             let mut json = serde_json::to_value(&failed).unwrap();
             json.as_object_mut().unwrap().remove("resume_phase");
             json.as_object_mut().unwrap().remove("portion_attempts");
+            json.as_object_mut().unwrap().remove("retry_feedback");
             let legacy: RunnerState = serde_json::from_value(json).unwrap();
+            assert_eq!(legacy.retry_feedback, None);
             assert_eq!(legacy.can_resume_invalid_completion(), !correction);
             if !correction {
                 assert_eq!(

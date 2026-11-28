@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use pioneer_compaction::runner::FailureKind;
 use pioneer_compaction::summary::{
-    CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
+    CompletionKind, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
 };
 use pioneer_compaction::{ModelBudget, ModelSelection, Transport};
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
@@ -83,7 +83,7 @@ impl NativeSummarizer {
             service_mode: self.service_mode.clone(),
             model: request.selection.model.clone(),
             messages: vec![
-                ChatMessage::system(INSTRUCTIONS),
+                ChatMessage::system(request.instructions()),
                 ChatMessage::user(request.data_json()?),
             ],
             temperature: None,
@@ -232,7 +232,9 @@ impl Summarizer for NativeSummarizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_compaction::summary::{HEADINGS, SummaryInput, SummaryPart, validate_summary};
+    use pioneer_compaction::summary::{
+        HEADINGS, INSTRUCTIONS, SummaryInput, SummaryPart, validate_summary,
+    };
     use pioneer_compaction::{CompactionMode, SourceRef};
     use pioneer_provider::{ChatResponse, ProviderFailureClassification, StreamChunk};
     use std::sync::Mutex;
@@ -308,6 +310,7 @@ mod tests {
         SummaryRequest {
             selection: selection(),
             output_cap: 500,
+            retry_feedback: None,
             input: SummaryInput {
                 mode: CompactionMode::Normal,
                 coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,

@@ -2347,6 +2347,7 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         },
         previous_checkpoint: Some(checkpoint.clone()),
         phase: RunnerPhase::Commit { checkpoint },
+        retry_feedback: None,
         observation: None,
         diagnostic: None,
     };

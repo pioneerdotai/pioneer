@@ -833,7 +833,7 @@ impl CompactionRunner {
                             .await?;
                         continue;
                     }
-                    let portion = match self.portion(&state, purpose).await {
+                    let mut portion = match self.portion(&state, purpose).await {
                         Ok(portion) => portion,
                         Err(error) => {
                             let capacity = error.downcast_ref::<SummaryInputCapacity>().is_some();
@@ -867,6 +867,9 @@ impl CompactionRunner {
                             continue;
                         }
                     };
+                    // Pick the portion using the original framing. The retry
+                    // instructions fit inside that framing and leave the input intact.
+                    portion.request.retry_feedback = state.retry_feedback;
                     let mut claimed = state.claim(self.clock.now_ms())?;
                     claimed.observation = Some(pioneer_compaction::runner::AttemptObservation {
                         number: claimed.attempts,
@@ -948,24 +951,20 @@ impl CompactionRunner {
                             ) {
                                 Ok(text) => text,
                                 Err(reason) => {
-                                    state = self
-                                        .persist(
+                                    let mut next = Self::diagnose(
+                                        self.attempt_failed(
                                             &state,
-                                            Self::diagnose(
-                                                self.attempt_failed(
-                                                    &state,
-                                                    FailureKind::InvalidCompletion,
-                                                    None,
-                                                )?,
-                                                FailureDiagnostic::new(
-                                                    "summary_validation",
-                                                    "invalid_completion",
-                                                    &reason.diagnostic_explanation(),
-                                                ),
-                                            ),
+                                            FailureKind::InvalidCompletion,
                                             None,
-                                        )
-                                        .await?;
+                                        )?,
+                                        FailureDiagnostic::new(
+                                            "summary_validation",
+                                            "invalid_completion",
+                                            &reason.diagnostic_explanation(),
+                                        ),
+                                    );
+                                    next.retry_feedback = reason.retry_feedback();
+                                    state = self.persist(&state, next, None).await?;
                                     continue;
                                 }
                             };
@@ -1099,6 +1098,7 @@ impl CompactionRunner {
         SummaryRequest {
             selection: self.snapshot.admission.selection.clone(),
             output_cap: state.target_tokens,
+            retry_feedback: None,
             input: SummaryInput {
                 mode: self.snapshot.plan.mode,
                 coverage_domain: self.snapshot.plan.coverage_domain,
