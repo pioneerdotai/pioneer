@@ -33,7 +33,6 @@ TARGETS = {
     "aarch64-pc-windows-msvc": "windows-arm64",
     "x86_64-pc-windows-msvc": "windows-x86_64",
 }
-MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def digest(path):
@@ -77,10 +76,10 @@ def safe_name(name):
     return normalized
 
 
-def extract(archive, destination, *, member_limit=512 * 1024 * 1024):
+def extract(archive, destination):
     """Reject every unsafe/duplicate/link entry before writing a single file."""
     destination.mkdir(parents=True, exist_ok=False)
-    seen, files, directories, total = set(), [], [], 0
+    seen, files, directories = set(), [], []
     if zipfile.is_zipfile(archive):
         container = zipfile.ZipFile(archive)
         entries = container.infolist()
@@ -111,10 +110,8 @@ def extract(archive, destination, *, member_limit=512 * 1024 * 1024):
             if mode & 0o7022:
                 raise ValueError("Unsafe archive permissions")
             seen.add(folded)
-            total += size
-            if (total > MAX_BYTES or size > member_limit or size < 0 or len(seen) > 10000
-                    or (directory and size != 0)):
-                raise ValueError("CUA archive exceeds extraction budget")
+            if size < 0 or (directory and size != 0):
+                raise ValueError("Invalid CUA archive member size")
             if not directory:
                 files.append((entry, name, size, mode))
             else:
@@ -357,8 +354,7 @@ def validate_tree(target, root, verify_signatures=False, development=False, lega
 def validate_archive(target, archive, verify_signatures=False):
     with tempfile.TemporaryDirectory(prefix="pioneer-cua-validation-") as temporary:
         root = Path(temporary) / "payload"
-        # A complete Gateway may exceed the upstream driver member limit.
-        extract(archive, root, member_limit=MAX_BYTES)
+        extract(archive, root)
         return validate_tree(target, root, verify_signatures)
 
 

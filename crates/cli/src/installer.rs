@@ -1729,8 +1729,6 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-const MAX_GATEWAY_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<GatewayLayout> {
     let is_zip = asset_path
         .extension()
@@ -1752,11 +1750,9 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<Gat
             fs::remove_dir_all(&payload)?;
         }
         let input = File::open(asset_path)?;
-        let mut decoder = flate2::read::GzDecoder::new(input).take(MAX_GATEWAY_PACKAGE_BYTES + 1);
+        let mut decoder = flate2::read::GzDecoder::new(input);
         let mut output = File::create(target_binary)?;
-        if std::io::copy(&mut decoder, &mut output)? > MAX_GATEWAY_PACKAGE_BYTES {
-            bail!("Gateway archive exceeds binary budget");
-        }
+        std::io::copy(&mut decoder, &mut output)?;
         Ok(GatewayLayout::Legacy)
     } else {
         bail!("Gateway archive format does not match this build variant and target")
@@ -1809,11 +1805,6 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLa
         fs::remove_dir_all(&payload).context("failed to clear staged Gateway runtime")?;
     }
     fs::create_dir(&payload).context("failed to create staged Gateway runtime directory")?;
-    anyhow::ensure!(
-        archive.len() <= 32768,
-        "Gateway archive has too many members"
-    );
-    let mut total_bytes = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     let mut found = false;
     let mut archive_layout = None;
@@ -1866,10 +1857,6 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLa
             .is_some_and(|mode| mode & 0o170000 == 0o120000)
         {
             bail!("Gateway archive symlinks are not permitted");
-        }
-        total_bytes = total_bytes.saturating_add(entry.size());
-        if total_bytes > MAX_GATEWAY_PACKAGE_BYTES {
-            bail!("Gateway archive exceeds payload budget");
         }
         if let Some((layout, companion)) = GatewayLayout::ALL.into_iter().find_map(|layout| {
             relative
@@ -2049,10 +2036,6 @@ fn activate_install_companions(directory: &Path, layout: GatewayLayout) -> Resul
 fn validate_cua_payload(payload: &Path, layout: GatewayLayout) -> Result<()> {
     let driver_dir = layout.driver_dir(payload);
     let manifest_path = driver_dir.join("manifest.json");
-    anyhow::ensure!(
-        fs::metadata(&manifest_path)?.len() <= 4 * 1024 * 1024,
-        "CUA manifest exceeds size budget"
-    );
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
     let daemon = layout.daemon();
     let os = match std::env::consts::OS {

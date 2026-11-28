@@ -120,7 +120,6 @@ function Expand-GatewayPackage {
     try {
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $files = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $total = [long]0
         foreach ($entry in $archive.Entries) {
             $directory = $entry.FullName.EndsWith('/')
             $name = if ($directory) { $entry.FullName.Substring(0, $entry.FullName.Length - 1) } else { $entry.FullName }
@@ -141,10 +140,8 @@ function Expand-GatewayPackage {
                     Fail "unsafe Gateway archive path: $($entry.FullName)"
                 }
             }
-            $total += $entry.Length
-            if ($entry.Length -lt 0 -or $total -gt 2GB -or
-                $seen.Count -gt 10000 -or ($directory -and $entry.Length -ne 0)) {
-                Fail "Gateway archive exceeds extraction budget"
+            if ($entry.Length -lt 0 -or ($directory -and $entry.Length -ne 0)) {
+                Fail "invalid Gateway archive member size"
             }
             if (-not $directory) { [void]$files.Add($name) }
         }

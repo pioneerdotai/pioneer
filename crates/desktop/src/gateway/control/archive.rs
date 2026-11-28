@@ -8,8 +8,6 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const GATEWAY_BUNDLE: &str = "runtime/Pioneer Gateway.app";
 
@@ -36,17 +34,9 @@ impl ArchiveInstaller {
         let provenance_path = temporary.path().join("provenance.json");
         // Snapshot all inputs in our private directory so verification, extraction,
         // and the child installer consume exactly the same archive bytes.
-        copy_bounded(&directory.join(asset_name), &asset_path, MAX_PACKAGE_BYTES)?;
-        copy_bounded(
-            &directory.join("SHA256SUMS"),
-            &checksums_path,
-            MAX_METADATA_BYTES,
-        )?;
-        copy_bounded(
-            &directory.join("provenance.json"),
-            &provenance_path,
-            MAX_METADATA_BYTES,
-        )?;
+        copy_input(&directory.join(asset_name), &asset_path)?;
+        copy_input(&directory.join("SHA256SUMS"), &checksums_path)?;
+        copy_input(&directory.join("provenance.json"), &provenance_path)?;
         let mut asset = File::open(&asset_path)?;
         verify_package(&mut asset, &checksums_path, &provenance_path, asset_name)?;
         asset.rewind()?;
@@ -64,21 +54,18 @@ impl ArchiveInstaller {
     }
 }
 
-fn copy_bounded(source: &Path, destination: &Path, limit: u64) -> Result<()> {
+fn copy_input(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("missing embedded Gateway input `{}`", source.display()))?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= limit,
-        "invalid embedded Gateway input"
-    );
-    let mut input = File::open(source)?.take(limit + 1);
+    ensure!(metadata.is_file(), "invalid embedded Gateway input");
+    let mut input = File::open(source)?.take(metadata.len());
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
     ensure!(
-        std::io::copy(&mut input, &mut output)? <= limit,
-        "embedded Gateway input exceeds size budget"
+        std::io::copy(&mut input, &mut output)? == metadata.len(),
+        "incomplete embedded Gateway input"
     );
     Ok(())
 }
@@ -136,12 +123,7 @@ fn verify_package(
 
 fn extract_archive(input: File, runtime: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(input)?;
-    ensure!(
-        archive.len() <= 16384,
-        "Gateway archive contains too many members"
-    );
     let mut seen = BTreeSet::new();
-    let mut total = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let name = entry.name()?.into_owned();
@@ -189,13 +171,6 @@ fn extract_archive(input: File, runtime: &Path) -> Result<()> {
             fs::create_dir_all(destination)?;
             continue;
         }
-        total = total
-            .checked_add(entry.size())
-            .context("Gateway archive size overflow")?;
-        ensure!(
-            total <= MAX_PACKAGE_BYTES,
-            "Gateway archive exceeds payload budget"
-        );
         fs::create_dir_all(
             destination
                 .parent()
@@ -264,10 +239,6 @@ fn validate_runtime(runtime: &Path, binary: &Path) -> Result<()> {
         "cua/cua-driver"
     };
     let manifest_path = driver_dir.join("manifest.json");
-    ensure!(
-        fs::metadata(&manifest_path)?.len() <= MAX_METADATA_BYTES,
-        "Gateway CUA manifest exceeds size budget"
-    );
     let manifest: Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
     let daemon_path = payload.join(daemon);
     let daemon_hash = hash_reader(&mut File::open(&daemon_path)?)?;

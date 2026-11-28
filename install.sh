@@ -216,10 +216,9 @@ asset = pathlib.Path(os.environ["PIONEER_ASSET_FILE"])
 installer = pathlib.Path(os.environ["PIONEER_INSTALLER_BIN"])
 destination = pathlib.Path(os.environ["PIONEER_EXTRACT_DIR"])
 destination.mkdir()
-max_package = 2 * 1024 * 1024 * 1024
 if asset.suffix == ".zip":
     with zipfile.ZipFile(asset) as archive:
-        seen, files, directories, total = set(), [], [], 0
+        seen, files, directories = set(), [], []
         devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
         for entry in archive.infolist():
             name = entry.orig_filename[:-1] if entry.is_dir() else entry.orig_filename
@@ -237,11 +236,8 @@ if asset.suffix == ".zip":
                     or name.casefold() in seen):
                 raise SystemExit(f"Unsafe or duplicate archive member: {entry.filename!r}")
             seen.add(name.casefold())
-            total += entry.file_size
-            if (entry.file_size < 0
-                    or total > max_package or len(seen) > 10000
-                    or (entry.is_dir() and entry.file_size != 0)):
-                raise SystemExit("Gateway archive exceeds extraction budget")
+            if entry.file_size < 0 or (entry.is_dir() and entry.file_size != 0):
+                raise SystemExit("Invalid Gateway archive member size")
             if not entry.is_dir():
                 files.append((entry, member, mode))
             else:
@@ -271,11 +267,7 @@ if asset.suffix == ".zip":
             (destination / member).chmod(mode & 0o777)
 elif asset.suffix == ".gz":
     with gzip.open(asset, "rb") as source, installer.open("xb") as target:
-        total = 0
         while chunk := source.read(1024 * 1024):
-            total += len(chunk)
-            if total > max_package:
-                raise SystemExit("Gateway executable exceeds extraction budget")
             target.write(chunk)
 else:
     raise SystemExit("Gateway installation requires a .gz server archive or complete ZIP archive")
