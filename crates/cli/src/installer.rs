@@ -1729,6 +1729,8 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+const MAX_GATEWAY_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<GatewayLayout> {
     let is_zip = asset_path
         .extension()
@@ -1750,9 +1752,9 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<Gat
             fs::remove_dir_all(&payload)?;
         }
         let input = File::open(asset_path)?;
-        let mut decoder = flate2::read::GzDecoder::new(input).take(512 * 1024 * 1024 + 1);
+        let mut decoder = flate2::read::GzDecoder::new(input).take(MAX_GATEWAY_PACKAGE_BYTES + 1);
         let mut output = File::create(target_binary)?;
-        if std::io::copy(&mut decoder, &mut output)? > 512 * 1024 * 1024 {
+        if std::io::copy(&mut decoder, &mut output)? > MAX_GATEWAY_PACKAGE_BYTES {
             bail!("Gateway archive exceeds binary budget");
         }
         Ok(GatewayLayout::Legacy)
@@ -1866,7 +1868,7 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLa
             bail!("Gateway archive symlinks are not permitted");
         }
         total_bytes = total_bytes.saturating_add(entry.size());
-        if entry.size() > 512 * 1024 * 1024 || total_bytes > 2 * 1024 * 1024 * 1024 {
+        if total_bytes > MAX_GATEWAY_PACKAGE_BYTES {
             bail!("Gateway archive exceeds payload budget");
         }
         if let Some((layout, companion)) = GatewayLayout::ALL.into_iter().find_map(|layout| {

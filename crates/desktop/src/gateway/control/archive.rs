@@ -8,7 +8,6 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -194,7 +193,7 @@ fn extract_archive(input: File, runtime: &Path) -> Result<()> {
             .checked_add(entry.size())
             .context("Gateway archive size overflow")?;
         ensure!(
-            entry.size() <= MAX_FILE_BYTES && total <= MAX_PACKAGE_BYTES,
+            total <= MAX_PACKAGE_BYTES,
             "Gateway archive exceeds payload budget"
         );
         fs::create_dir_all(
@@ -367,7 +366,7 @@ fn validate_architecture(path: &Path) -> Result<()> {
     } else if cfg!(windows) {
         let offset = u32::from_le_bytes(header[60..64].try_into()?);
         ensure!(
-            offset as u64 <= MAX_FILE_BYTES - 6,
+            u64::from(offset) + 6 <= input.metadata()?.len(),
             "invalid Gateway PE header offset"
         );
         input.seek(std::io::SeekFrom::Start(offset as u64))?;

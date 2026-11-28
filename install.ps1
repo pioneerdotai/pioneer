@@ -142,7 +142,7 @@ function Expand-GatewayPackage {
                 }
             }
             $total += $entry.Length
-            if ($entry.Length -lt 0 -or $entry.Length -gt 512MB -or $total -gt 2GB -or
+            if ($entry.Length -lt 0 -or $total -gt 2GB -or
                 $seen.Count -gt 10000 -or ($directory -and $entry.Length -ne 0)) {
                 Fail "Gateway archive exceeds extraction budget"
             }
@@ -167,7 +167,7 @@ function Expand-GatewayPackage {
                     $written = [long]0
                     while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
                         $written += $count
-                        if ($written -gt $entry.Length -or $written -gt 512MB) {
+                        if ($written -gt $entry.Length) {
                             Fail "Gateway archive member exceeds declared size"
                         }
                         $output.Write($buffer, 0, $count)

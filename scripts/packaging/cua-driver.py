@@ -77,7 +77,7 @@ def safe_name(name):
     return normalized
 
 
-def extract(archive, destination):
+def extract(archive, destination, *, member_limit=512 * 1024 * 1024):
     """Reject every unsafe/duplicate/link entry before writing a single file."""
     destination.mkdir(parents=True, exist_ok=False)
     seen, files, directories, total = set(), [], [], 0
@@ -112,7 +112,7 @@ def extract(archive, destination):
                 raise ValueError("Unsafe archive permissions")
             seen.add(folded)
             total += size
-            if (total > MAX_BYTES or size > 512 * 1024 * 1024 or size < 0 or len(seen) > 10000
+            if (total > MAX_BYTES or size > member_limit or size < 0 or len(seen) > 10000
                     or (directory and size != 0)):
                 raise ValueError("CUA archive exceeds extraction budget")
             if not directory:
@@ -133,7 +133,7 @@ def extract(archive, destination):
                 written = 0
                 while chunk := source.read(min(1024 * 1024, size - written + 1)):
                     written += len(chunk)
-                    if written > size or written > 512 * 1024 * 1024:
+                    if written > size:
                         raise ValueError("Archive member exceeds declared size")
                     target.write(chunk)
             if written != size:
@@ -357,7 +357,8 @@ def validate_tree(target, root, verify_signatures=False, development=False, lega
 def validate_archive(target, archive, verify_signatures=False):
     with tempfile.TemporaryDirectory(prefix="pioneer-cua-validation-") as temporary:
         root = Path(temporary) / "payload"
-        extract(archive, root)
+        # A complete Gateway may exceed the upstream driver member limit.
+        extract(archive, root, member_limit=MAX_BYTES)
         return validate_tree(target, root, verify_signatures)
 
 
@@ -515,7 +516,9 @@ def _finish_package(target, root, selected, metadata, archive):
     with tempfile.TemporaryDirectory(prefix="." + archive.name + ".", dir=archive.parent) as temporary:
         partial = Path(temporary) / archive.name
         zip_tree(root, partial)
-        validate_archive(target, partial, "apple-darwin" in target)
+        verified = validate_archive(target, partial, "apple-darwin" in target)
+        if verified != manifest:
+            raise ValueError("Archived Gateway differs from the staged file inventory")
         partial.replace(archive)
 
 

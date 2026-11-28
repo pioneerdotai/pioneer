@@ -216,7 +216,7 @@ asset = pathlib.Path(os.environ["PIONEER_ASSET_FILE"])
 installer = pathlib.Path(os.environ["PIONEER_INSTALLER_BIN"])
 destination = pathlib.Path(os.environ["PIONEER_EXTRACT_DIR"])
 destination.mkdir()
-max_file = 512 * 1024 * 1024
+max_package = 2 * 1024 * 1024 * 1024
 if asset.suffix == ".zip":
     with zipfile.ZipFile(asset) as archive:
         seen, files, directories, total = set(), [], [], 0
@@ -238,8 +238,8 @@ if asset.suffix == ".zip":
                 raise SystemExit(f"Unsafe or duplicate archive member: {entry.filename!r}")
             seen.add(name.casefold())
             total += entry.file_size
-            if (entry.file_size < 0 or entry.file_size > max_file
-                    or total > 2 * 1024 * 1024 * 1024 or len(seen) > 10000
+            if (entry.file_size < 0
+                    or total > max_package or len(seen) > 10000
                     or (entry.is_dir() and entry.file_size != 0)):
                 raise SystemExit("Gateway archive exceeds extraction budget")
             if not entry.is_dir():
@@ -261,7 +261,7 @@ if asset.suffix == ".zip":
                 written = 0
                 while chunk := source.read(min(1024 * 1024, entry.file_size - written + 1)):
                     written += len(chunk)
-                    if written > entry.file_size or written > max_file:
+                    if written > entry.file_size:
                         raise SystemExit("Archive member exceeds declared size")
                     target.write(chunk)
             if written != entry.file_size:
@@ -274,7 +274,7 @@ elif asset.suffix == ".gz":
         total = 0
         while chunk := source.read(1024 * 1024):
             total += len(chunk)
-            if total > max_file:
+            if total > max_package:
                 raise SystemExit("Gateway executable exceeds extraction budget")
             target.write(chunk)
 else:
