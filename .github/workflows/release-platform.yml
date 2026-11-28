@@ -3,6 +3,14 @@ name: Release one platform
 on:
   workflow_call:
     inputs:
+      source_run:
+        type: string
+      source_sha:
+        type: string
+      source_attempt:
+        type: string
+      release_tag:
+        type: string
       platform:
         description: One validated six-target platform record from the release caller.
         required: true
@@ -27,6 +35,7 @@ env:
 
 jobs:
   prepare-cua:
+    if: inputs.source_run == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -47,6 +56,7 @@ jobs:
           compression-level: 0
 
   prepare-postgres:
+    if: inputs.source_run == ''
     runs-on: ${{ fromJSON(inputs.platform).target == 'aarch64-pc-windows-msvc' && 'windows-latest' || fromJSON(inputs.platform).os }}
     timeout-minutes: 45
     steps:
@@ -65,6 +75,7 @@ jobs:
           if-no-files-found: error
 
   prepare-livekit:
+    if: inputs.source_run == ''
     runs-on: ${{ contains(fromJSON(inputs.platform).target, 'apple-darwin') && fromJSON(inputs.platform).os || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
@@ -85,6 +96,7 @@ jobs:
           if-no-files-found: error
 
   build-gateway-default:
+    if: inputs.source_run == ''
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
       run:
@@ -156,6 +168,7 @@ jobs:
           compression-level: 0
 
   build-gateway-computer-use:
+    if: inputs.source_run == ''
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
       run:
@@ -218,6 +231,7 @@ jobs:
           compression-level: 0
 
   build-desktop:
+    if: inputs.source_run == ''
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
       run:
@@ -269,6 +283,7 @@ jobs:
           compression-level: 0
 
   package-gateway-default:
+    if: inputs.source_run == ''
     needs: [build-gateway-default, prepare-postgres, prepare-livekit]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
@@ -345,9 +360,13 @@ jobs:
           if-no-files-found: ignore
 
   package-gateway-computer-use:
+    if: always() && !cancelled() && (inputs.source_run != '' || (needs.build-gateway-computer-use.result == 'success' && needs.prepare-cua.result == 'success' && needs.prepare-postgres.result == 'success' && needs.prepare-livekit.result == 'success'))
     needs: [build-gateway-computer-use, prepare-cua, prepare-postgres, prepare-livekit]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
+      PIONEER_RELEASE_SOURCE_RUN: ${{ inputs.source_run }}
+      PIONEER_RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+      PIONEER_DESKTOP_VERSION: ${{ inputs.release_tag }}
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
       MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
@@ -374,14 +393,20 @@ jobs:
           python-version: '3.x'
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: pioneer-release-model-catalog
           path: release-model-catalog
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-computer-use
           path: gateway-inputs
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: prepared-cua-${{ fromJSON(inputs.platform).target }}
           path: cua-prepared
       - uses: ./.github/actions/download-release-input
@@ -412,10 +437,14 @@ jobs:
         if: runner.os == 'macOS'
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
           path: postgres-runtime
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: livekit-runtime-${{ fromJSON(inputs.platform).target }}
           path: livekit-runtime
       - name: package-ready-gateway
@@ -457,9 +486,13 @@ jobs:
           security delete-keychain "${RUNNER_TEMP}/pioneer-signing.keychain-db" || true
 
   package-desktop:
+    if: always() && !cancelled() && (inputs.source_run != '' || (needs.build-desktop.result == 'success')) && needs.package-gateway-computer-use.result == 'success'
     needs: [build-desktop, package-gateway-computer-use]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
+      PIONEER_RELEASE_SOURCE_RUN: ${{ inputs.source_run }}
+      PIONEER_RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+      PIONEER_DESKTOP_VERSION: ${{ inputs.release_tag }}
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
       MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
@@ -490,10 +523,14 @@ jobs:
           python-version: '3.x'
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: pioneer-release-model-catalog
           path: release-model-catalog
       - uses: ./.github/actions/download-release-input
         with:
+          run-id: ${{ inputs.source_run }}
+          max-attempt: ${{ inputs.source_attempt }}
           role: compiled-desktop-${{ fromJSON(inputs.platform).target }}
           path: desktop-runtime
       - uses: ./.github/actions/download-release-input

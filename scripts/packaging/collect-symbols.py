@@ -118,10 +118,13 @@ def build_manifest(data):
         if start < 0:
             break
         try:
-            length = struct.unpack_from('<I', data, start+len(marker))[0]
-            if length <= 16384:
-                obj = json.loads(data[start+len(marker)+4:start+len(marker)+4+length])
-                if obj.get('schema_version') == 1 and obj.get('manifest_id'):
+            header = start + len(marker)
+            length = struct.unpack_from('<I', data, header)[0]
+            payload = header + 4
+            end = payload + length
+            if end <= len(data):
+                obj = json.loads(data[payload:end])
+                if isinstance(obj, dict) and obj.get('schema_version') == 1 and obj.get('manifest_id'):
                     values.append(obj)
         except (ValueError, struct.error, UnicodeError):
             pass
